@@ -1,0 +1,54 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -698,6 +698,12 @@
+         if (ptask) {
+             res["id_task"] = ptask->id;
+             res["n_prompt_tokens"]           = (int32_t) prompt.tokens.size();
++            // The prompt the task arrived with. n_prompt_tokens above is what
++            // the slot holds right now, which grows as the prompt is consumed
++            // and again with every token generated, so it cannot say how much
++            // of a prompt is still to read. A monitor that subtracts the two
++            // counters below from it measures what it has already done.
++            res["n_prompt_tokens_total"]     = ptask->n_tokens();
+             res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
+             res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
+             res["params"] = ptask->params.to_json(only_metrics);
+--- a/tools/server/tests/unit/test_slot_save.py
++++ b/tools/server/tests/unit/test_slot_save.py
+@@ -546,3 +546,36 @@
+     assert res.status_code == 200
+     assert res.body["timings"]["cache_n"] == 0
+     assert res.body["content"] == content
++
++
++def test_slots_report_the_prompt_the_task_arrived_with():
++    """n_prompt_tokens is what the slot holds, which grows as it works.
++
++    A monitor wants the size of the prompt it was given, so that it can say
++    how much of it is still to read. n_prompt_tokens cannot answer that: it
++    counts the tokens in the slot, so it grows while the prompt is consumed
++    and again with every token generated. n_prompt_tokens_total is the task's
++    own prompt and does not move.
++    """
++    global server
++    server.start()
++
++    prompt = "What is the capital of France?"
++    res = server.make_request("POST", "/completion", data={
++        "prompt": prompt,
++        "id_slot": 1,
++        "n_predict": 8,
++        "cache_prompt": True,
++    })
++    assert res.status_code == 200
++    asked = res.body["tokens_evaluated"]
++
++    slots = server.make_request("GET", "/slots").body
++    slot = next(s for s in slots if s["id"] == 1)
++    # The task's prompt, not the slot's contents: by now the slot also holds
++    # the eight tokens that were generated.
++    assert slot["n_prompt_tokens_total"] == asked
++    assert slot["n_prompt_tokens"] > slot["n_prompt_tokens_total"]
++    # And it accounts for the whole prompt: what was reused plus what was read.
++    assert (slot["n_prompt_tokens_cache"]
++            + slot["n_prompt_tokens_processed"]) == slot["n_prompt_tokens_total"]

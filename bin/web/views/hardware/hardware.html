@@ -1,0 +1,135 @@
+<template id="tpl-hardware">
+  <section class="hardware">
+    <svg class="defs" aria-hidden="true" width="0" height="0">
+      <defs>
+        <pattern id="hatch-read" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+          <rect class="p-read" width="6" height="6"></rect>
+          <line class="p-gap" x1="0" y1="0" x2="0" y2="6"></line>
+        </pattern>
+        <pattern id="hatch-stall" patternUnits="userSpaceOnUse" width="6" height="6" patternTransform="rotate(45)">
+          <rect class="p-stall" width="6" height="6"></rect>
+          <line class="p-gap" x1="0" y1="0" x2="0" y2="6"></line>
+        </pattern>
+      </defs>
+    </svg>
+
+    <div class="block">
+      <div class="titleline">
+        <h3 class="title" title="CPU from /proc/stat by NUMA node, memory from each node's meminfo, gpu from nvidia-smi every ten seconds. Sparklines cover the last ten minutes.">machine</h3>
+        <span class="dim" data-slot="machineNote"></span>
+      </div>
+      <div class="rows machine" data-slot="machine"></div>
+    </div>
+
+    <div class="block">
+      <h3 class="title" title="What each slot is doing at this moment.">reading against generating</h3>
+      <div class="keys">
+        <span><i class="k-read"></i>reading a prompt</span>
+        <span><i class="k-gen"></i>generating</span>
+        <span><i class="k-stall"></i>generating but stalled</span>
+        <span><i class="k-idle"></i>idle</span>
+      </div>
+      <div class="rows splits" data-slot="splits"></div>
+    </div>
+
+    <div class="block">
+      <div class="titleline">
+        <h3 class="title" title="Reading and generating are averages per request from /metrics over the window shown. Contended is the slowest generating slot with a reader beside it right now.">tokens per second</h3>
+        <span class="dim" data-slot="ratesSince"></span>
+        <button type="button" class="small" data-slot="resetRates" title="Start the averages again from now.">reset</button>
+      </div>
+      <table class="cmp">
+        <thead><tr data-slot="heads"></tr></thead>
+        <tbody data-slot="rates"></tbody>
+      </table>
+    </div>
+
+    <div class="block">
+      <h3 class="title" title="What each backend was started with, read from its own startup log.">settings</h3>
+      <table class="cmp">
+        <thead><tr data-slot="settingHeads"></tr></thead>
+        <tbody data-slot="settings"></tbody>
+      </table>
+    </div>
+
+    <div class="block">
+      <div class="titleline">
+        <h3 class="title" title="One column per ten seconds: slots reading, generating, stalled, or idle.">the last ten minutes</h3>
+        <span class="dim" data-slot="since"></span>
+      </div>
+      <div class="charts" data-slot="charts"></div>
+    </div>
+  </section>
+</template>
+
+<template id="tpl-hw-node">
+  <div class="node">
+    <span class="who"><b data-slot="name"></b> <span class="dim" data-slot="runs"></span></span>
+    <span class="spark">
+      <svg class="sparkline" viewBox="0 0 240 44" aria-hidden="true"><g data-slot="cpuPlot"></g></svg>
+      <span class="mono" data-slot="cpuNow" title="Busy share of this node's cores, from /proc/stat."></span>
+    </span>
+    <span class="mem" title="Page cache against what the backend must keep resident: the buffers it mapped, less the tensor it reads lazily from disk, from its startup log. When the cache band is shorter than the mark, prefill reads weights from disk.">
+      <span class="membar">
+        <i class="cache" data-slot="cache"></i><i class="free" data-slot="free"></i><b class="mark" data-slot="mark"></b>
+      </span>
+      <span class="mono dim" data-slot="memText"></span>
+    </span>
+  </div>
+</template>
+
+<template id="tpl-gpu">
+  <div class="node">
+    <span class="who"><b>gpu</b></span>
+    <span class="spark">
+      <svg class="sparkline" viewBox="0 0 240 44" aria-hidden="true"><g data-slot="utilPlot"></g></svg>
+      <span class="mono" data-slot="utilNow" title="Utilisation, from nvidia-smi."></span>
+    </span>
+    <span class="mem" title="VRAM used of total, from nvidia-smi.">
+      <span class="membar"><i class="cache" data-slot="vram"></i></span>
+      <span class="mono dim" data-slot="vramText"></span>
+    </span>
+  </div>
+</template>
+
+<template id="tpl-split">
+  <div class="split">
+    <span data-slot="name"></span>
+    <span class="stack">
+      <i class="read" data-slot="read"></i>
+      <i class="gen" data-slot="gen"></i>
+      <i class="stalled" data-slot="stalled"></i>
+    </span>
+    <span class="num mono" data-slot="text"></span>
+  </div>
+</template>
+
+<template id="tpl-head">
+  <th class="num" data-slot="name"></th>
+</template>
+
+<template id="tpl-rate-row">
+  <tr><th scope="row" data-slot="label"></th></tr>
+</template>
+
+<template id="tpl-setting-cell">
+  <td class="num mono" data-slot="value"></td>
+</template>
+
+<template id="tpl-rate-cell">
+  <td class="num mono">
+    <span class="rate">
+      <span class="bar sm"><i data-slot="fill"></i></span>
+      <span data-slot="value"></span>
+    </span>
+  </td>
+</template>
+
+<template id="tpl-chart">
+  <figure>
+    <svg class="chart" viewBox="0 0 640 150" role="img">
+      <g data-slot="plot"></g>
+    </svg>
+    <figcaption><b data-slot="name"></b> <span class="dim" data-slot="slots"></span></figcaption>
+  </figure>
+</template>

@@ -1,0 +1,69 @@
+@layer tokens, utilities, components;
+
+@layer tokens {
+  :root {
+    color-scheme: light dark;
+    --bg:        light-dark(#f6f7f9, #0b0d12);
+    --surface:   light-dark(#ffffff, #131722);
+    --text:      light-dark(#1a1d23, #e6e9ef);
+    --text-dim:  light-dark(#5d6570, #9aa3b2);
+    --accent:    light-dark(#1a64d6, #8ab4f8);
+    --ok:        light-dark(#1a7f37, #46c46a);
+    --busy:      light-dark(#bf8700, #e3b341);
+    --bad:       light-dark(#cf222e, #f85149);
+    --hairline:  light-dark(#d8dce2, #232936);
+    --idle:      light-dark(#e4e7ec, #1c2230);
+    --hatch:     repeating-linear-gradient(135deg, transparent 0 3px, rgba(255, 255, 255, .35) 3px 5px);
+    --r: 6px;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+}
+
+@layer utilities {
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .dim  { color: var(--text-dim); }
+  h1, h2, h3 { text-wrap: balance; }
+  p { text-wrap: pretty; }
+}
+
+@layer components {
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 1rem;
+    padding: .8rem 1.4rem; border-bottom: 1px solid var(--hairline);
+  }
+  header h1 { font-size: 1rem; margin: 0; letter-spacing: .02em; }
+  header nav { margin-inline-end: auto; display: flex; gap: 1rem; }
+  header nav a {
+    color: var(--text-dim); text-decoration: none; font-size: .9rem;
+    padding-block: .15rem; border-bottom: 2px solid transparent;
+  }
+  header nav a:hover { color: var(--text); }
+  header nav a[aria-current] { color: var(--text); border-bottom-color: var(--accent); }
+  .live {
+    display: inline-block; width: .55rem; height: .55rem; border-radius: 50%;
+    background: var(--hairline); transition: background .9s ease-out;
+  }
+  .live.on { background: var(--ok); transition: none; }
+  #theme {
+    font: inherit; font-size: .8rem; color: var(--text-dim);
+    background: transparent; border: 1px solid var(--hairline);
+    border-radius: var(--r); padding: .15rem .6rem; cursor: pointer;
+  }
+  #errbar {
+    display: block; margin: .6rem 1.4rem; padding: .5rem .8rem;
+    border-radius: var(--r); background: color-mix(in oklch, var(--bad), transparent 85%);
+    color: var(--bad); font-size: .9rem;
+  }
+  #errbar[hidden] { display: none; }
+  main { padding: 1.4rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) { animation: none !important; }
+}

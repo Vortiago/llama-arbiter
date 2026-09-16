@@ -1,0 +1,11 @@
+@layer components;
+
+@scope (.caching) {
+  :scope { container-type: inline-size; display: grid; gap: 1.4rem; }
+
+  .rows.ram { --cols: max-content 8rem 1fr max-content; }
+  .rows.files { --cols: max-content max-content 1fr max-content max-content; }
+  .rows.requests { --cols: max-content max-content 1fr max-content max-content max-content; }
+  .rows.choices { --cols: max-content max-content max-content max-content 1fr; }
+  .rows.holds { --cols: max-content 1fr; }
+}

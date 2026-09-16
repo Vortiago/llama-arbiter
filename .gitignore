@@ -1,0 +1,43 @@
+# Model weights. Hundreds of gigabytes, fetched separately.
+models/
+
+# The patched llama.cpp fork, and an older checkout beside it. The local
+# change is kept as a patch in patches/, so the fork itself is not tracked.
+llama.cpp-mtp/
+qwen/
+
+# Everything a run produces: backend logs, saved slots, pids.
+run/
+
+# What a benchmark run produces. A number here was measured on one machine on
+# one day and says nothing about anyone else's; the readings worth keeping are
+# written up in docs/.
+*.log
+results/
+
+# The lab notebooks. Scripts written to drive this one box, their write-ups,
+# and the fixed prompts they read. Useful here, not to anyone else.
+experiments/
+cache-lab/
+prefill-harness/
+tools/prefill-sweep.py
+tools/prefill-by-position.py
+
+# Open questions. These belong in the issue tracker, not in the tree.
+docs/FUTURE-WORK.md
+
+# What this machine differs in: where its weights are, how many cores a socket
+# has, which backends it runs. config.local.example.sh is the tracked copy to
+# start from.
+config.local.sh
+backends.local.json
+
+# Installed, not written.
+bin/web/node_modules/
+__pycache__/
+*.pyc
+# The venv self-ignores, which is luck rather than intent. Say so.
+.venv/
+
+# Design prototypes for a dashboard view. Scratch: nothing imports them.
+bin/web/views/*/proto/

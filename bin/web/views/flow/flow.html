@@ -1,0 +1,173 @@
+<template id="tpl-flow">
+  <section class="flowview">
+    <div class="f-board" data-slot="board">
+      <svg class="f-wires" data-slot="wires" aria-hidden="true"></svg>
+
+      <div class="f-stage" data-slot="stage">
+        <section class="f-col">
+          <h2 class="f-title">&#128229; arriving</h2>
+          <div class="f-gate f-gate-first" data-slot="arrivingGate"><b class="f-gate-n" data-slot="waiting">0</b></div>
+          <div class="f-list" data-slot="arrivals"></div>
+        </section>
+        <section class="f-col">
+          <h2 class="f-title">&#128214; reading</h2>
+          <p class="f-key">
+            <span><i class="k-reused"></i>reused</span>
+            <span><i class="k-read"></i>read</span>
+            <span><i class="k-todo"></i>to read</span>
+          </p>
+          <div class="f-list" data-slot="readers"></div>
+        </section>
+        <section class="f-col">
+          <h2 class="f-title">&#9203; parked</h2>
+          <div class="f-gate" data-slot="parkedGate">
+            <b class="f-gate-n" data-slot="queued">0</b>
+            <div class="f-stack" data-slot="parked"></div>
+          </div>
+        </section>
+        <section class="f-col">
+          <h2 class="f-title">&#9889; generating</h2>
+          <div class="f-list" data-slot="generators"></div>
+        </section>
+      </div>
+
+      <aside class="f-bank">
+        <p class="f-hero" data-slot="hero">&mdash;</p>
+        <div class="f-tape">
+          <div class="f-tapelist" data-slot="tape"></div>
+          <p class="f-empty" data-slot="noTurns">nothing finished yet</p>
+        </div>
+        <div class="f-meter">
+          <p class="f-key">
+            <span><i class="k-reused"></i>took</span>
+            <span><i class="k-ghost"></i>cold</span>
+            <span class="f-est" data-slot="estimated" hidden>estimated</span>
+          </p>
+          <span class="f-bar"><i data-slot="shareFill"></i></span>
+          <span class="f-note" data-slot="shareNote"></span>
+        </div>
+      </aside>
+
+      <div class="f-stores">
+        <div class="f-store f-flip">
+          <span class="f-strip" data-slot="strip"></span>
+          <p class="f-head"><b>&#128190; copies</b><span class="f-cap" data-slot="copiesCap"></span></p>
+          <div class="f-foot">
+            <span class="f-key">
+              <span><i class="k-live"></i>in a slot</span>
+              <span><i class="k-disk"></i>on disk</span>
+              <span><i class="k-kept"></i>before restart</span>
+            </span>
+            <span class="f-twin" data-slot="copiesTwin"></span>
+          </div>
+        </div>
+        <div class="f-store">
+          <p class="f-head"><b>&#128218; openings</b><span class="f-cap" data-slot="openingsCap"></span></p>
+          <div class="f-shelves" data-slot="shelves"></div>
+          <div class="f-foot">
+            <span class="f-key"><span><i class="k-free"></i>free</span></span>
+            <span class="f-twin" data-slot="openingsTwin"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</template>
+
+<template id="tpl-node">
+  <div class="f-node">
+    <p class="f-node-head">
+      <b class="f-name" data-slot="name"></b>
+      <span class="f-conv" data-slot="conv" hidden></span>
+      <span class="f-phase"><i class="f-ico" data-slot="icon"></i><span data-slot="phase"></span></span>
+    </p>
+    <span class="f-fill">
+      <i class="f-reused" data-slot="reused"></i><i class="f-read" data-slot="read"></i>
+    </span>
+    <p class="f-node-foot">
+      <span data-slot="rate"></span>
+      <span class="f-num" data-slot="done"></span>
+      <span class="f-num" data-slot="eta"></span>
+    </p>
+    <span class="f-hist" data-slot="hist" title="the last ten minutes, ten seconds a bar"></span>
+  </div>
+</template>
+
+<template id="tpl-waiter">
+  <div class="f-wait">
+    <p class="f-wait-head"><b data-slot="conv"></b><span class="f-num" data-slot="waited"></span></p>
+    <p class="f-wait-why">
+      <span data-slot="why"></span>
+      <span class="f-pics" data-slot="waitPics" hidden></span>
+      <span class="f-num" data-slot="tokens"></span>
+    </p>
+  </div>
+</template>
+
+<template id="tpl-group">
+  <section class="f-group">
+    <p class="f-group-head"><b data-slot="conv"></b><span class="f-num" data-slot="saved"></span></p>
+    <div class="f-group-turns" data-slot="turns"></div>
+  </section>
+</template>
+
+<template id="tpl-turn">
+  <div class="f-turn">
+    <span class="f-tbar"><i class="f-ghost" data-slot="ghost"></i><i class="f-took" data-slot="took"></i></span>
+    <p class="f-turn-head">
+      <span class="f-mode" data-slot="mode"></span>
+      <span class="f-pics" data-slot="turnPics" hidden></span>
+      <span class="f-num" data-slot="took2"></span>
+    </p>
+  </div>
+</template>
+
+<template id="tpl-shelf">
+  <div class="f-shelf">
+    <p class="f-shelf-head"><b data-slot="title"></b><span class="f-of" data-slot="of"></span></p>
+    <div class="f-rack" data-slot="rack"></div>
+  </div>
+</template>
+
+<template id="tpl-cell">
+  <div class="f-cell">
+    <b class="f-cell-size" data-slot="size"></b>
+    <span class="f-cell-name" data-slot="name"></span>
+    <span class="f-cell-loads" data-slot="loads"></span>
+  </div>
+</template>
+
+<template id="tpl-block">
+  <i class="f-blk"><span data-slot="label"></span></i>
+</template>
+
+<template id="tpl-twin">
+  <details class="f-details">
+    <summary data-slot="summary">as a table</summary>
+    <div class="f-wrap"><table class="f-table"><thead data-slot="head"></thead><tbody data-slot="body"></tbody></table></div>
+  </details>
+</template>
+
+<template id="tpl-cellrow">
+  <tr><th scope="row" data-slot="c0"></th><td data-slot="c1"></td><td class="f-num" data-slot="c2"></td><td class="f-num" data-slot="c3"></td></tr>
+</template>
+
+<template id="tpl-headrow">
+  <tr><th scope="col" data-slot="c0"></th><th scope="col" data-slot="c1"></th><th scope="col" class="f-num" data-slot="c2"></th><th scope="col" class="f-num" data-slot="c3"></th></tr>
+</template>
+
+<template id="tpl-parked">
+  <span class="f-file">
+    <i class="f-file-ico">&#128190;</i>
+    <b data-slot="size"></b>
+    <span class="f-file-conv" data-slot="conv"></span>
+    <span class="f-file-waited" data-slot="waited"></span>
+  </span>
+</template>
+
+<template id="tpl-packet">
+  <span class="f-packet">
+    <i class="f-packet-ico" data-slot="icon"></i>
+    <b data-slot="size"></b>
+  </span>
+</template>

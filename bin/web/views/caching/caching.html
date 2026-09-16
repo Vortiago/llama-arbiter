@@ -1,0 +1,118 @@
+<template id="tpl-caching">
+  <section class="caching">
+    <div class="block">
+      <h3 class="title" title="Since each backend started, from its /metrics counters.">prompt tokens reused instead of read</h3>
+      <div class="keys">
+        <span><i class="k-gen"></i>reused</span>
+        <span><i class="k-read"></i>read again</span>
+      </div>
+      <div class="rows reuse" data-slot="reuse"></div>
+    </div>
+
+    <div class="block">
+      <div class="titleline">
+        <h3 class="title" title="Idle conversations kept warm in RAM. An eviction means a full re-read on return.">prompt cache in ram</h3>
+        <span class="dim" data-slot="ramWhy"></span>
+      </div>
+      <div class="rows ram" data-slot="ram"></div>
+    </div>
+
+    <div class="block">
+      <div class="titleline">
+        <h3 class="title" title="Where a second conversation could pick up what is already held, counted in messages. A saved prompt on disk serves every new session; a slot's contents serve one that opens the same way.">starting points</h3>
+        <span class="dim" data-slot="deeperWhy"></span>
+      </div>
+      <div class="rows holds" data-slot="holds"></div>
+      <div class="rows choices" data-slot="choices"></div>
+    </div>
+
+    <div class="block">
+      <h3 class="title">recent requests</h3>
+      <div class="rows requests" data-slot="requests"></div>
+    </div>
+
+    <details class="block">
+      <summary class="title" title="Caches written to disk, read back, or moved between backends.">recent cache activity</summary>
+      <div class="rows files" data-slot="files"></div>
+    </details>
+  </section>
+</template>
+
+<template id="tpl-reuse">
+  <div class="split reuse">
+    <span data-slot="name"></span>
+    <span class="stack">
+      <i class="gen" data-slot="reused"></i>
+      <i class="read" data-slot="read"></i>
+    </span>
+    <span class="num mono" data-slot="text"></span>
+  </div>
+</template>
+
+<template id="tpl-ram">
+  <div class="row ram">
+    <strong data-slot="name"></strong>
+    <span class="bar"><i class="accent" data-slot="fill"></i></span>
+    <span class="mono" data-slot="held"></span>
+    <span class="mono warn" data-slot="lost"></span>
+  </div>
+</template>
+
+<template id="tpl-hold">
+  <div class="row hold">
+    <span class="mono" data-slot="where"></span>
+    <span data-slot="through"></span>
+  </div>
+</template>
+
+<template id="tpl-choice-head">
+  <div class="row choice head">
+    <span>conversation</span>
+    <span class="num" title="Messages in the request's opening that another conversation could share.">messages</span>
+    <span title="How far in a saved prompt on disk matches this request.">saved file matches</span>
+    <span title="How far in some slot's contents match this request.">a slot matches</span>
+    <span></span>
+  </div>
+</template>
+
+<template id="tpl-choice">
+  <div class="row choice">
+    <span class="mono" data-slot="conv"></span>
+    <span class="num mono" data-slot="cuts"></span>
+    <span data-slot="stored"></span>
+    <span data-slot="shared"></span>
+    <span><span class="pill" data-slot="worth" hidden title="A slot holds more of this opening than any saved file, so a deeper prompt is worth saving.">deeper than saved</span></span>
+  </div>
+</template>
+
+<template id="tpl-request-head">
+  <div class="row request head">
+    <span>conversation</span>
+    <span>backend</span>
+    <span title="Own warm slot, own copy recalled from disk, a saved prompt, or cold: read everything.">started from</span>
+    <span class="num">tokens</span>
+    <span class="num" title="Time with no slot before the backend took it.">waited</span>
+    <span class="num">took</span>
+  </div>
+</template>
+
+<template id="tpl-request">
+  <div class="row request">
+    <span class="mono" data-slot="conv"></span>
+    <span class="mono" data-slot="backend"></span>
+    <span data-slot="started"></span>
+    <span class="num mono" data-slot="tokens"></span>
+    <span class="num mono dim" data-slot="waited"></span>
+    <span class="num mono dim" data-slot="took"></span>
+  </div>
+</template>
+
+<template id="tpl-file">
+  <div class="row file">
+    <span data-slot="did"></span>
+    <span class="mono dim" data-slot="where"></span>
+    <span class="mono" data-slot="name"></span>
+    <span class="num mono dim" data-slot="size"></span>
+    <span class="num mono dim" data-slot="when"></span>
+  </div>
+</template>

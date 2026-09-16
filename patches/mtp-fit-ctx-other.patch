@@ -1,0 +1,240 @@
+common: give the memory-fit pass a ctx_other for MTP/draft heads
+
+Problem
+-------
+Starting llama-server with an MTP draft head, e.g.
+
+    llama-server --model Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf \
+                 --model-draft mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+                 --spec-type draft-mtp --spec-draft-n-max 3 \
+                 -ngl 99 -ncmoe 48 -c 155000 -b 2048 -ub 512 --flash-attn on
+
+prints during startup:
+
+    E llama_init_from_model: failed to initialize the context: qwen4exp requires ctx_other
+      to be set (this warning is normal during memory fitting)
+    W operator(): failed to measure the memory of the extra model, fitting without it:
+      failed to create llama_context from model
+
+Root cause
+----------
+common_init_result() (common/common.cpp:1304-1326) runs the automatic memory fit *before* the
+target model is loaded, and describes the draft/MTP model to it as a common_fit_extra_model.
+common_params_fit_impl()'s add_extra_memory() lambda (common/fit.cpp:204-257) measures that extra
+model by loading it with no_alloc and building a throwaway llama_context for it
+(common_get_device_memory_data_impl(), common/fit.cpp:64-70).
+
+Draft heads whose GGUF has no token_embd/output of its own read those tensors from the target
+model through llama_context_params::ctx_other (src/models/qwen4exp.cpp:26-35, and likewise
+eagle3.cpp / dflash.cpp / gemma4-assistant.cpp).  llama_context::llama_context() rejects such a
+model when ctx_other == nullptr (src/llama-context.cpp:155-162), llama_init_from_model() returns
+nullptr, and common_get_device_memory_data_impl() throws.
+
+The throw is caught in add_extra_memory() and the extra model is then accounted for with an
+all-zero llama_device_memory_data (common/fit.cpp:225-231), i.e. the fit proceeds as if the draft
+model needed no device memory at all.  Consequences:
+
+  * when the fit is free to choose (-c / -ngl unset) it oversizes the KV cache / offloads too
+    many layers, and the process OOMs later at runtime (typically in
+    ggml_cuda_graph_evaluate_and_capture on the second request, once the CUDA graph is captured);
+  * when -c / -ngl are pinned by the user, the deficit is invisible: the fit concludes
+    "no changes needed" (common/fit.cpp:351-355) and never warns that the configuration cannot fit.
+
+The whole failure is reported at W/E level but is worded as if it were benign, so it is easy to
+miss.
+
+Fix
+---
+Wire the target model's measurement context through to the extra model's measurement, so the
+draft context can actually be built and measured:
+
+  * common_get_device_memory_data_impl() gains an optional `common_fit_scratch_ctx * keep`
+    out-parameter.  When given, the no_alloc model + context created for the measurement are
+    handed to the caller instead of being freed immediately (and a previously kept pair is
+    released first).  Default nullptr keeps every other caller unchanged.
+  * common_params_fit_impl() keeps the scratch context of the most recent main-model measurement
+    and add_extra_memory() passes it as extra->cparams->ctx_other.  All five main-model
+    measurements that are followed by an add_extra_memory() now request it.  The pointer is
+    cleared again right after the measurement so it can never dangle.
+  * as a safety net, if the extra model still cannot be measured the fallback is now logged at
+    ERROR level and states explicitly that device memory use is underestimated, with the flags
+    to work around it.
+
+This costs no extra model loads: the context that is kept alive is the one that was created for
+the main model's measurement anyway.  Both models are loaded with no_alloc = true /
+LLAMA_LOAD_MODE_NONE, so nothing is actually allocated on the device while both are alive.
+
+Only common/fit.cpp is touched; no MTP-specific or public API code changes.
+
+Apply with:  git apply patches/mtp-fit-ctx-other.patch   (from the repository root)
+
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -26,6 +26,38 @@
+     using std::runtime_error::runtime_error;
+ };
+ 
++// [TAG_FIT_CTX_OTHER]
++// Some draft heads (MTP/NextN, EAGLE3, DFlash, Gemma4-Assistant) do not ship a token embedding and/or an
++// output tensor of their own - they read those from the target model through llama_context_params::ctx_other.
++// llama_init_from_model() refuses to build such a context when ctx_other == nullptr, so the memory fit has to
++// keep the measurement context of the main model alive and hand it to the measurement of the extra model.
++// Without it the extra model cannot be measured at all and would be silently assumed to need no memory.
++struct common_fit_scratch_ctx {
++    llama_model   * model = nullptr;
++    llama_context * ctx   = nullptr;
++
++    common_fit_scratch_ctx() = default;
++    common_fit_scratch_ctx(const common_fit_scratch_ctx &)             = delete;
++    common_fit_scratch_ctx & operator=(const common_fit_scratch_ctx &) = delete;
++
++    void reset() {
++        if (ctx) {
++            llama_free(ctx);
++            ctx = nullptr;
++        }
++        if (model) {
++            llama_model_free(model);
++            model = nullptr;
++        }
++    }
++
++    ~common_fit_scratch_ctx() {
++        reset();
++    }
++};
++
++// if keep != nullptr the model and the context created for the measurement are not freed but handed to the
++// caller, which can then use the context as the ctx_other of a dependent model, see [TAG_FIT_CTX_OTHER]
+ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+         const char * path_model,
+         const llama_model_params * mparams,
+@@ -34,7 +66,8 @@
+         uint32_t & hp_ngl,
+         uint32_t & hp_n_ctx_train,
+         uint32_t & hp_n_expert,
+-        ggml_log_level log_level) {
++        ggml_log_level log_level,
++        common_fit_scratch_ctx * keep = nullptr) {
+     struct user_data_t {
+         struct {
+             ggml_log_callback callback;
+@@ -52,6 +85,11 @@
+         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+     }, &ud);
+ 
++    if (keep) {
++        // release the model/context of a previous measurement before loading another one
++        keep->reset();
++    }
++
+     llama_model_params mparams_copy = *mparams;
+     mparams_copy.no_alloc  = true;
+     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+@@ -145,8 +183,13 @@
+ 
+     common_memory_breakdown_print(ctx);
+ 
+-    llama_free(ctx);
+-    llama_model_free(model);
++    if (keep) {
++        keep->model = model;
++        keep->ctx   = ctx;
++    } else {
++        llama_free(ctx);
++        llama_model_free(model);
++    }
+     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+ 
+     return ret;
+@@ -199,6 +242,10 @@
+     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
+     uint32_t n_ctx_extra = 0;  // context that memory was measured at
+ 
++    // model + context of the most recent measurement of the main model, kept alive so that the extra model can
++    // be built against it, see [TAG_FIT_CTX_OTHER]. Invalidated by the next measurement of the main model.
++    common_fit_scratch_ctx main_scratch;
++
+     // the extra model competes for the same memory as the main model, add it to every measurement
+     // its memory is measured again whenever the context it follows changes
+     auto add_extra_memory = [&](dmds_t & dmds) {
+@@ -214,6 +261,10 @@
+ 
+             extra->cparams->n_ctx = cparams->n_ctx;
+ 
++            // a draft head that shares tok_embd/output with its target can only be built against the target's
++            // context - hand it the one of the last main model measurement, see [TAG_FIT_CTX_OTHER]
++            extra->cparams->ctx_other = main_scratch.ctx;
++
+             LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
+                 __func__, cparams->n_ctx);
+ 
+@@ -222,13 +273,21 @@
+                 measured = common_get_device_memory_data_impl(
+                     extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+             } catch (const std::runtime_error & e) {
+-                // the extra model is optional, fit the main model alone rather than giving up
+-                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
++                // the extra model is optional, fit the main model alone rather than giving up.
++                // this is not harmless: the fit then assumes the extra model needs no memory at all, which
++                // oversizes the KV cache of the main model and can OOM at runtime -> report it loudly.
++                extra->cparams->ctx_other = nullptr;
++                LOG_ERR("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
++                LOG_ERR("%s: the memory of the draft/MTP model is NOT accounted for, device memory use is underestimated - "
++                    "raise the reserved margin with -fitt/--fit-target or set --ctx-size and --n-gpu-layers manually\n", __func__);
+                 dmds_extra = dmds_t(devs.size() + 1);
+                 n_ctx_extra = cparams->n_ctx;
+                 return;
+             }
+ 
++            // main_scratch is invalidated by the next measurement of the main model, do not keep a dangling pointer
++            extra->cparams->ctx_other = nullptr;
++
+             dmds_extra = dmds_t(devs.size() + 1);
+             dmds_extra.back().mb = measured.back().mb;
+             for (size_t je = 0; je < devs_extra.size(); je++) {
+@@ -260,7 +319,7 @@
+     // step 1: get data for default parameters and check whether any changes are necessary in the first place
+ 
+     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
+-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &main_scratch);
+ 
+     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
+     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
+@@ -272,7 +331,7 @@
+         if (n_streams > 1) {
+             LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
+                 __func__, n_ctx_max, n_streams);
+-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &main_scratch);
+         }
+     }
+     add_extra_memory(dmds_full);
+@@ -411,7 +470,7 @@
+ 
+                     int64_t sum_projected_used_min_ctx = 0;
+                     cparams->n_ctx = n_ctx_min_total;
+-                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &main_scratch);
+                     add_extra_memory(dmds_min_ctx);
+                     if (nd == 0) {
+                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
+@@ -593,7 +652,7 @@
+         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
+ 
+         dmds_t dmd_nl = common_get_device_memory_data_impl(
+-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &main_scratch);
+         add_extra_memory(dmd_nl);
+ 
+         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
+@@ -622,7 +681,7 @@
+ 
+         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
+         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
+-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &main_scratch);
+         add_extra_memory(dmds_cpu_moe);
+ 
+         for (size_t id = 0; id < nd; id++) {

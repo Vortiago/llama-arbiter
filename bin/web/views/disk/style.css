@@ -1,0 +1,9 @@
+@layer components;
+
+@scope (.disk) {
+  :scope { container-type: inline-size; display: grid; gap: 1.4rem; }
+
+  .rows.budgets, .rows.mounts { --cols: max-content minmax(8rem, 22rem) max-content; }
+  .rows.files { --cols: max-content max-content 1fr max-content max-content; }
+  .bar.wide { width: 100%; }
+}

@@ -1,0 +1,157 @@
+server: carry context checkpoints in a saved slot state
+
+A state written with llama_state_seq_save_file carries the KV and the tokens
+but not the slot's context checkpoints. The in-memory prompt cache carries
+them, because it moves the whole server_prompt. The file path assigns only
+.tokens.
+
+So a slot restored from a file has no checkpoint. llama.cpp must process at
+least one token to produce logits, which means stepping back, and on a model
+with recurrent state there is no way back without a checkpoint. The slot is
+discarded and the whole prompt read again.
+
+Measured on Qwen3.8-Flash-Next, a 601 token state restored onto another
+instance:
+
+    before   extended strictly   609 tokens re-read
+    before   exact match         609 tokens re-read
+    after    extended strictly    12 tokens
+    after    exact match           4 tokens
+
+The checkpoints are appended after the state and read back on restore. A file
+written without the trailer restores exactly as before, so old files and files
+from other tools still work. n_bytes reports the whole file, trailer included,
+because a caller budgets disk against it.
+
+The state file roughly doubles: a checkpoint is 112 to 200 MiB and a long
+conversation has several.
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index fe068d3e9..453834707 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -830,6 +830,93 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
+ // server_context_impl (private implementation)
+ //
+ 
++// A slot state written with llama_state_seq_save_file carries the KV and the
++// tokens, but not the context checkpoints. The in-memory prompt cache keeps
++// them, because it moves the whole server_prompt. A slot restored from a file
++// therefore has no checkpoint to step back to, and llama.cpp must step back to
++// process at least one token, so the next request re-reads the whole prompt.
++//
++// These append the checkpoints after the state and read them back. A file
++// without the trailer restores exactly as before.
++static const uint32_t CKPT_MAGIC = 0x504b4351; // "QCKP"
++
++static void ckpt_write_blob(FILE * f, const std::vector<uint8_t> & blob) {
++    const uint64_t n = blob.size();
++    fwrite(&n, sizeof(n), 1, f);
++    if (n) {
++        fwrite(blob.data(), 1, n, f);
++    }
++}
++
++static bool ckpt_read_blob(FILE * f, std::vector<uint8_t> & blob) {
++    uint64_t n = 0;
++    if (fread(&n, sizeof(n), 1, f) != 1) {
++        return false;
++    }
++    blob.resize(n);
++    return n == 0 || fread(blob.data(), 1, n, f) == n;
++}
++
++// Returns the bytes appended, so the caller can report the real file size.
++static size_t ckpt_save(const std::string & path,
++                        const std::list<common_prompt_checkpoint> & checkpoints) {
++    FILE * f = fopen(path.c_str(), "ab");
++    if (!f) {
++        return 0;
++    }
++    const long before = ftell(f);
++    const uint32_t magic = CKPT_MAGIC;
++    const uint32_t count = (uint32_t) checkpoints.size();
++    fwrite(&magic, sizeof(magic), 1, f);
++    fwrite(&count, sizeof(count), 1, f);
++    for (const auto & cur : checkpoints) {
++        fwrite(&cur.n_tokens, sizeof(cur.n_tokens), 1, f);
++        fwrite(&cur.id_task,  sizeof(cur.id_task),  1, f);
++        fwrite(&cur.pos_min,  sizeof(cur.pos_min),  1, f);
++        fwrite(&cur.pos_max,  sizeof(cur.pos_max),  1, f);
++        ckpt_write_blob(f, cur.data_tgt);
++        ckpt_write_blob(f, cur.data_dft);
++        ckpt_write_blob(f, cur.data_spec);
++    }
++    const long after = ftell(f);
++    fclose(f);
++    return after > before ? (size_t) (after - before) : 0;
++}
++
++static void ckpt_load(const std::string & path, size_t offset,
++                      std::list<common_prompt_checkpoint> & out) {
++    out.clear();
++    FILE * f = fopen(path.c_str(), "rb");
++    if (!f) {
++        return;
++    }
++    if (fseek(f, (long) offset, SEEK_SET) != 0) {
++        fclose(f);
++        return;
++    }
++    uint32_t magic = 0, count = 0;
++    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != CKPT_MAGIC ||
++        fread(&count, sizeof(count), 1, f) != 1) {
++        fclose(f);
++        return;                       // written before this, or by something else
++    }
++    for (uint32_t i = 0; i < count; ++i) {
++        common_prompt_checkpoint cur;
++        if (fread(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) != 1 ||
++            fread(&cur.id_task,  sizeof(cur.id_task),  1, f) != 1 ||
++            fread(&cur.pos_min,  sizeof(cur.pos_min),  1, f) != 1 ||
++            fread(&cur.pos_max,  sizeof(cur.pos_max),  1, f) != 1 ||
++            !ckpt_read_blob(f, cur.data_tgt) ||
++            !ckpt_read_blob(f, cur.data_dft) ||
++            !ckpt_read_blob(f, cur.data_spec)) {
++            out.clear();
++            break;
++        }
++        out.push_back(std::move(cur));
++    }
++    fclose(f);
++}
++
+ struct server_context_impl {
+     friend struct server_context;
+ 
+@@ -2579,6 +2666,11 @@ private:
+                         break;
+                     }
+ 
++                    // Carry the context checkpoints too. Without them the slot
++                    // cannot step back, and a restored slot must step back to
++                    // process even one token.
++                    const size_t nckpt = ckpt_save(filepath, slot->prompt.checkpoints);
++
+                     const int64_t t_end = ggml_time_us();
+                     const double t_save_ms = (t_end - t_start) / 1000.0;
+ 
+@@ -2588,7 +2680,9 @@ private:
+                     res->filename = filename;
+                     res->is_save  = true;
+                     res->n_tokens = slot->prompt.tokens.size();
+-                    res->n_bytes  = nwrite;
++                    // The trailer is part of the file, so report it. The
++                    // caller budgets disk against this number.
++                    res->n_bytes  = nwrite + nckpt;
+                     res->t_ms     = t_save_ms;
+                     queue_results.send(std::move(res));
+                 } break;
+@@ -2638,6 +2732,7 @@ private:
+ 
+                         slot->prompt.clear();
+                         slot->prompt.tokens = std::move(restored);
++                        ckpt_load(filepath, nread, slot->prompt.checkpoints);
+                     } catch (const std::exception & err) {
+                         slot->prompt_clear();
+                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

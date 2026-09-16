@@ -1,0 +1,144 @@
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -146,6 +146,7 @@
+     server_http_context::handler_t post_anthropic_messages;
+     server_http_context::handler_t post_anthropic_count_tokens;
+     server_http_context::handler_t post_apply_template;
++    server_http_context::handler_t post_anthropic_apply_template;
+     server_http_context::handler_t get_models;
+     server_http_context::handler_t post_tokenize;
+     server_http_context::handler_t post_detokenize;
+@@ -170,6 +171,7 @@
+     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
+     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
+     std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type);
++    std::unique_ptr<server_res_generator> handle_apply_template(const server_http_req & req, task_response_type res_type);
+ 
+     // using unique_ptr to allow late initialization of const
+     std::unique_ptr<const server_context_meta> meta;
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -225,6 +225,7 @@
+         routes.post_tokenize               = models_routes->proxy_post;
+         routes.post_detokenize             = models_routes->proxy_post;
+         routes.post_apply_template         = models_routes->proxy_post;
++        routes.post_anthropic_apply_template = models_routes->proxy_post;
+         routes.post_chat_completions_tok   = models_routes->proxy_post;
+         routes.post_responses_tok_oai      = models_routes->proxy_post;
+         routes.get_lora_adapters           = models_routes->proxy_get;
+@@ -272,6 +273,7 @@
+     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
+     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
+     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
++    ctx_http.post("/v1/messages/apply-template",       ex_wrapper(routes.post_anthropic_apply_template)); // anthropic messages, rendered but not run
+     // token counting
+     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
+     ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -5153,15 +5153,11 @@
+ 
+     // same with handle_chat_completions, but without inference part
+     this->post_apply_template = [this](const server_http_req & req) {
+-        auto res = create_response();
+-        std::vector<raw_buffer> files; // dummy, unused
+-        json body = json::parse(req.body);
+-        json data = oaicompat_chat_params_parse(
+-            body,
+-            meta->chat_params,
+-            files);
+-        res->ok({{ "prompt", std::move(data.at("prompt")) }});
+-        return res;
++        return handle_apply_template(req, TASK_RESPONSE_TYPE_OAI_CHAT);
++    };
++
++    this->post_anthropic_apply_template = [this](const server_http_req & req) {
++        return handle_apply_template(req, TASK_RESPONSE_TYPE_ANTHROPIC);
+     };
+ 
+     this->get_models = [this](const server_http_req &) {
+@@ -5580,6 +5576,33 @@
+     return res;
+ }
+ 
++std::unique_ptr<server_res_generator> server_routes::handle_apply_template(const server_http_req & req, task_response_type res_type) {
++    auto res = create_response();
++    std::vector<raw_buffer> files; // dummy, unused
++    json body = json::parse(req.body);
++
++    switch (res_type) {
++        case TASK_RESPONSE_TYPE_OAI_CHAT:
++            break;
++        case TASK_RESPONSE_TYPE_OAI_RESP:
++            body = server_chat_convert_responses_to_chatcmpl(body);
++            break;
++        case TASK_RESPONSE_TYPE_ANTHROPIC:
++            body = server_chat_convert_anthropic_to_oai(body);
++            break;
++        default:
++            res->error(format_error_response("invalid res_type", ERROR_TYPE_INVALID_REQUEST));
++            return res;
++    }
++
++    json data = oaicompat_chat_params_parse(
++        body,
++        meta->chat_params,
++        files);
++    res->ok({{ "prompt", std::move(data.at("prompt")) }});
++    return res;
++}
++
+ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type) {
+     auto res = create_response();
+     std::vector<raw_buffer> files;
+--- a/tools/server/tests/unit/test_compat_anthropic.py
++++ b/tools/server/tests/unit/test_compat_anthropic.py
+@@ -1085,3 +1085,48 @@
+         # should also have text block
+         text_blocks = [b for b in content if b.get("type") == "text"]
+         assert len(text_blocks) > 0, "Should have text content block"
++
++
++def test_anthropic_apply_template():
++    """Render an Anthropic request without running it.
++
++    /apply-template only understands OpenAI-shaped messages, so a client of
++    /v1/messages had no way to ask what its prompt renders to. A tool call is
++    the case that matters: tool_use and tool_result blocks make the OpenAI
++    parser raise "unsupported content[].type".
++    """
++    server.jinja = True
++    server.start()
++
++    body = {
++        "messages": [
++            {"role": "user", "content": [
++                {"type": "text", "text": "What is the weather in Oslo?"}]},
++            {"role": "assistant", "content": [
++                {"type": "text", "text": "Let me check."},
++                {"type": "tool_use", "id": "t1", "name": "get_weather",
++                 "input": {"city": "Oslo"}}]},
++            {"role": "user", "content": [
++                {"type": "tool_result", "tool_use_id": "t1",
++                 "content": [{"type": "text", "text": "7C, rain"}]}]},
++        ]
++    }
++
++    # the OpenAI route cannot read this body
++    res = server.make_request("POST", "/apply-template", data=body)
++    assert res.status_code == 400
++
++    res = server.make_request("POST", "/v1/messages/apply-template", data=body)
++    assert res.status_code == 200
++    prompt = res.body["prompt"]
++    assert "Oslo" in prompt
++    assert "7C, rain" in prompt
++
++    # the rendering has to be the one generation would use, or a prompt
++    # prefilled from it is not a prefix of the real prompt
++    counted = server.make_request("POST", "/v1/messages/count_tokens",
++                                  data={**body, "model": "m"})
++    tokenized = server.make_request("POST", "/tokenize",
++                                    data={"content": prompt,
++                                          "add_special": False})
++    assert len(tokenized.body["tokens"]) == counted.body["input_tokens"]

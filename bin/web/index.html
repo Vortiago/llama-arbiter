@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qwen router</title>
+<link rel="stylesheet" href="./shell.css">
+<link rel="modulepreload" href="./shell.js">
+<link rel="modulepreload" href="./views/registry.js">
+<link rel="modulepreload" href="./lib/templates.js">
+<link rel="modulepreload" href="./lib/render.js">
+<link rel="modulepreload" href="./lib/chrome.js">
+<script type="module" src="./shell.js"></script>
+</head>
+<body>
+<header>
+  <h1>qwen router</h1>
+  <nav>
+    <a href="#/overview">right now</a>
+    <a href="#/flow">flow</a>
+    <a href="#/hardware">hardware</a>
+    <a href="#/caching">caching</a>
+    <a href="#/disk">disk</a>
+  </nav>
+  <span class="live" id="live" title="Brightens when the router pushed a change."></span>
+  <button id="theme" type="button" title="Theme">auto</button>
+</header>
+<output id="errbar" hidden></output>
+<main id="stage"></main>
+</body>
+</html>

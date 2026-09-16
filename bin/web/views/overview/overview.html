@@ -1,0 +1,104 @@
+<template id="tpl-overview">
+  <section class="overview">
+    <div class="totals" data-slot="totals"></div>
+
+    <div class="block">
+      <div class="titleline">
+        <h3 class="title" title="Requests with no slot yet. A pinned conversation holds out 20 seconds for the backend with its cache; a new one needs a backend that prefills.">waiting</h3>
+        <span class="dim" data-slot="waitingWhy"></span>
+      </div>
+      <div class="rows waiting" data-slot="waiting"></div>
+    </div>
+
+    <div class="block wrap">
+      <table class="backends">
+        <thead>
+          <tr>
+            <th>backend / slot</th><th>state</th>
+            <th class="num">slots</th><th title="The whole prompt: reused from a cache, read so far, still to read.">prompt</th>
+            <th class="num" title="Prompt tokens read per second, summed over busy slots.">prompt/s</th>
+            <th class="num" title="Tokens generated per second, summed over busy slots.">output/s</th>
+            <th title="One tick per token landed in the last 30 seconds. A reading slot ticks per 100 tokens read.">tokens landing</th>
+            <th>detail</th>
+          </tr>
+        </thead>
+        <tbody data-slot="rows"></tbody>
+      </table>
+    </div>
+
+    <div class="block">
+      <div class="titleline">
+        <h3 class="title" title="A cache moves only as a file: out to disk before something displaces it, or back into a slot.">moves</h3>
+        <span class="dim" data-slot="lastMove"></span>
+      </div>
+      <div class="lane idle" data-slot="lane">
+        <span class="from" data-slot="laneFrom"></span>
+        <span class="track"></span>
+        <span class="packet mono" data-slot="packet"></span>
+        <span class="to" data-slot="laneTo"></span>
+        <span class="idle-note">nothing in transit</span>
+      </div>
+    </div>
+
+    <div class="block">
+      <h3 class="title">client setup</h3>
+      <div class="downloads">
+        <a href="config/opencode" download title="Written for the address you are reading this page on.">opencode.json</a>
+        <code class="dim">~/.config/opencode/opencode.json</code>
+        <a href="config/claude" download title="Written for the address you are reading this page on.">settings.json</a>
+        <code class="dim">~/.claude/settings.json</code>
+      </div>
+    </div>
+  </section>
+</template>
+
+<template id="tpl-wait-row">
+  <div class="row wait">
+    <span class="mono" data-slot="conv"></span>
+    <span class="mono" data-slot="waited"></span>
+    <span class="num mono" data-slot="tokens"></span>
+    <span class="dim" data-slot="status"></span>
+  </div>
+</template>
+
+<template id="tpl-stat">
+  <div class="stat">
+    <strong class="mono" data-slot="value"></strong>
+    <span data-slot="label"></span>
+  </div>
+</template>
+
+<template id="tpl-backend">
+  <tr class="backend">
+    <th scope="row"><span data-slot="name"></span> <span class="pill" data-slot="flag" hidden></span></th>
+    <td><span class="phase" data-slot="state"></span></td>
+    <td class="num mono" data-slot="slots"></td>
+    <td></td>
+    <td class="num mono" data-slot="prompt"></td>
+    <td class="num mono" data-slot="output"></td>
+    <td></td>
+    <td></td>
+  </tr>
+</template>
+
+<template id="tpl-slot">
+  <tr class="slot">
+    <td data-slot="id"></td>
+    <td><span class="phase" data-slot="phase"></span></td>
+    <td></td>
+    <td><span class="bar sm bands"><i class="reused" data-slot="reused"></i><i data-slot="progress"></i></span></td>
+    <td class="num mono" data-slot="prompt"></td>
+    <td class="num mono" data-slot="output"></td>
+    <td>
+      <svg class="tape" viewBox="0 0 144 16" aria-hidden="true">
+        <line class="axis" x1="0" y1="15" x2="144" y2="15"></line>
+        <g data-slot="ticks"></g>
+      </svg>
+    </td>
+    <td class="mono">
+      <span data-slot="detail"></span>
+      <span class="stall" data-slot="stall"></span>
+      <span class="eta" data-slot="eta"></span>
+    </td>
+  </tr>
+</template>

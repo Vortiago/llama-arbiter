@@ -1,0 +1,54 @@
+<template id="tpl-disk">
+  <section class="disk">
+    <div class="block">
+      <h3 class="title" title="Conversation copies are capped in bytes: 115 MiB plus 36.6 KiB a token. Saved prompts are capped by count.">budgets</h3>
+      <div class="rows budgets" data-slot="budgets"></div>
+    </div>
+
+    <div class="block">
+      <h3 class="title" title="Every file is a copy of something that also lives, or lived, in a slot. Deleting one costs at worst a re-read.">run/slots</h3>
+      <div class="rows files" data-slot="files"></div>
+    </div>
+
+    <div class="block">
+      <h3 class="title" title="Saved prompts link to the NVMe, which reads at 2.3 GB/s. Conversation copies stay on the roomier disk.">disks</h3>
+      <div class="rows mounts" data-slot="mounts"></div>
+    </div>
+  </section>
+</template>
+
+<template id="tpl-budget">
+  <div class="budget">
+    <span data-slot="label"></span>
+    <span class="bar wide"><i class="accent" data-slot="fill"></i></span>
+    <span class="mono dim" data-slot="text"></span>
+  </div>
+</template>
+
+<template id="tpl-disk-head">
+  <div class="row head">
+    <span>file</span>
+    <span>kind</span>
+    <span></span>
+    <span class="num">size</span>
+    <span class="num" title="Times a request started from this saved prompt since the router started.">loaded</span>
+  </div>
+</template>
+
+<template id="tpl-disk-file">
+  <div class="row diskfile">
+    <span class="mono" data-slot="name"></span>
+    <span><span class="pill" data-slot="kind"></span></span>
+    <span class="dim" data-slot="who"></span>
+    <span class="num mono" data-slot="size"></span>
+    <span class="num mono dim" data-slot="loads"></span>
+  </div>
+</template>
+
+<template id="tpl-mount">
+  <div class="budget">
+    <span class="mono" data-slot="path"></span>
+    <span class="bar wide"><i class="accent" data-slot="fill"></i></span>
+    <span class="mono dim" data-slot="text"></span>
+  </div>
+</template>

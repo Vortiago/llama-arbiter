@@ -1,0 +1,40 @@
+server: let a caller name the slot on the anthropic endpoint
+
+Problem
+-------
+/v1/messages converts an anthropic body to the OAI shape through a whitelist:
+
+    for (const auto & key : {"temperature", "top_p", "top_k", "stream",
+                             "chat_template_kwargs"})
+
+Anything not on the list is dropped, including id_slot. A router in front of
+this server can then only guess which slot took a prompt, by reading id_slot
+back out of the reply. That does not work either: to_json_anthropic never
+emits __verbose.
+
+Guessing from a poll is wrong most of the time, because the poll is seconds
+old and reading a long prompt runs for minutes.
+
+Fix
+---
+Add id_slot to the pass-through list, so a caller can say which slot should
+serve the request. It is honoured by get_available_slot the same way it is on
+the OAI endpoints.
+
+diff --git a/tools/server/server-chat.cpp b/tools/server/server-chat.cpp
+index a6fe3c6ba..a6674f66c 100644
+--- a/tools/server/server-chat.cpp
++++ b/tools/server/server-chat.cpp
+@@ -576,7 +576,11 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
+     }
+ 
+     // Pass through common params
+-    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs"}) {
++    // id_slot lets a caller say which slot should serve the request. Without
++    // it a router in front of this server can only guess which slot took a
++    // prompt, and guessing from a poll is wrong as often as not.
++    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs",
++                             "id_slot"}) {
+         if (body.contains(key)) {
+             oai_body[key] = body.at(key);
+         }

@@ -1,0 +1,134 @@
+/* Pieces every view of the router dashboard shares: block titles, phase
+   pills, bars, row grids, the token tape and the transfer lane. Each view
+   loads this beside its own stylesheet. Colours come from shell.css. */
+@layer components;
+
+@layer components {
+  .block { display: grid; gap: .5rem; }
+  .titleline { display: flex; gap: .8rem; align-items: baseline; flex-wrap: wrap; font-size: .85rem; }
+  .title {
+    margin: 0; font-size: .85rem; font-weight: 600; text-transform: lowercase;
+    color: var(--text-dim);
+  }
+  details.block > summary { cursor: pointer; list-style: none; }
+  details.block > summary::before { content: "▸ "; font-size: .7rem; }
+  details[open].block > summary::before { content: "▾ "; }
+  .note { font-size: .8rem; color: var(--text-dim); margin: 0; }
+  .wrap { overflow-x: auto; }
+  .num { text-align: right; }
+
+  .totals { display: flex; flex-wrap: wrap; gap: 2.4rem; }
+  .stat { display: grid; }
+  .stat strong { font-size: 1.7rem; line-height: 1.1; }
+  .stat span { font-size: .75rem; color: var(--text-dim); }
+  .stat.warn strong { color: var(--bad); }
+
+  .phase {
+    font-size: .76rem; padding: .08rem .5rem; border-radius: 1rem;
+    white-space: nowrap; display: inline-block;
+  }
+  .phase.up, .phase.generating { background: var(--ok); color: #fff; }
+  .phase.reading { background: var(--busy); color: #fff; }
+  .phase.down, .phase.stalled { background: var(--bad); color: #fff; }
+  .phase.idle { background: color-mix(in oklch, var(--text-dim), transparent 80%); }
+  .phase.draining { background: transparent; color: var(--busy); border: 1px solid var(--busy); }
+  .pill {
+    font-size: .72rem; padding: .02rem .4rem; border-radius: 1rem;
+    border: 1px solid var(--hairline); color: var(--text-dim); white-space: nowrap;
+  }
+
+  .bar {
+    display: inline-block; width: 7rem; height: .7rem; border-radius: 1rem;
+    background: var(--idle); overflow: hidden; vertical-align: middle;
+  }
+  .bar.sm { width: 5.5rem; height: .55rem; }
+  .bar > i { display: block; height: 100%; background: var(--ok); transition: width .5s linear; }
+  .bar > i.reading { background: var(--busy); }
+  .bar > i.stalled { background: var(--bad); }
+  .bar > i.accent { background: var(--accent); }
+  .bar.bands { display: inline-flex; }
+  .bar.bands > i.reused { background: color-mix(in oklch, var(--ok), transparent 55%); }
+
+  /* A list is one grid; each row's cells are its items (display: contents),
+     so a column is as wide as the widest thing in it and the 1fr column takes
+     what is left. Each list sets --cols: max-content for names and numbers,
+     1fr for the one free column. Never a guessed width. */
+  .rows {
+    display: grid; grid-template-columns: var(--cols, 1fr);
+    column-gap: .75rem; row-gap: .35rem; align-items: center; font-size: .85rem;
+  }
+  .rows > * { display: contents; }
+  .rows > .head > * { font-size: .78rem; color: var(--text-dim); }
+  .rows > .new > * { animation: settle 1.2s ease-out; }
+  @keyframes settle {
+    from { background: color-mix(in oklch, var(--accent), transparent 80%); }
+    to { background: transparent; }
+  }
+  .warn { color: var(--bad); }
+
+  .keys { display: flex; gap: 1.2rem; flex-wrap: wrap; font-size: .78rem; color: var(--text-dim); }
+  .keys i {
+    display: inline-block; width: .9rem; height: .6rem; border-radius: 2px;
+    vertical-align: middle; margin-inline-end: .3rem;
+  }
+  .keys .k-read { background: var(--busy); background-image: var(--hatch); }
+  .keys .k-gen { background: var(--ok); }
+  .keys .k-stall { background: var(--bad); background-image: var(--hatch); }
+  .keys .k-idle { background: var(--idle); border: 1px solid var(--hairline); }
+
+  /* A part-to-whole bar: reading against generating, reused against read. */
+  .rows.splits, .rows.reuse { --cols: max-content minmax(8rem, 1fr) max-content; }
+  .rows.reuse { max-width: 40rem; }
+  .split .stack {
+    display: flex; height: .9rem; border-radius: 1rem; overflow: hidden; gap: 2px;
+    background: var(--idle);
+  }
+  .split .stack i { display: block; height: 100%; transition: width .5s linear; }
+  .split .stack .read { background: var(--busy); background-image: var(--hatch); }
+  .split .stack .gen { background: var(--ok); }
+  .split .stack .stalled { background: var(--bad); background-image: var(--hatch); }
+
+  /* One tick per token that landed in the last 30 seconds. */
+  .tape { width: 9rem; height: 1rem; display: block; }
+  .tape line { stroke: var(--ok); stroke-width: 1.5; }
+  .tape line.pp { stroke: var(--busy); }
+  .tape .axis { stroke: var(--hairline); stroke-width: 1; }
+  .stall { color: var(--bad); font-weight: 600; white-space: nowrap; }
+  .eta { color: var(--text-dim); white-space: nowrap; }
+
+  /* A cache in transit: out to disk, or back into a slot. */
+  .lane {
+    position: relative; height: 2.2rem; border-radius: var(--r); background: var(--surface);
+    border: 1px solid var(--hairline); overflow: hidden;
+  }
+  .lane .from, .lane .to {
+    position: absolute; top: 50%; transform: translateY(-50%);
+    font-size: .78rem; color: var(--text-dim);
+  }
+  .lane .from { left: .7rem; }
+  .lane .to { right: .7rem; }
+  .lane .track {
+    position: absolute; left: 6.5rem; right: 6.5rem; top: 50%; height: 1px;
+    background: var(--hairline);
+  }
+  .lane .packet {
+    position: absolute; top: 50%; left: 6.5rem; transform: translate(0, -50%);
+    font-size: .74rem; padding: .1rem .5rem; border-radius: 1rem; white-space: nowrap;
+    background: var(--accent); color: #fff; opacity: 0;
+  }
+  .lane .idle-note {
+    position: absolute; inset: 0; display: grid; place-items: center;
+    font-size: .8rem; color: var(--text-dim);
+  }
+  .lane:not(.idle) .idle-note, .lane.idle .from, .lane.idle .to { visibility: hidden; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bar > i, .split .stack i { transition: none; }
+    .rows > .new > * { animation: none; }
+  }
+  @container (width < 800px) {
+    /* Narrow: each row is its own two-column grid again. */
+    .rows { grid-template-columns: 1fr; }
+    .rows > * { display: grid; grid-template-columns: 1fr 1fr; gap: .2rem .75rem; }
+  }
+}
