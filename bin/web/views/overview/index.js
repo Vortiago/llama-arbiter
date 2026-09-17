@@ -1,11 +1,8 @@
 // @ts-check
 /**
  * Right now: what every slot is doing, what the queue is blocked on, and the
- * last cache that moved.
- *
- * Rows are reconciled in place rather than swapped, so a progress bar can
- * advance and a token tape can gain a tick between two payloads. Everything
- * that moves on this page moves because a number in the payload changed.
+ * last cache that moved. Rows are reconciled in place, so a bar can advance
+ * and a tape can gain a tick between two payloads.
  */
 import { loadTemplates, tpl, pick, mount } from "../../lib/templates.js";
 import { renderRegion, reconcileList } from "../../lib/render.js";
@@ -37,8 +34,7 @@ const rate = (live) => (live ? `${live}` : "-");
 const reduced = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // ---------------------------------------------------------------- totals
-/** The six numbers the totals row shows. Derived once, so the region's sig
- * and its render read the same values rather than two copies of the sums.
+/** The totals row's numbers. Derived once, so the region's sig and its render agree.
  * @param {Status} status */
 function totalsOf(status) {
   const up = backendsOf(status).filter((b) => b.up);
@@ -83,8 +79,7 @@ function buildTotals(status) {
   return frag;
 }
 
-/** One row per waiter: only what differs between them. The shared reason is
- * in the heading line. @param {Status} status @returns {DocumentFragment} */
+/** One row per waiter, with only what differs. @param {Status} status @returns {DocumentFragment} */
 function buildWaiting(status) {
   const frag = new DocumentFragment();
   const reason = poolReason(status);
@@ -101,8 +96,7 @@ function buildWaiting(status) {
   return frag;
 }
 
-/** One line for the whole queue: how many, what they are blocked on, and the
- * soonest slot. Shared by every waiter, so said once. @param {Status} status */
+/** One line for the whole queue: how many, why, and the soonest slot. @param {Status} status */
 function waitingText(status) {
   const waiting = status.waiting || 0;
   if (!waiting) return "nobody";
@@ -183,8 +177,7 @@ function updateSlot(el, be, sl) {
     el.dataset.phase = shown;
   }
 
-  // One bar for the whole prompt: the reused band is calm, the band being
-  // read is the active one, so a mostly reused prompt reads as mostly done.
+  // One bar for the whole prompt: the reused band is calm, the read band is active.
   const bands = promptBands(sl);
   const reused = pick(el, "reused"), progress = pick(el, "progress");
   const pct = (/** @type {number} */ n) => (bands ? `${((100 * n) / bands.total).toFixed(1)}%` : "0");
@@ -193,8 +186,7 @@ function updateSlot(el, be, sl) {
   progress.className = sl.phase === "reading" ? "reading" : stalled ? "stalled" : "";
 
   pick(el, "prompt").textContent = sl.phase === "reading" && sl.pp_rate ? `${sl.pp_rate}` : "";
-  // Blank until a rate has resolved, rather than the "null" a template would
-  // otherwise print into the cell.
+  // Blank until a rate resolves, never "null".
   pick(el, "output").textContent =
     sl.phase === "generating" && sl.tg_rate != null ? `${sl.tg_rate}` : "";
 
@@ -243,8 +235,8 @@ function drawTape(el, t, now) {
   }, (line, at) => place(line, at, now));
 }
 
-/** Add a tick for every token that landed since the last payload, spread
- * across the gap, since the payload only says how many. @param {Element} el @param {Slot} sl */
+/** Add a tick per token landed since the last payload, spread across the gap.
+ * @param {Element} el @param {Slot} sl */
 function tape(el, sl) {
   const now = Date.now() / 1000;
   let t = tapes.get(el);
@@ -277,8 +269,8 @@ let lastFileAt = null;
 /** @param {FileEvent} ev */
 const describe = (ev) => `${DID[ev.did] || ev.did} ${ev.name}${ev.bytes ? ` · ${mib(ev.bytes)}` : ""}`;
 
-/** Cross the lane once, for as long as the copy took. A write to the SATA
- * disk runs at 520 MB/s, so the size sets the time; a load has no size.
+/** Cross the lane once, for as long as the copy took. The SATA disk writes at
+ * 520 MB/s. A load has no size.
  * @param {FileEvent} ev @param {HTMLElement} lane @param {AbortSignal} signal */
 function transfer(ev, lane, signal) {
   const toDisk = ev.did === "parked" || ev.did.startsWith("kept");
@@ -322,12 +314,8 @@ export default {
     loadCSS(import.meta.url, "./style.css", signal);
     await loadTemplates(new URL("./overview.html", import.meta.url).href,
                         { signal });
-    // The shell aborts this controller when the reader clicks another
-    // view. Without the check a mount cancelled mid-fetch carried on and
-    // painted over whatever mounted after it - and worse, subscribe() and
-    // every() register their teardown on `signal`, which never fires again
-    // once it has aborted, so the dead view kept its SSE subscriber and its
-    // interval for the life of the tab. flow/index.js has had this guard.
+    // Stop a mount cancelled mid-fetch. subscribe() and every() register teardown
+    // on `signal`, which never fires again once aborted, so a dead view would leak them.
     if (signal.aborted) throw new DOMException("mount cancelled", "AbortError");
 
     mount(container, tpl("tpl-overview"));
@@ -342,10 +330,8 @@ export default {
     subscribe(
       /** @param {Status} status */
       (status) => {
-        // Signed off the slice each region renders. All three signed the whole
-        // payload, and the payload carries the history buckets, one of which
-        // moves every second with or without traffic - so the sig never
-        // matched and the gate never skipped a rebuild.
+        // Sign each region with the slice it renders, never the whole payload:
+        // the history buckets move every second.
         const whyText = waitingText(status);
         renderRegion(totals, () => buildTotals(status),
                      { sig: `t${JSON.stringify(totalsOf(status))}` });

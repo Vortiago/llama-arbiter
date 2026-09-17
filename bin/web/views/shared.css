@@ -1,6 +1,5 @@
-/* Pieces every view of the router dashboard shares: block titles, phase
-   pills, bars, row grids, the token tape and the transfer lane. Each view
-   loads this beside its own stylesheet. Colours come from shell.css. */
+/* Pieces every view shares. Each view loads this beside its own stylesheet.
+   Colours come from shell.css. */
 @layer components;
 
 @layer components {
@@ -49,10 +48,8 @@
   .bar.bands { display: inline-flex; }
   .bar.bands > i.reused { background: color-mix(in oklch, var(--ok), transparent 55%); }
 
-  /* A list is one grid; each row's cells are its items (display: contents),
-     so a column is as wide as the widest thing in it and the 1fr column takes
-     what is left. Each list sets --cols: max-content for names and numbers,
-     1fr for the one free column. Never a guessed width. */
+  /* A list is one grid; each row's cells are its items (display: contents).
+     Each list sets --cols: max-content for names and numbers, 1fr for the free column. */
   .rows {
     display: grid; grid-template-columns: var(--cols, 1fr);
     column-gap: .75rem; row-gap: .35rem; align-items: center; font-size: .85rem;

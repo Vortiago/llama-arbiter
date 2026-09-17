@@ -1,31 +1,21 @@
-/* Flow: a prompt crosses the top, the two stores it draws on hold the floor,
-   and the bank down the right says what the caching saved.
-   Horizontal is progress through a turn; vertical is storage. Nothing here
-   may violate that - it is what makes the disk read as a substrate rather
-   than another box in the row, and it is true: a migration to a generating
-   instance passes through a file, and an opening comes up off disk into a slot.
+/* Flow: a prompt crosses the top, the two stores hold the floor, and the bank
+   on the right says what the caching saved. Horizontal is progress through a
+   turn; vertical is storage.
 
-   This view deliberately does NOT load shared.css. It uses none of `.block`,
-   `.title`, `.phase`, `.pill`, `.bar`, `.rows`, `.tape` or `.lane`, and the
-   old flow sheet collided with shared's `.lane` at equal specificity. Every
-   class here is `f-` prefixed and the rules are unlayered, so they outrank
-   anything in @layer components whatever its specificity. */
+   This view does not load shared.css. Every class here is `f-` prefixed and
+   the rules are unlayered, so they outrank anything in @layer components. */
 @layer components;
 
-/* Full-bleed, without a measured constant and without touching the shell.
-   The :has() guard only matches while this view is mounted, and loadCSS
-   removes the link on abort, so the other tabs are untouched twice over. */
+/* Full-bleed. The :has() guard matches only while this view is mounted, and
+   loadCSS removes the link on abort. */
 :root:has(.flowview) body { min-height: 100dvh; display: flex; flex-direction: column; }
 :root:has(.flowview) main { flex: 1; min-height: 0; padding: 0; display: flex; }
 
 @scope (.flowview) {
   :scope {
-    /* Derived from the eleven in shell.css, never invented. --ok, --busy and
-       --bad stay reserved for state and are never spent on a category; they
-       are only four units apart under protanopia, so the phase glyph and the
-       phase word carry reading-against-generating, not the hue.
-       Every categorical pair below was computed with the dataviz validator
-       against #ffffff and #131722, not eyeballed. */
+    /* Derived from shell.css. --ok, --busy and --bad are reserved for state;
+       they are four units apart under protanopia, so the glyph and the word
+       carry the phase. Pairs below were validated against #ffffff and #131722. */
     --f-ground: light-dark(#eceff4, #06080c);
     --f-sunk:   light-dark(#e4e8ee, #080a10);
     --f-live:   var(--accent);                       /* a copy in a slot now */
@@ -39,7 +29,7 @@
     container-type: inline-size;
   }
 
-  /* the ground is lit from where the work enters, so the board has a front */
+  /* the ground is lit from where the work enters */
   .f-board::before {
     content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 0;
     background:
@@ -55,33 +45,26 @@
   .f-stage  { grid-column: 1; grid-row: 1; z-index: 3; }
   .f-stores { grid-column: 1; grid-row: 2; z-index: 1; }
   .f-bank   { grid-column: 2; grid-row: 1 / span 2; z-index: 3; }
-  /* Stacking, declared once: the stores sit under the wires so a connector to
-     a copy stays visible, the stage over them so a node is never crossed. */
+  /* Stacking: stores under the wires, stage over them, so a node is never crossed. */
   .f-wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none;
     overflow: visible; z-index: 2; }
-  /* A wire is a rail and a current. The rail is always there and recedes; the
-     current runs on it only while tokens are moving, as round marks spaced one
-     token apart. A single path could not be both - a hairline thin enough to
-     sit back cannot also carry a mark you can see across a room. */
+  /* A wire is a rail and a current: two paths, because a hairline cannot also
+     carry a visible mark. */
   .f-wires path { fill: none; stroke: none; }
   .f-wires path[data-tone="rail"] { stroke: color-mix(in oklch, var(--text-dim), transparent 62%); stroke-width: 1.2; }
   .f-wires path[data-tone="hold"] { stroke: var(--f-live); stroke-width: 1.6; opacity: .45; stroke-dasharray: 4 5; }
   .f-wires path[data-tone="hold"].lit { opacity: 1; stroke-width: 2.6; stroke-dasharray: none; }
-  /* a zero-length dash with a round cap is a dot, so the marks read as things
-     travelling rather than as a moving dashed line */
+  /* a zero-length dash with a round cap is a dot */
   .f-wires path.march {
     stroke-dasharray: 0.01 var(--f-period); stroke-linecap: round; stroke-width: 3.4;
   }
   .f-wires path[data-tone="read"].march     { stroke: var(--busy); }
   .f-wires path[data-tone="generate"].march { stroke: var(--ok); }
-  /* A capped wire is brighter, never faster - it does not pretend to a rate it
-     is not running at. No filter: a drop-shadow on an animated path rasterises
-     every frame, the one genuinely costly thing on a page open all day. */
+  /* A capped wire is brighter, never faster. No filter: a drop-shadow on an
+     animated path rasterises every frame. */
   .f-wires path.capped { stroke-width: 5; }
 
-  /* The gap between stations is where the wires live. At 1.5rem every wire was
-     an 18px stub and the current - the whole idea - had nowhere to run. The
-     columns give the room up; a station is only as wide as it needs to be. */
+  /* The gap between stations is where the wires run. At 1.5rem a wire is an 18px stub. */
   .f-stage { position: relative; display: grid; gap: 0 4rem;
     align-items: start; align-content: center;
     grid-template-columns: minmax(7rem,.5fr) minmax(13rem,1.15fr) minmax(6.5rem,.42fr) minmax(10rem,.85fr); }
@@ -108,7 +91,7 @@
     background: var(--surface); padding: .5rem .6rem .55rem; display: grid; gap: .38rem;
     box-shadow: 0 1px 1px light-dark(rgba(0,0,0,.04), rgba(0,0,0,.45)),
                 0 12px 28px -22px light-dark(rgba(0,0,0,.45), rgba(0,0,0,1)); }
-  /* an idle slot goes genuinely dark, so the page is dark where the machine is */
+  /* an idle slot goes dark */
   .f-node[data-phase="idle"] { background: color-mix(in oklch, var(--surface), var(--f-ground) 82%);
     border-color: color-mix(in oklch, var(--hairline), transparent 55%); color: var(--text-dim);
     box-shadow: none; }
@@ -120,7 +103,7 @@
   }
   .f-node[data-phase="reading"]    { color: var(--busy); border-color: color-mix(in oklch, var(--busy), var(--hairline) 45%); }
   .f-node[data-phase="generating"] { color: var(--ok);   border-color: color-mix(in oklch, var(--ok), var(--hairline) 45%); }
-  /* a backend that is down stays on the page and says so */
+  /* a backend that is down stays on the page */
   .f-node[data-phase="down"] { color: var(--bad); border-style: dashed;
     border-color: color-mix(in oklch, var(--bad), var(--hairline) 40%);
     background: color-mix(in oklch, var(--surface), var(--f-ground) 65%); }
@@ -156,8 +139,7 @@
   .f-phase { font-size: .7rem; margin-inline-start: auto; display: inline-flex; gap: .25rem; align-items: baseline; }
   .f-ico { font-style: normal; font-family: initial; font-size: .74rem; line-height: 1; }
   .f-node-foot { font-size: .7rem; color: var(--text-dim); font-family: var(--mono); gap: .7rem; }
-  /* the prompt: reused, read, and what is still to read. A 2px gap in the
-     surface colour separates the bands; never a border drawn round them. */
+  /* the prompt: reused, read, still to read. A 2px gap separates the bands. */
   .f-fill { height: 1.4rem; border-radius: 3px; background: var(--f-sunk); display: flex; gap: var(--gap);
     overflow: hidden; position: relative; }
   .f-fill i { display: block; height: 100%; transition: width .6s linear; }
@@ -165,9 +147,7 @@
   .f-read { background: currentColor; border-radius: 0 3px 3px 0; }
   .f-node[data-phase="idle"] .f-fill { height: .5rem; }
   .f-node-foot > .f-num:last-child { margin-inline-start: auto; }
-  /* Ten minutes, ten seconds a bar. The only part of this view with a memory:
-     without it a slot that has read for an hour and one that started a moment
-     ago look the same, and a stall that came and went leaves no trace. */
+  /* Ten minutes, ten seconds a bar. The only part of this view with a memory. */
   .f-hist { display: flex; gap: 1px; height: .85rem; align-items: flex-end; }
   .f-hist i {
     flex: 1 1 0; min-width: 0; height: 100%; border-radius: 1px;
@@ -186,10 +166,7 @@
   .f-wait-head .f-num { margin-inline-start: auto; font-size: .68rem; color: var(--text-dim); }
   .f-wait-why { font-size: .66rem; color: var(--text-dim); }
   .f-wait-why .f-num { margin-inline-start: auto; }
-  /* A request carrying pictures is a different shape of work: the vision
-     encoder runs in RAM on every instance, including one with a GPU, which at
-     full context may have no VRAM to spare for it. So an image turn does CPU
-     work whichever instance ends up generating it. */
+  /* A request with pictures: the vision encoder runs in RAM on every instance, GPU or not. */
   .f-pics { color: var(--accent); white-space: nowrap; cursor: help; }
   .f-pics[hidden] { display: none; }
   .f-gate { border: 1px dashed color-mix(in oklch, var(--hairline), transparent 20%); border-radius: var(--r);
@@ -197,10 +174,8 @@
     background: color-mix(in oklch, var(--surface), transparent 55%); }
   .f-gate-n { font-family: var(--mono); font-size: 1.9rem; line-height: 1; font-weight: 600;
     font-variant-numeric: proportional-nums; color: var(--text); }
-  /* A parked turn IS a file: hand_off writes the cache to disk, hands the
-     reader back, and only then waits - between the park and the restore the
-     conversation lives on disk and nowhere else. So the queue is drawn as the
-     stack of files it is, biggest wait on top. */
+  /* A parked turn is a file on disk, so the queue is drawn as a stack of files,
+     longest wait on top. */
   .f-stack { display: grid; gap: .3rem; width: 100%; margin-top: .15rem; }
   .f-stack:empty { display: none; }
   .f-file {
@@ -222,8 +197,7 @@
   .f-gate:has(.f-gate-n:not(:empty)) { color: var(--text-dim); }
   .f-gate span { font-size: .64rem; color: var(--text-dim); text-align: center; }
 
-  /* the bank: one chart, not a list. Each turn is what it took against what
-     reading it cold would have cost, so the hollow IS the saving. */
+  /* the bank: each turn is what it took against a cold read. The hollow is the saving. */
   .f-bank { display: grid; grid-template-rows: auto minmax(0,1fr) auto; gap: .55rem;
     border: 1px solid var(--hairline); border-radius: var(--r);
     background: var(--surface); padding: .7rem .75rem .6rem; min-height: 0; }
@@ -266,8 +240,7 @@
   .f-stores { position: relative; display: grid; gap: .7rem; grid-template-rows: auto auto; min-height: 0; }
   .f-store { border: 1px solid var(--hairline); border-radius: var(--r); background: var(--surface);
     padding: .45rem .65rem .5rem; display: grid; gap: .4rem; grid-template-rows: auto minmax(0,1fr) auto; }
-  /* content first, so a connector from a slot lands on the strip across the
-     box's padding instead of crossing a header full of text */
+  /* content first, so a connector from a slot lands on the strip, not on the header */
   .f-flip { grid-template-rows: auto auto auto; padding-top: .5rem; }
   .f-head, .f-foot { margin: 0; display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap; font-size: .72rem; }
   .f-cap { margin-inline-start: auto; color: var(--text-dim); font-family: var(--mono); font-size: .66rem; }
@@ -276,30 +249,26 @@
   .f-shelf { display: grid; gap: .28rem; }
   .f-shelf-head { margin: 0; display: flex; gap: .45rem; align-items: baseline; font-size: .68rem; }
   .f-of { margin-inline-start: auto; color: var(--text-dim); font-family: var(--mono); font-size: .65rem; }
-  /* fits without a scrollbar: an ambient display must never need one */
-  /* Not a grid of equal boxes: a cell's weight follows its size, so the shelf
-     reads as a shelf. An 8-hex hash tells you nothing; 3.4 GiB against
-     357 MiB tells you which one costs eleven times as much to read. */
+  /* No scrollbar. Not a grid of equal boxes: a cell's weight follows its size.
+     3.4 GiB against 357 MiB is eleven times the read cost. */
   .f-rack { display: flex; flex-wrap: wrap; gap: .28rem; }
   .f-cell { flex: var(--w, 1) 1 4rem; }
   .f-cell { border-radius: 4px; background: var(--f-sunk); padding: .28rem .35rem .3rem;
     display: grid; gap: .04rem; font-family: var(--mono); line-height: 1.2; cursor: default; }
-  /* size is what tells a 3.6 GiB prompt from a 375 MiB one; the hash is not */
+  /* size tells 3.6 GiB from 375 MiB; the hash does not */
   .f-cell-size { font-size: .68rem; font-weight: 600; }
   .f-cell-name { font-size: .56rem; color: var(--text-dim); }
   .f-cell-loads { font-size: .56rem; color: var(--accent); }
   .f-cell-loads:empty { display: none; }
   .f-cell[data-free] { background: transparent; box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--hairline), transparent 30%); }
 
-  /* the copies: PARK_BUDGET is the whole strip, each copy as wide as its real
-     share of it, linear because the budget counts bytes and not files */
+  /* the copies: PARK_BUDGET is the whole strip, each copy its share in bytes */
   .f-strip { display: flex; height: 3.4rem; border-radius: 4px; background: var(--f-sunk); overflow: hidden; }
   .f-blk { position: relative; min-width: 3px; height: 100%; background: var(--f-disk);
     display: grid; align-content: center; justify-items: center; overflow: hidden; cursor: default;
     box-shadow: inset -1px 0 0 var(--surface); font-style: normal; }
   .f-blk[data-state="live"] { background: var(--f-live); }
-  /* hollow, not faint: this is 84% of the strip by bytes and at a low-contrast
-     fill it dissolved into the track */
+  /* hollow, not faint: 84% of the strip by bytes dissolves at a low-contrast fill */
   .f-blk[data-state="kept"] { background: transparent; box-shadow: inset 0 0 0 1px var(--f-disk), inset -1px 0 0 var(--surface); }
   .f-blk[data-state="live"]::after { content: ""; position: absolute; inset-inline: 0; top: 0; height: 3px; background: var(--accent); }
   .f-blk.paired { outline: 2px solid var(--accent); outline-offset: -2px; z-index: 1; }
@@ -314,15 +283,11 @@
   .f-table th, .f-table td { text-align: left; padding: .12rem .5rem .12rem 0; font-weight: 400; }
   .f-table thead th { color: var(--text-dim); border-bottom: 1px solid var(--hairline); }
   .f-table td.f-num { text-align: right; }
-  /* A column the caller did not name. Stated here rather than left to the UA
-     rule, as every other [hidden] in this sheet is. */
+  /* a column the caller did not name; stated, not left to the UA rule */
   .f-table th[hidden], .f-table td[hidden] { display: none; }
   .f-table tbody tr:nth-child(odd) { background: color-mix(in oklch, var(--text-dim), transparent 94%); }
 
-  /* A cache going to disk is a file being carried, so it is drawn as one: a
-     card with a folded corner, wearing the emoji of the store it is bound for,
-     with its real size on it. It was a text pill, which read as a tooltip
-     flying past rather than a thing with weight. */
+  /* a transfer packet: a card with a folded corner, the store's emoji, and its size */
   .f-packet {
     position: absolute; z-index: 4; left: 0; top: 0; pointer-events: none;
     display: grid; justify-items: center; align-content: center; gap: .1rem;
@@ -332,7 +297,7 @@
                 0 0 22px -6px var(--f-live),
                 0 10px 22px -12px light-dark(rgba(0,0,0,.4), rgba(0,0,0,1));
   }
-  /* the folded corner: the one flourish, and it is what makes it read as paper */
+  /* the folded corner */
   .f-packet::after {
     content: ""; position: absolute; top: 0; right: 0; width: 11px; height: 11px;
     border-radius: 0 5px 0 4px;
@@ -347,8 +312,7 @@
     .f-bank { grid-column: 1; grid-row: 3; }
   }
 
-  /* Where hue cannot survive - forced colours, print - texture carries
-     identity instead. Opt-in only, never the default channel. */
+  /* Forced colours and print: texture carries identity instead of hue. */
   @media (forced-colors: active), print {
     .f-blk[data-state="live"] { background: repeating-linear-gradient(45deg, CanvasText 0 2px, Canvas 2px 5px); }
     .f-blk[data-state="kept"] { background: transparent; }

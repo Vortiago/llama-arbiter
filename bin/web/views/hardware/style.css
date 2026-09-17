@@ -16,8 +16,7 @@
   button.small:hover { color: var(--text); }
   button.small:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .cmp th, .cmp td { text-align: left; padding: .3rem .7rem; white-space: nowrap; }
-  /* Bar then number, in two fixed tracks, so every number in a column shares
-     a right edge with the heading above it. */
+  /* Bar then number, in two fixed tracks, so the numbers in a column share a right edge. */
   .rate { display: inline-grid; grid-template-columns: 5.5rem max-content; gap: .6rem; align-items: center; justify-items: end; }
   .rate .bar { justify-self: start; }
   .cmp thead th { font-size: .78rem; font-weight: 600; color: var(--text-dim); border-bottom: 1px solid var(--hairline); }

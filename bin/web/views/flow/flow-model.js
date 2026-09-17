@@ -1,11 +1,7 @@
 // @ts-check
 /**
- * The flow payload, read without a DOM: where each turn stands, what each slot
- * is doing and how fast, what the two disk stores hold, and what the caching
- * has saved. Pure, so the tests run in node.
- *
- * Everything here is a function of one payload. The view only places what
- * these say; anything that needs a rect or a clock lives in index.js.
+ * The flow payload, read without a DOM. Pure, so the tests run in node.
+ * Anything that needs a rect or a clock lives in index.js.
  */
 import { backendsOf, slotsOf, STALL_RATE, promptBands } from "../status.js";
 
@@ -17,44 +13,31 @@ import { backendsOf, slotsOf, STALL_RATE, promptBands } from "../status.js";
 /** @typedef {import("../status.js").FileEvent} FileEvent */
 /** @typedef {import("../status.js").Request} Request */
 
-/** What a prompt costs to prefill here, in tokens a second, measured over a
- * working day. Every "what did this save" figure on the page is tokens
- * divided by this. */
+/** Prefill cost here in tokens a second, measured over a working day.
+ * Every saving on the page is tokens divided by this. */
 export const READ_RATE = 25;
 
-/** The spacing of one mark on a wire, in px. A wire walks exactly this far a
- * second at playbackRate 1, so the rate IS marks a second. The model decides
- * the rate; the stylesheet only draws it. */
+/** Spacing of one mark on a wire, in px. A wire walks this far a second at
+ * playbackRate 1, so the rate is marks a second. */
 export const MARK_PERIOD = 15;
 
-/** Marks a second past which the eye reads a wagon wheel rather than a flow.
- * A mark covers one period a second at rate 1, so at 60Hz it aliases past half
- * the frame rate - 30 a second, whatever the period is - and this leaves
- * headroom. A capped wire says so rather than lying about its speed. */
+/** Marks a second past which the eye sees a wagon wheel. At 60Hz a wire
+ * aliases past 30 marks a second. A capped wire says so. */
 export const MARK_CAP = 24;
 
-/** The row a slot stands on. Every key on this page is built here, so a slot
- * named from a payload row and one named from a backend's own slots always
- * read alike. @param {{backend: string|null, slot: number|null}} r */
+/** Every slot key on this page is built here, so keys from any source read alike.
+ * @param {{backend: string|null, slot: number|null}} r */
 export const slotKey = (r) => (r.backend ? `${r.backend}:${r.slot ?? 0}` : "");
 
-/** The rate a reading slot is really moving at.
- *
- * A slot's own `pp_rate` is 0.0 until the router's ten second window closes,
- * and a reader's counter steps a batch at a time, so a zero here is silence,
- * not a stall. The backend's own running average is the better answer, and the
- * measured machine rate is the floor.
+/** The rate a reading slot moves at. A slot's own `pp_rate` is 0 until the
+ * router's 10 second window closes, so 0 is silence, not a stall. Fall back
+ * to the backend average, then to READ_RATE.
  * @param {Backend} be @param {Slot} sl @returns {number} */
 export const readRate = (be, sl) => sl.pp_rate || be.stats?.pp_rate || READ_RATE;
 
-/** The rate a generating slot is really moving at, or null when nothing knows.
- *
- * The same zero as readRate's, from the same window: `tg_rate` stays 0 all
- * through the read, so it is still 0 for up to ten seconds after the first
- * token comes out. Taken at face value that is under STALL_RATE, so every turn
- * opened wearing "not moving" on a wire with no marks on it. There is no
- * machine floor to fall back on here - a stall is what this number is read for,
- * so inventing one would hide the thing it answers - hence null for silence.
+/** The rate a generating slot moves at, or null when nothing knows yet.
+ * `tg_rate` stays 0 for up to 10 seconds after the first token, which reads
+ * as under STALL_RATE. Null, not a floor: a stall is what this number is read for.
  * @param {Backend} be @param {Slot} sl @returns {number | null} */
 export const genRate = (be, sl) => sl.tg_rate || be.stats?.tg_rate || null;
 
@@ -72,12 +55,8 @@ export function currentOf(be, sl) {
 export const markRate = (rate) => ({ marks: Math.min(rate, MARK_CAP), capped: rate > MARK_CAP });
 
 /** A slot that has work and is not getting through it.
- *
- * For a generating slot, under half a token a second because a prefill runs
- * beside it - against genRate, not the raw `tg_rate`, or a turn is stalled for
- * the first ten seconds of every generation it ever does. For a reading slot it
- * cannot be the rate at all, which reads zero whenever the window has not
- * closed; it is the counter standing still for longer than two batches take.
+ * Generating: under STALL_RATE by genRate, not raw `tg_rate`, which is 0 for the first 10 seconds.
+ * Reading: the `done` counter has stood still for longer than two batches take.
  * @param {Backend} be @param {Slot} sl @param {number} sinceStep seconds since
  *   `done` last moved, or 0 when it has never been seen to move */
 export function stuck(be, sl, sinceStep) {
@@ -86,15 +65,13 @@ export function stuck(be, sl, sinceStep) {
     return rate !== null && rate < STALL_RATE;
   }
   if (sl.phase !== "reading") return false;
-  // bin/qwen-mtp-cpu.sh's default, for a backend whose log this router did not
-  // write. 2048 here was four times too patient once the default moved.
+  // bin/qwen-mtp-cpu.sh's default n_batch. 2048 is four times too patient.
   const batch = be.config?.n_batch || 512;
   return sinceStep > (2 * batch) / readRate(be, sl);
 }
 
-/** A word and a glyph per state. The glyph is not decoration: `--busy` and
- * `--ok` are four units apart under protanopia, so reading and generating
- * cannot be told apart by hue, and the mark carries it instead. */
+/** A word and a glyph per state. `--busy` and `--ok` are four units apart
+ * under protanopia, so the glyph, not the hue, tells reading from generating. */
 export const PHASE = {
   idle: { icon: "·", word: "idle" },
   reading: { icon: "📖", word: "reading" },
@@ -103,13 +80,12 @@ export const PHASE = {
   down: { icon: "✖", word: "down" },
 };
 
-/** Stands in for a backend that never answered, so it has a card to be down on.
- *  @type {Slot} */
+/** Stands in for a backend that never answered. @type {Slot} */
 const DOWN_SLOT = { id: 0, busy: false, prompt: 0, done: 0, cached: 0, decoded: 0,
   pp_rate: 0, tg_rate: 0, phase: "idle" };
 
 /** @typedef {{ i: number, read: number, gen: number, stalled: number }} Bar one
- *  bucket of the history band, with its index so a list can key on it */
+ *  bucket of the history band, keyed by its index */
 
 /** @typedef {{ key: string, backend: string, slot: number, generator: boolean,
  *              phase: string, stuck: boolean, bands: ReturnType<typeof promptBands>,
@@ -124,14 +100,10 @@ export function nodesOf(status, sinceStep) {
   const live = status.flow?.live || [];
   /** @type {SlotNode[]} */ const rows = [];
   for (const be of backendsOf(status)) {
-    // One band per backend, not per slot: every slot of a backend shares its
-    // history, and rebuilding sixty buckets a slot is work nobody reads.
+    // One history per backend: every slot of a backend shares it.
     const history = historyOf(status, be.name);
-    // A backend the router has never polled carries no slot detail at all -
-    // it is seeded empty and only written after /slots answers - so a backend
-    // that failed to come up drew nothing, which is the one case the down card
-    // exists for. One stands in. Only while it is down: a live backend's slots
-    // are its own, and inventing one would be inventing state.
+    // A backend the router never polled has no slot detail. One stand-in slot
+    // gives it a down card. Only while down: a live backend's slots are its own.
     const slots = slotsOf(be).length || be.up ? slotsOf(be) : [DOWN_SLOT];
     for (const sl of slots) {
       const key = slotKey({ backend: be.name, slot: sl.id });
@@ -144,17 +116,12 @@ export function nodesOf(status, sinceStep) {
         stuck: be.up && stuck(be, sl, sinceStep(key)),
         bands: promptBands(sl), tone, rate, marks, capped,
         decoded: sl.decoded || 0,
-        // what this slot's context is carrying: the prompt it holds plus what
-        // it has generated on top, against the window it has to fit in.
+        // the prompt it holds plus what it generated, against its window
         ctx: (sl.cached || 0) + (sl.done || 0) + (sl.decoded || 0),
         nCtx: be.n_ctx || 0,
-        // Not status.js's secondsLeft: that divides by the slot's own pp_rate,
-        // which is zero until the router's window closes, so the eta silently
-        // vanished for most of every read. readRate has the honest answer.
-        //
-        // Gated on be.up like phase and stuck are: a backend that died mid-read
-        // keeps the slot detail of its last good poll, and an eta counting down
-        // beside "down" is a promise nothing is keeping.
+        // Not secondsLeft: that divides by the slot's own pp_rate, which is 0
+        // until the window closes. Gated on be.up: a dead backend keeps the
+        // slot detail of its last good poll.
         left: be.up && sl.phase === "reading" && sl.prompt > 0
           ? sl.prompt / readRate(be, sl) : null,
         history,
@@ -166,22 +133,17 @@ export function nodesOf(status, sinceStep) {
 }
 
 /** @typedef {{ read: number, gen: number, stalled: number }} Band cumulative
- *  percentages up the bucket, so CSS can build one gradient from three stops */
+ *  percentages up the bucket, so CSS builds one gradient from three stops */
 
 /** The last ten minutes of a backend, one band per ten-second bucket.
- *
- * `history` is the only part of the payload that remembers anything, and the
- * rest of this view is all present tense. A slot that has been reading for an
- * hour and one that started thirty seconds ago look identical without it, and
- * a stall that came and went leaves no trace at all.
+ * The only part of this view with a memory.
  * @param {Status} status @param {string} backend @returns {Bar[]} */
 export function historyOf(status, backend) {
   const h = status.history?.backends?.[backend];
   if (!h) return [];
   const buckets = [...(h.done || []), ...(h.cur ? [h.cur] : [])];
   return buckets.map((b, i) => {
-    // A multi-slot backend can spend more slot-seconds than the bucket is
-    // long, so the scale is whichever is larger - the bands never overflow.
+    // A multi-slot backend can spend more slot-seconds than the bucket is long. Scale by the larger.
     const busy = (b.read || 0) + (b.gen || 0) + (b.stalled || 0);
     const span = Math.max(b.secs || 0, busy, 1e-9);
     const read = (100 * (b.read || 0)) / span;
@@ -194,25 +156,16 @@ export function historyOf(status, backend) {
  *              why: string, kind: "turn" | "pinned" | "other",
  *              images: number, imageTokens: number }} Arrival */
 
-/** The turns with no slot yet, and what each is waiting for.
- *
- * Not status.js's waitLabel: that writes a sentence, and a sentence per card
- * in a column three cards deep is a wall. The distinction is worth four words.
- *
- * `since` rides along because it is the only thing that tells two waiters
- * apart: the whole point of `wants: "turn"` is a turn queued behind another
- * turn of the SAME conversation, so the conversation alone is not a key.
+/** The turns with no slot yet, and what each waits for. `since` is part of the
+ * key: a `wants: "turn"` waiter is queued behind another turn of the same conversation.
  * @param {Status} status @param {number} [aged] seconds since this payload
  *   arrived, measured locally @returns {Arrival[]} */
 export function arrivalsOf(status, aged = 0) {
   return (status.waiting_detail || []).map((w) => ({
     conv: w.conv,
     since: w.since,
-    // The router stamps `waited` when it builds the payload, so between two
-    // payloads it stands still. `aged` is seconds measured locally since this
-    // one arrived, not a reading of any clock: `since` is the router's epoch,
-    // and subtracting a browser's own clock from it is off by the skew
-    // between two machines rather than by nothing.
+    // `waited` is stamped by the router. Age it by local elapsed time, never
+    // by comparing this clock to the router's epoch: the skew is unknown.
     waited: w.waited + aged,
     tokens: w.tokens,
     why: w.wants === "turn" ? "behind its own turn"
@@ -227,13 +180,8 @@ export function arrivalsOf(status, aged = 0) {
 
 /** @typedef {{ conv: string, waited: number, bytes: number }} Parked */
 
-/** The turns whose prompt is read and whose cache is on disk, waiting for the
- * generator, longest wait first.
- *
- * A count alone says nothing about a queue whose entries sit for minutes
- * holding gigabytes. Each of these is literally a file: `hand_off` parks the
- * cache, hands the reader back, and only then waits - so between the park and
- * the restore the conversation lives on disk and nowhere else.
+/** The turns parked on disk and waiting for the generator, longest wait first.
+ * Each is a file: `hand_off` parks the cache, hands the reader back, then waits.
  * @param {Status} status @param {number} now epoch seconds @returns {Parked[]} */
 export function parkedOf(status, now) {
   /** @type {Map<string, number>} */ const size = new Map();
@@ -251,15 +199,9 @@ export function parkedOf(status, now) {
 }
 
 
-/** Which slot provably holds each conversation's copy.
- *
- * A copy's `backend` is where the conversation last ran; only `slot` says the
- * cache is still sitting there, and the router clears it the moment something
- * displaces it. Three copies can name one single-slot backend and at most one
- * of them is in it, so a line drawn from `backend` alone claims three caches
- * in one slot.
- * Where a copy carries no `slot`, a turn the flow says is in a slot right now
- * proves the same fact from the other side, so it counts too.
+/** Which slot provably holds each conversation's copy. A copy's `backend` only
+ * says where it last ran; `slot` says the cache is still there. A live turn in
+ * a slot proves the same fact and counts too.
  * @param {DiskFile[]} files @param {Backend[]} backends
  * @param {{conv: string, backend: string|null, slot: number|null}[]} [live]
  * @returns {Map<string, string>} conversation -> slot key */
@@ -267,12 +209,9 @@ export function residency(files, backends, live = []) {
   const up = new Set(backends.filter((b) => b.up).map((b) => b.name));
   /** @type {Map<string, string>} */ const bySlot = new Map();   // slot key -> conv
   /** @type {Map<string, string>} */ const held = new Map();     // conv -> slot key
-  // One slot holds one cache, so a later claim evicts the earlier one. The
-  // router does not clear a displaced pin's `slot` - it only clears its own
-  // when the backend changes - so two copies really do name one slot after a
-  // conversation hands it on, and without this both were drawn sitting in it.
-  // The live rows come last because a turn running there now is the better
-  // evidence than a copy that was written there once.
+  // One slot holds one cache, so a later claim evicts the earlier. The router
+  // does not clear a displaced pin's `slot`, so two copies can name one slot.
+  // Live rows come last: they are the better evidence.
   /** @param {string} conv @param {string} key */
   const claim = (conv, key) => {
     if (!key) return;
@@ -293,24 +232,20 @@ export function residency(files, backends, live = []) {
   return held;
 }
 
-/** `residency` read from the slot's side. Its values are unique, so this is an
- * exact inverse - and one pass, where scanning the map per slot was not.
+/** The inverse of `residency`. Its values are unique, so this is exact.
  * @param {Map<string, string>} held @returns {Map<string, string>} slot key -> conversation */
 export const holderOf = (held) => new Map([...held].map(([conv, key]) => [key, conv]));
 
-/** The two disks, and how each is read. Openings are symlinked onto the NVMe
- * because every new session starts from one; a conversation's copy is written
- * once and read at most once, so it stays on the roomier SATA disk. */
+/** Bytes a second of the two disks. Openings sit on the NVMe. A conversation's
+ * copy is written once and read at most once, so it stays on the SATA disk. */
 const NVME = 2.3e9, SATA = 520e6;
 
 /** @typedef {{ did: string, store: "openings" | "copies", down: boolean,
  *              key: string, name: string, bytes: number, seconds: number }} Transfer */
 
-/** What one slot-file event moves, which way, and how long it really takes.
- *
- * All five `did` values move something. `moved` fires after the restore on the
- * TARGET, so it names the slot the cache climbed into - an up, not a round
- * trip. Only the two `opening` verbs touch the nvme.
+/** What one file event moves, which way, and how long it takes. `moved` fires
+ * after the restore on the target, so it is an up, not a round trip. Only the
+ * two `opening` verbs touch the NVMe.
  * @param {FileEvent} ev @returns {Transfer} */
 export function transferOf(ev) {
   const opening = ev.did === "loaded opening" || ev.did === "kept opening";
@@ -326,9 +261,7 @@ export function transferOf(ev) {
   };
 }
 
-/** The entries of a newest-first log that are newer than the last look, oldest
- * first, with the stamp to remember. Serves `recent_files` and `flow.log`
- * alike - both are newest-first and carry `at`.
+/** The entries of a newest-first log newer than `lastAt`, oldest first, with the new stamp.
  * @template {{ at?: number }} T
  * @param {T[] | undefined} log @param {number} lastAt
  * @returns {{ entries: T[], lastAt: number }} */
@@ -337,8 +270,7 @@ export function since(log, lastAt) {
   return { entries, lastAt: entries.reduce((t, e) => Math.max(t, e.at ?? 0), lastAt) };
 }
 
-/** One word for where a turn's prompt came from, keyed by the router's own
- * strings (`how_started`). */
+/** One word per `how_started` value from the router. */
 export const MODE = {
   cold: "cold", recalled: "recalled", "saved prompt": "opening", "warm slot": "in slot",
 };
@@ -348,12 +280,8 @@ export const MODE = {
  *              reused: number | null, read: number | null,
  *              images: number, imageTokens: number }} Turn */
 
-/** One finished turn, measured against what reading it cold would have cost.
- *
- * The bank asks what the caching saved, and tokens cannot answer it: every turn
- * is a near-identical wall of reuse. Time can. `took` is measured; `coldCost`
- * is the whole prompt at the rate the backends read, so the gap between them
- * is the saving.
+/** One finished turn against what reading it cold would cost. `took` is
+ * measured; `coldCost` is the whole prompt at READ_RATE. The gap is the saving.
  * @param {Request} r @returns {Turn} */
 export function turnOf(r) {
   const reused = r.reused ?? null, read = r.read ?? null;
@@ -376,11 +304,6 @@ export function turnOf(r) {
 /** @typedef {{ conv: string, saved: number, turns: Turn[] }} Group */
 
 /** The tape, grouped by conversation, newest group first.
- *
- * Ungrouped it was fourteen rows that all said the same conversation and very
- * nearly the same number - repetition reading as noise. One conversation's
- * turns belong together, and the group's total saving is a figure no single
- * row could carry.
  * @param {Status} status @param {number} keep
  * @returns {{ groups: Group[], scale: number, exact: boolean }} */
 export function tapeOf(status, keep) {
@@ -394,14 +317,12 @@ export function tapeOf(status, keep) {
   return {
     groups: [...by.values()],
     scale: Math.max(1, ...rows.map((t) => Math.max(t.took, t.coldCost))),
-    // Every row, not any row: one turn reporting counts does not make the
-    // thirteen beside it measured, and the caveat is about the whole tape.
+    // Every row, not any: the caveat is about the whole tape.
     exact: rows.length > 0 && rows.every((t) => t.reused !== null),
   };
 }
 
-/** Hours of reading that never happened, from the backends' own counters.
- * Lifetime and measured, so it stands whether or not a turn reports its split.
+/** Hours of reading that never happened, from the backends' lifetime counters.
  * @param {Status} status @returns {{ hours: number, reused: number, read: number }} */
 export function skipped(status) {
   let read = 0, reused = 0;
@@ -416,15 +337,9 @@ export function skipped(status) {
 /** @typedef {{ title: string, what: string, files: DiskFile[],
  *              kind: "base" | "deep" }} Shelf */
 
-/** The openings, one shelf per kind, biggest first.
- *
- * The two share one budget but are not interchangeable: a deeper cut is
- * dropped before a system prompt, whatever their ages, because every brand new
- * session starts from a system prompt. Within a shelf, size is the only thing
- * that tells one 8-hex hash from another - a 3.4 GiB Claude Code prompt costs
- * eleven times what a 357 MiB one does to read - so the shelf is ordered by it
- * and nothing else. There are no empty places to draw: what fits depends on
- * what each one weighs, so a shelf is only ever as long as its files.
+/** The openings, one shelf per kind, biggest first. The two share one budget,
+ * and a deeper cut is dropped before a system prompt. Size is the only thing
+ * that tells one hash from another: 3.4 GiB costs eleven times what 357 MiB does to read.
  * @param {Status} status @returns {Shelf[]} */
 export function shelvesOf(status) {
   const o = status.openings || { bases: [], deeps: [], wants: [] };
@@ -441,16 +356,9 @@ export function shelvesOf(status) {
 /** @typedef {{ conv: string, bytes: number, share: number, state: "live" | "kept" | "disk",
  *              where: string, label: boolean, doomed: boolean }} Block */
 
-/** The copies, as shares of the budget they are capped by.
- *
- * Linear in bytes, never square-rooted: PARK_BUDGET caps bytes and not files,
- * so a width that does not mean bytes misstates the one thing the strip is
- * for. A name only goes inside a block that can hold it; the rest carry theirs
- * in the table twin.
- * The order is the budget's own: the sweep keeps the newest parked copies and
- * drops the oldest, so newest sits at the left and the right-hand end of the
- * filled run is what goes next. In payload order the strip was an inventory;
- * in this order it is a forecast.
+/** The copies as shares of PARK_BUDGET. The budget caps bytes, so width is
+ * linear in bytes. Newest first, as the sweep orders them: the right-hand end
+ * of the run goes next. A label goes only in a block wide enough for it.
  * @param {Status} status @param {number} px strip width
  * @param {number} [minPx] pixels a name needs @param {number} [maxLabels]
  * @returns {{ blocks: Block[], used: number, count: number, live: number, kept: number }} */
@@ -463,8 +371,7 @@ export function blocksOf(status, px, minPx = 44, maxLabels = 6) {
   const blocks = files.map((f) => {
     const conv = f.conv || "";
     const live = held.has(conv);
-    // "(before the restart)" is a pin the router took back on startup: it names
-    // no live backend, so the next turn restores it wherever it lands.
+    // "(before the restart)" names a pin the router took back on startup.
     const kept = (f.backend || "").startsWith("(");
     return {
       conv, bytes: f.bytes || 0, share: (f.bytes || 0) / budget,
@@ -473,16 +380,13 @@ export function blocksOf(status, px, minPx = 44, maxLabels = 6) {
         : kept ? "kept from before the restart"
         : `on disk, last ran on ${f.backend}`,
       label: false,
-      // the tail of the run is what the budget drops first
       doomed: false,
     };
   });
   for (const i of widest(blocks.map((b) => b.share), px, minPx, maxLabels)) blocks[i].label = true;
-  // Walk from the newest and mark everything past the budget: those are what
-  // the next park sweeps away. The newest is never swept, however large - the
-  // router skips index 0 (`if age and total > PARK_BUDGET`), because dropping
-  // the copy just written is what made cpu1_0 write the same 9.45 GiB file
-  // 1,456 times in four hours.
+  // Mark everything past the budget: the next park sweeps it. The newest is
+  // never swept, however large: the router skips index 0. Otherwise one
+  // 9.45 GiB file was written 1,456 times in four hours.
   let running = 0;
   blocks.forEach((b, i) => {
     running += b.share;

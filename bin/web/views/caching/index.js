@@ -1,10 +1,7 @@
 // @ts-check
 /**
- * Caching: is it working?
- *
- * The answer is a rate, not an inventory: the share of prompt tokens each
- * backend reused instead of reading again. The RAM cache and the activity
- * feed are the detail underneath.
+ * Caching: is it working? The answer is a rate: the share of prompt tokens
+ * each backend reused instead of reading again.
  */
 import { loadTemplates, tpl, pick, mount } from "../../lib/templates.js";
 import { renderRegion } from "../../lib/render.js";
@@ -163,12 +160,8 @@ export default {
     loadCSS(import.meta.url, "./style.css", signal);
     await loadTemplates(new URL("./caching.html", import.meta.url).href,
                         { signal });
-    // The shell aborts this controller when the reader clicks another
-    // view. Without the check a mount cancelled mid-fetch carried on and
-    // painted over whatever mounted after it - and worse, subscribe() and
-    // every() register their teardown on `signal`, which never fires again
-    // once it has aborted, so the dead view kept its SSE subscriber and its
-    // interval for the life of the tab. flow/index.js has had this guard.
+    // Stop a mount cancelled mid-fetch. subscribe() registers teardown on
+    // `signal`, which never fires again once aborted, so a dead view would leak it.
     if (signal.aborted) throw new DOMException("mount cancelled", "AbortError");
 
     mount(container, tpl("tpl-caching"));
@@ -185,18 +178,14 @@ export default {
     subscribe(
       /** @param {Status} status */
       (status) => {
-        // Each region signs the slice it renders, per render.js's rule. These
-        // all signed the whole payload, which carries the history buckets: one
-        // of those moves every second whether or not anything happened, so no
-        // sig ever matched and no region ever skipped. The gate was paying for
-        // itself eight times a second and saving nothing.
+        // Sign each region with the slice it renders, never the whole payload:
+        // the history buckets move every second.
         const bes = backendsOf(status);
         const reuseSig = bes.map((be) => {
           const st = be.stats || {};
           return `${be.name}:${Boolean(st.pp_rate || st.generated)}:${st.cached || 0}`;
         }).join("|");
-        // A region whose whole content is one sentence signs with the
-        // sentence: exact by construction, and it has to be built anyway.
+        // A one-sentence region signs with the sentence.
         const ramWhyText = ramText(status);
         const deeperText = deeperAnswer(status);
         renderRegion(reuse, () => buildReuse(status), { sig: `u${reuseSig}` });

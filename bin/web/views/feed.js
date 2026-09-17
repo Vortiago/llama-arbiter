@@ -1,12 +1,7 @@
 // @ts-check
 /**
- * One live feed for the whole page.
- *
- * The stream is opened by liveSSE like any view would, but the controller
- * that owns it lives for the page, not for a view: one EventSource serves
- * every view, and the latest payload is replayed to a view that mounts
- * between pushes. Views subscribe with their own signal and are dropped when
- * it aborts, so nothing outlives a view except this one shared subscription.
+ * One live feed for the whole page: one EventSource serves every view.
+ * The latest payload is replayed to a view that mounts between pushes.
  */
 import { liveSSE } from "../lib/live.js";
 
@@ -15,16 +10,13 @@ import { liveSSE } from "../lib/live.js";
 
 /** @type {Set<Subscriber>} */
 const subscribers = new Set();
-// The parsed payload only. `raw` was passed to every subscriber and read by
-// none, and keeping it here held a second, ~110 KB copy of each push - the
-// json text as well as the object - for the life of the tab.
+// The parsed payload only. Keeping the raw json too holds a second ~110 KB copy per push.
 /** @type {Status | null} */
 let last = null;
 let opened = false;
 const life = new AbortController();     // liveSSE needs a signal; never aborted.
 
-/** Brighten the header dot for one frame. It marks a payload that changed,
- * and settles: the server pushes only on change. */
+/** Brighten the header dot for one frame. The server pushes only on change. */
 function blip() {
   const dot = document.getElementById("live");
   if (!dot) return;
@@ -49,8 +41,7 @@ function open() {
   );
 }
 
-/** Hear every payload until `signal` aborts. The latest one is replayed at
- * once, so a view that mounts between pushes is not blank until the next.
+/** Hear every payload until `signal` aborts. The latest one is replayed at once.
  * @param {Subscriber} fn @param {AbortSignal} signal */
 export function subscribe(fn, signal) {
   subscribers.add(fn);

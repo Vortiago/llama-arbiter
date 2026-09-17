@@ -1,19 +1,15 @@
 // @ts-check
 /**
- * Flow: a prompt crosses the top, the two stores it draws on hold the floor,
- * and the bank down the right says what the caching saved.
+ * Flow: a prompt crosses the top, the two stores hold the floor, and the bank
+ * on the right says what the caching saved.
  *
- * Everything that moves is a measurement. The wires carry one mark per token
- * at the rate the slot really reads or generates, so a busy link flows and a
- * stopped one stands still; a transfer packet crosses in the time its bytes
- * really take; the tape lands a bar when a turn really finished. Nothing here
- * animates on a timer that is not tied to the payload.
+ * Everything that moves is a measurement. Wires run at the slot's real rate, a
+ * transfer crosses in the time its bytes take, and the tape lands a bar when a
+ * turn finishes. Nothing animates on a timer that is not tied to the payload.
  *
- * Colour never carries a distinction on its own: `--busy` and `--ok` are four
- * units apart under protanopia, so every slot states its phase in a glyph and
- * a word as well. The only properties this file writes are widths, transforms,
- * `strokeDashoffset` and one custom property - colour stays in CSS, which is
- * why the theme toggle needs no hook here.
+ * `--busy` and `--ok` are four units apart under protanopia, so every slot
+ * states its phase in a glyph and a word. This file writes only widths,
+ * transforms, `strokeDashoffset` and one custom property. Colour stays in CSS.
  */
 import { loadTemplates, tpl, pick, slot, mount, loadCSS, every } from "../../lib/templates.js";
 import { reconcileList } from "../../lib/render.js";
@@ -32,13 +28,11 @@ import { backendsOf, reuseShare } from "../status.js";
 const TAPE = 14;
 /** How long a hero figure takes to count to a new value. */
 const COUNT_MS = 900;
-/** Sorts last, so the unused budget always sits at the right of the strip. */
+/** Sorts last, so the unused budget sits at the right of the strip. */
 const FREE = "zzz-free";
 
 const GIB = 1024 ** 3, MIB = 1024 ** 2;
-/** Binary units, because every limit this page draws against is one:
- *  PARK_BUDGET is 256 GiB and the README counts in MiB and GiB throughout.
- *  `lib/format.js` divides by 1024 but labels GB, and it is vendored.
+/** Binary units: PARK_BUDGET is 256 GiB. `lib/format.js` labels GB and is vendored.
  *  @param {number} n */
 const fmtBytes = (n) => (n >= GIB ? `${(n / GIB).toFixed(n < 10 * GIB ? 1 : 0)} GiB` : `${Math.round(n / MIB)} MiB`);
 
@@ -72,14 +66,11 @@ export default {
   /** @param {HTMLElement} container @param {unknown} _data
    *  @param {{ signal: AbortSignal }} helpers */
   async mount(container, _data, { signal }) {
-    // Deliberately not shared.css: this view uses none of it, and the old
-    // sheet collided with shared's `.lane` at equal specificity.
+    // Not shared.css: this view uses none of it, and `.lane` collided at equal specificity.
     const link = loadCSS(import.meta.url, "./style.css", signal);
-    // Wait for the sheet. shell.js runs the swap inside startViewTransition and
-    // the browser captures the new snapshot once the callback resolves, so an
-    // unstyled capture is a white flash on a dark ground - and every rect
-    // measured before the sheet lands is wrong. The markup is a second,
-    // independent fetch: serialising them puts two round trips on a view swap.
+    // Wait for the sheet: startViewTransition snapshots when the callback
+    // resolves, so an unstyled capture is a white flash, and rects measured
+    // before the sheet lands are wrong. Fetch the markup in parallel.
     await Promise.all([
       styled(link, signal),
       loadTemplates(new URL("./flow.html", import.meta.url).href),
@@ -90,9 +81,7 @@ export default {
     const root = /** @type {HTMLElement} */ (container.querySelector(".flowview"));
     const board = pick(root, "board"), stage = pick(root, "stage"), wires = pick(root, "wires");
     const heroEl = pick(root, "hero"), estEl = pick(root, "estimated");
-    // Both queues wear the same gate, so a querySelector(".f-gate") picks the
-    // first one on the page - which sent every wire meant for `parked` back to
-    // `arriving`. Name them.
+    // Both queues wear the same gate class, so pick each by name.
     const arrivingGate = pick(root, "arrivingGate"), parkedGate = pick(root, "parkedGate");
     const hosts = {
       arrivals: pick(root, "arrivals"), readers: pick(root, "readers"),
@@ -102,31 +91,24 @@ export default {
     };
     root.style.setProperty("--f-period", `${MARK_PERIOD}px`);
 
-    /** Every animation this view starts, so abort cancels the lot: an infinite
-     *  dashoffset on a detached path keeps ticking otherwise. @type {Set<Animation>} */
+    /** Every animation this view starts. Abort cancels them all: an infinite
+     *  animation on a detached path keeps ticking. @type {Set<Animation>} */
     const anims = new Set();
-    /** Paused because the tab went away, so returning resumes what was running
-     *  and not what had finished. @type {Set<Animation>} */
+    /** Paused when the tab went away. Only these resume on return. @type {Set<Animation>} */
     const parked = new Set();
     /** @type {Map<string, Animation>} */ const marching = new Map();
-    /** When each slot's `done` last moved: a reading slot's own rate reads zero
-     *  until the router's window closes, so the counter standing still is the
-     *  only honest evidence that nothing is happening.
+    /** When each slot's `done` last moved. A reader's rate reads 0 until the
+     *  window closes, so a still counter is the only evidence of a stall.
      *  @type {Map<string, { done: number, phase: string, at: number }>} */
     const steps = new Map();
     /** @type {Status | null} */ let latest = null;
-    /** performance.now() when `latest` arrived, so a wait can be aged between
-     *  pushes without comparing this machine's clock to the router's. */
+    /** performance.now() when `latest` arrived. Waits age by local elapsed time, never by comparing clocks. */
     let latestAt = 0;
-    /** The nodes the last paint drew. A resize re-places what is on the page;
-     *  rebuilding them needs the step clock, and a resize has no reading of it.
-     *  @type {SlotNode[]} */ let shown = [];
+    /** The nodes the last paint drew, for a resize to re-place. @type {SlotNode[]} */ let shown = [];
     /** @type {Status | null} */ let pending = null;
     /** @type {number | null} */ let lastFile = null;
-    /** Nothing has been drawn yet, so the first payload's file log is history
-     *  rather than a backlog to fly. A file event's `at` can be any epoch, and
-     *  an empty first payload leaves `since` echoing the seed, so the flag is
-     *  its own and not a number. */
+    /** False until the first payload, whose file log is history, not a backlog
+     *  to fly. A flag, not a stamp: an empty first log leaves `since` echoing the seed. */
     let seenFiles = false;
     /** @type {Set<string>} */ let onTape = new Set();
     /** What the hero last drew, or null before the first paint. @type {number | null} */
@@ -135,8 +117,7 @@ export default {
     let counting = null;
     let laidOut = false;
     /** The elements the pointer lit, held rather than re-queried: `data-pair`
-     *  is rewritten on every paint, so a card whose conversation moves on can
-     *  no longer be found by the value it was lit under. */
+     *  is rewritten on every paint. */
     let lit = "";
     /** @type {Element[]} */ let litEls = [];
 
@@ -148,8 +129,7 @@ export default {
     };
     /** @typedef {{ x: number, y: number, w: number, h: number }} Box */
     /** A run between two stations. `lane` spreads the origins down the source
-     *  box so several wires leaving one queue do not stack into each other -
-     *  cable management, and it is what stops the fan-out looking accidental.
+     *  box, so wires leaving one queue do not stack.
      *  @param {Box} a @param {Box} b @param {number} [lane] @param {number} [lanes] */
     const across = (a, b, lane = 0, lanes = 1) => {
       const y1 = lanes > 1 ? a.y + (a.h * (lane + 1)) / (lanes + 1) : a.y + a.h / 2;
@@ -186,9 +166,7 @@ export default {
       const b = n.bands;
       const reused = pick(node, "reused"), read = pick(node, "read");
       if (n.generator) {
-        // A full-width green band says "done" and nothing else. What a
-         // generating instance is really doing is filling a context window,
-         // and that moves with every token it writes.
+        // A generator fills a context window, so its band is context used, not prompt read.
         const share = n.nCtx ? (100 * n.ctx) / n.nCtx : 0;
         reused.style.width = `${share}%`;
         read.style.width = "0%";
@@ -205,9 +183,8 @@ export default {
       if (!n.generator) slot(node, { eta: n.left !== null ? `~${secs(n.left)} left` : "" });
     }
 
-    /** One waiting ticket, not one conversation: a turn queued behind another
-     *  turn of the same conversation is the commonest waiter there is, and two
-     *  rows under one key leave a node on the page every push.
+    /** One key per waiting ticket, not per conversation: a turn queued behind
+     *  its own conversation is the commonest waiter.
      *  @param {import("./flow-model.js").Arrival} a */
     const waiterKey = (a) => `${a.conv}:${a.since}`;
     /** @param {import("./flow-model.js").Arrival} a */
@@ -216,9 +193,7 @@ export default {
       fillWaiter(el, a);
       return el;
     };
-    /** Say a request carries pictures, and what they cost against the rest of
-     *  its prompt. The encoder runs on the cpu on every backend, so this is
-     *  work a turn brings with it wherever it ends up generating.
+    /** Mark a request that carries pictures, and what they cost against its prompt.
      *  @param {HTMLElement} el @param {number} n @param {number} charged @param {number} whole */
     function pics(el, n, charged, whole) {
       el.hidden = !n;
@@ -246,10 +221,7 @@ export default {
     /** @param {Element} el @param {import("./flow-model.js").Bar} b */
     function band(el, b) {
       const s = /** @type {HTMLElement} */ (el).style;
-      // Prefixed, because a custom property inherits: plain `--r` is
-      // shell.css's 6px border radius, which six rules in this sheet read, and
-      // a bar setting it to a percentage hands that meaning to anything drawn
-      // inside it.
+      // Prefixed: a custom property inherits, and plain `--r` is shell.css's border radius.
       s.setProperty("--f-read", `${b.read}%`);
       s.setProperty("--f-gen", `${b.gen}%`);
       s.setProperty("--f-stalled", `${b.stalled}%`);
@@ -271,10 +243,8 @@ export default {
       for (const n of nodes) {
         const done = n.bands ? n.bands.read : 0;
         const seen = steps.get(n.key);
-        // The phase is half the mark. An idle slot reports no bands, so it
-        // stands at done 0 - and a read starts at done 0 too, for the whole
-        // first batch. Without the phase, a slot that had been idle five
-        // minutes opened every read wearing "not moving".
+        // The phase is part of the mark: an idle slot and a read in its first
+        // batch both stand at done 0.
         if (!seen || seen.done !== done || seen.phase !== n.phase) {
           steps.set(n.key, { done, phase: n.phase, at: now });
         }
@@ -285,8 +255,7 @@ export default {
     }
 
     // ---------------------------------------------------------------- bank
-    /** Count a figure up rather than snapping it, so a change reads as
-     *  something that happened.
+    /** Count a figure up rather than snapping it.
      *  @param {HTMLElement} node @param {number} value @param {string} unit @param {string} label */
     function countTo(node, value, unit, label) {
       /** @param {number} v */
@@ -294,16 +263,12 @@ export default {
         node.replaceChildren(document.createTextNode(v.toFixed(1))); // static-render
         node.append(spanOf("unit", unit), spanOf("lbl", label));
       };
-      // One count at a time, from what is on the screen. A push can land
-      // inside the 900 ms of the last one, and two chains easing the same node
-      // fight over every frame - the second from the first one's target rather
-      // than from the figure the eye is on, so the digits jump backwards.
+      // One count at a time, from the figure on screen. Two chains on one
+      // node make the digits jump backwards.
       if (counting !== null) { cancelAnimationFrame(counting); counting = null; }
       const from = heroShown;
       heroShown = value;
-      // null, not zero: nothing has been drawn yet, so there is nothing to
-      // count up from. Zero hours saved is a figure like any other, and a jump
-      // off it is the one this function exists to draw.
+      // null, not zero: before the first paint there is nothing to count from. Zero is a real figure.
       if (from === null || Math.abs(value - from) < 0.05 || reducedMotion()) { show(value); return; }
       const t0 = performance.now();
       /** @param {number} now */
@@ -312,8 +277,7 @@ export default {
         const k = Math.min(1, (now - t0) / COUNT_MS);
         const at = from + (value - from) * (1 - Math.pow(1 - k, 3));
         show(at);
-        // What the screen holds, so an interrupted count hands the next one a
-        // figure that was actually shown.
+        // what the screen holds, so an interrupted count hands on a shown figure
         heroShown = at;
         counting = k < 1 ? requestAnimationFrame(step) : null;
         if (k >= 1) heroShown = value;
@@ -331,9 +295,7 @@ export default {
 
       const share = reuseShare(status);
       pick(root, "shareFill").style.width = `${share ?? 0}%`;
-      // "all time" was a promise the counters do not keep: they come through
-      // since_reset, so a reset walks this figure back to nothing. The
-      // hardware view reads the same stamp for the same reason.
+      // The counters come through since_reset, so a reset walks this figure back.
       const span = status.rates_since ? "since the counters were reset" : "since each backend started";
       slot(root, {
         shareNote: share === null ? "" : `${share.toFixed(1)}% reused, ${span}`,
@@ -342,10 +304,8 @@ export default {
       const { groups, scale, exact } = tapeOf(status, TAPE);
       pick(root, "noTurns").hidden = groups.length > 0;
       estEl.hidden = exact || !groups.length;
-      // Not a missing feature: the router sends read_prompt_n and read_cache_n
-      // for every turn that reached the read path, and null for one that never
-      // did, so a single such turn on the tape makes the whole of it an
-      // estimate. Saying "not yet" sent the reader after a change that shipped.
+      // The router sends null counts for a turn that never reached the read
+      // path. One such turn makes the whole tape an estimate.
       estEl.title = "At least one of these turns never ran a read pass, so the backend "
         + "reported no split for it and its bar stands on this router's estimate "
         + "of the prompt instead.";
@@ -356,8 +316,7 @@ export default {
         el.classList.toggle("fresh", onTape.size > 0 && !onTape.has(t.key));
         slot(el, { mode: t.mode, took2: secs(t.took) });
         pics(pick(el, "turnPics"), t.images, t.imageTokens, t.whole);
-        // The hollow between the two IS the saving: what this turn took,
-        // against what reading its whole prompt cold would have cost.
+        // The hollow between the two bars is the saving.
         pick(el, "ghost").style.width = `${(100 * t.coldCost) / scale}%`;
         pick(el, "took").style.width = `${(100 * t.took) / scale}%`;
         /** @type {HTMLElement} */ (el).title = `${num(t.whole)} tokens, took ${secs(t.took)}, `
@@ -386,17 +345,14 @@ export default {
     }
 
     // -------------------------------------------------------------- stores
-    /** The WCAG-clean twin of a store: every value the marks encode, as text,
-     *  so nothing here is reachable by hover alone.
+    /** The accessible twin of a store: every value the marks encode, as text.
      *  @param {HTMLElement} host @param {string[]} head @param {string[][]} rows */
     function twin(host, head, rows) {
       if (!host.firstElementChild) mount(host, tpl("tpl-twin"));
       const details = /** @type {HTMLElement} */ (host.firstElementChild);
       slot(details, { summary: "as a table" });
-      /** The row templates carry four cells and the copies twin names three, so
-       *  a cell nobody filled is hidden rather than left blank: an empty
-       *  `th scope="col"` is a fourth column a screen reader announces for
-       *  every row of the table the twin exists to be.
+      /** Hide, never blank, a cell nobody filled: an empty `th scope="col"` is
+       *  a column a screen reader announces on every row.
        *  @param {Element} el @param {string[]} cells */
       const cellsInto = (el, cells) => {
         ["c0", "c1", "c2", "c3"].forEach((name, i) => {
@@ -411,9 +367,7 @@ export default {
         cellsInto(el, cells);
         return el;
       };
-      // The head row is `th scope="col"`, not the body row's `th scope="row"`
-      // plus three data cells: a table nobody can read the columns of is not
-      // the accessible twin of anything.
+      // The head row is `th scope="col"`, not a body row.
       reconcileList(pick(details, "head"), [head], () => "h", rowOf("tpl-headrow"), cellsInto);
       reconcileList(pick(details, "body"), rows, (r) => r[0], rowOf("tpl-cellrow"), cellsInto);
     }
@@ -423,8 +377,7 @@ export default {
       const load = loadOf(status);
       const shelves = shelvesOf(status);
       slot(root, {
-        // `openings` first: with none saved yet both counts are zero, and
-        // "none loaded" of nothing claims a rack of openings that is empty.
+        // `openings` first: with none saved both counts are zero, and "none loaded" would be wrong.
         openingsCap: !load.openings ? ""
           : load.unloaded === load.openings ? "none loaded since restart"
           : load.unloaded ? `${load.unloaded} unloaded` : "",
@@ -432,9 +385,7 @@ export default {
 
       /** @param {Element} el @param {import("./flow-model.js").Shelf} s */
       const fillShelf = (el, s) => {
-          // How many, not "n of a cap": the shelves share one budget in bytes,
-          // so there is no count either could be full at and no empty place to
-          // draw. The disk view has the bar.
+          // A count, not "n of a cap": the shelves share one budget in bytes.
           slot(el, { title: s.title, of: `${s.files.length}` });
           /** @type {HTMLElement} */ (el).title = s.what;
           const biggest = Math.max(1, ...s.files.map((f) => f.bytes || 0));
@@ -446,10 +397,7 @@ export default {
               node.toggleAttribute("data-free", !c.f);
               node.dataset.name = c.f ? c.f.name : "";
               node.style.setProperty("--w", String(0.55 + 0.45 * c.share));
-              // Size is what tells a 3.6 GiB prompt from a 375 MiB one; the
-              // hash is not. Selective labelling: the exception is what gets
-              // said, and every one of these reads zero because the router
-              // keeps `loads` in memory and resets it on a restart.
+              // `loads` lives in router memory and resets on a restart, so only a non-zero count is said.
               slot(node, {
                 size: c.f ? fmtBytes(c.f.bytes || 0) : "",
                 name: c.f ? c.f.name : "",
@@ -487,18 +435,14 @@ export default {
       /** @param {Element} el @param {typeof strip[0]} b */
       const fillBlock = (el, b) => {
           const node = /** @type {HTMLElement} */ (el);
-          // Basis zero, never auto: with `auto` a labelled block is its label
-          // wide BEFORE its share is added, so the widths stop meaning bytes -
-          // which is the one thing the strip is for. The 44px a label needs is
-          // measured against this width, so it has to be this width.
+          // Basis 0, never auto: with auto a labelled block is its label wide
+          // before its share is added, so widths stop meaning bytes.
           node.style.flex = `${b.share * 100} 0 0%`;
           node.dataset.state = b.state;
           node.toggleAttribute("data-free", b.state === "free");
           node.toggleAttribute("data-doomed", Boolean(b.doomed));
           if (b.conv) node.dataset.conv = b.conv;
-          // The slot and the copy are one thing in two places: the slot carries
-          // `data-pair` from layout(), and the block has to carry it too or the
-          // highlight only ever runs one way and never reaches the strip.
+          // The block carries `data-pair` like the slot does in layout(), or the highlight runs one way only.
           node.dataset.pair = b.state === "live" ? b.conv : "";
           slot(node, { label: b.label ? b.conv.split("/")[0] : "" });
           node.title = b.conv ? `${b.conv} - ${fmtBytes(b.bytes)}, ${b.where}` : "";
@@ -517,10 +461,8 @@ export default {
     }
 
     // --------------------------------------------------------------- wires
-    /** One infinite animation a wire, retimed rather than restarted. One dash
-     *  period a second at playbackRate 1, so the rate IS marks a second; a rate
-     *  of zero freezes the marks where they stand, which is exactly what a slot
-     *  that has stopped should look like.
+    /** One infinite animation a wire, retimed rather than restarted. One period
+     *  a second at playbackRate 1, so the rate is marks a second. Rate 0 freezes the marks.
      *  @param {Element} path @param {string} id @param {number} marks */
     function march(path, id, marks) {
       let anim = marching.get(id);
@@ -539,9 +481,7 @@ export default {
     function layout(status, nodes) {
       if (signal.aborted || document.hidden) return;
       laidOut = true;
-      // A wire has to leave a thing, not a region: the arrivals list is empty
-      // most of the time, so its box is zero-height mid-air. Each queue's own
-      // gate is the object work actually leaves from and arrives at.
+      // Wires leave the gates, not the lists: an empty list has a zero-height box.
       const arrivals = box(arrivingGate), gate = box(parkedGate);
       const bankBox = box(heroEl);
       const holder = holderOf(
@@ -573,8 +513,7 @@ export default {
         const node = /** @type {HTMLElement} */ (el);
         node.toggleAttribute("data-holds", Boolean(conv));
         node.dataset.pair = conv;
-        // A line is a claim that this cache is in this slot; only draw it where
-        // the pin's own slot number proves it.
+        // Draw a hold line only where the pin's own slot number proves it.
         if (conv) {
           const blk = hosts.strip.querySelector(`[data-conv="${conv}"]`);
           if (blk) wire(`hold-${conv}`, down(nb, box(blk)), "hold", 0, false, conv);
@@ -601,31 +540,23 @@ export default {
       transfers(status);
     }
 
-    /** A copy crossing between a slot and its store: the only thing that moves
-     *  on the vertical axis, and it crosses in the time its bytes really take.
+    /** A copy crossing between a slot and its store, in the time its bytes take.
      *  @param {Status} status */
     function transfers(status) {
       const { entries, lastAt } = since(status.recent_files, lastFile ?? 0);
       lastFile = lastAt;
-      // First paint: whatever is already in the log happened before anyone was
-      // looking. `since` echoes the seed back when the log is empty, so a
-      // router with nothing parked yet left the seed at 0 and the next payload
-      // flew its whole log at once - the flag says what the number could not.
+      // First paint: the log is history. A flag, because `since` echoes the seed for an empty log.
       if (!seenFiles) { seenFiles = true; return; }
       if (document.hidden || reducedMotion()) return;
       for (const ev of entries) {
         const t = transferOf(ev);
         const from = stage.querySelector(`[data-key="${t.key}"]`);
         if (!from) continue;
-        // `note_file` records name[:8]. An opening IS its 8-character key, so
-        // that matches outright; a copy's is the head of a conversation key and
-        // the block wears the short key, which carries a tail too - so the copy
-        // is found by its head or not at all.
+        // `note_file` records name[:8]. An opening is its 8-character key. A
+        // copy's name is the head of a conversation key, so match by prefix.
         const to = t.store === "copies"
           ? hosts.strip.querySelector(`[data-conv^="${t.name}"]`) || hosts.strip
           : hosts.shelves.querySelector(`[data-name="${t.name}"]`) || hosts.shelves;
-        // the emoji of the store it is bound for, so the eye joins the file to
-        // the shelf it lands on
         fly(box(from), box(to), t.down, t.store === "copies" ? "💾" : "📚",
             fmtBytes(t.bytes), t.seconds);
       }
@@ -683,8 +614,7 @@ export default {
     }
 
     // ------------------------------------------------------------ the page
-    /** A copy and the slot holding it are one thing in two places; hovering
-     *  either lights the other and the line between them. */
+    /** Hovering a copy or the slot holding it lights both and the line between them. */
     root.addEventListener("pointerover", (e) => {
       const target = e.target instanceof Element ? e.target.closest("[data-pair]") : null;
       const conv = target ? target.getAttribute("data-pair") || "" : "";
@@ -710,10 +640,8 @@ export default {
       }
       for (const a of parked) a.play();
       parked.clear();
-      // The step clock is fed by paint, and paint does not run while the tab
-      // is away, so every counter looks to have stood still for however long
-      // that was. Start it again from now, or a minute on another tab brings
-      // back a page of readers all wearing "not moving".
+      // paint does not run while the tab is away, so restart the step clock
+      // from now. Otherwise every reader comes back "not moving".
       const back = Date.now();
       for (const seen of steps.values()) seen.at = back;
       // No backlog stampede on return: skip to now rather than replaying.
@@ -732,16 +660,13 @@ export default {
     }, { once: true });
 
     subscribe((status) => {
-      // A hidden tab still gets every push. Parsing is the feed's cost, but the
-      // DOM and the rects are ours and buy nothing while nobody is looking.
+      // A hidden tab still gets every push. Skip the DOM work until it is visible.
       if (document.hidden) { pending = status; latest = status; latestAt = performance.now(); return; }
       paint(status);
     }, signal);
 
-    // The waits age between pushes: the payload is at best one a second, and a
-    // read can sit for an hour. Both queues carry a number the router stamped
-    // when it built the payload, so ageing it means adding what this machine
-    // has measured since - never reading a clock against the router's own.
+    // Age the waits between pushes by local elapsed time. Never compare this
+    // clock to the router's.
     every(() => {
       if (document.hidden || !latest || !laidOut) return;
       const aged = (performance.now() - latestAt) / 1000;

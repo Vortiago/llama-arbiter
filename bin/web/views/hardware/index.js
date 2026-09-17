@@ -1,11 +1,7 @@
 // @ts-check
 /**
- * Hardware: is each backend doing what it is good at?
- *
- * An instance is configured to prefill, to generate, or to do both, and the
- * question this view answers is whether each is spending its time on the one
- * it is good at. Three blocks: what every slot is doing now, the rates per
- * backend, and ten minutes of slot-time by phase.
+ * Hardware: is each backend doing what it is configured for? Three blocks:
+ * what every slot does now, rates per backend, and ten minutes of slot-time by phase.
  */
 import { loadTemplates, tpl, pick, mount } from "../../lib/templates.js";
 import { renderRegion } from "../../lib/render.js";
@@ -110,8 +106,6 @@ function buildMachine(status) {
 
 /** @param {Status} status */
 function machineNote(status) {
-  // Telemetry, not prefill: "reading" everywhere else on this page means
-  // reading a prompt, and this is about nvidia-smi having nothing to say.
   return status.machine?.gpu ? "" : "no GPU telemetry";
 }
 
@@ -144,9 +138,8 @@ function buildSplits(status) {
 /** @param {Status} status @returns {DocumentFragment} */
 function buildHeads(status) {
   const frag = new DocumentFragment();
-  // The row's first cell names the row, not a backend. renderRegion replaces
-  // every child, so the corner has to be rebuilt here or each name lands one
-  // column left of its own figures.
+  // The corner cell. renderRegion replaces every child, so rebuild it here, or
+  // each name lands one column left of its figures.
   frag.appendChild(document.createElement("th"));
   for (const be of backendsOf(status)) {
     const th = tpl("tpl-head");
@@ -319,12 +312,8 @@ export default {
     loadCSS(import.meta.url, "./style.css", signal);
     await loadTemplates(new URL("./hardware.html", import.meta.url).href,
                         { signal });
-    // The shell aborts this controller when the reader clicks another
-    // view. Without the check a mount cancelled mid-fetch carried on and
-    // painted over whatever mounted after it - and worse, subscribe() and
-    // every() register their teardown on `signal`, which never fires again
-    // once it has aborted, so the dead view kept its SSE subscriber and its
-    // interval for the life of the tab. flow/index.js has had this guard.
+    // Stop a mount cancelled mid-fetch. subscribe() registers teardown on
+    // `signal`, which never fires again once aborted, so a dead view would leak it.
     if (signal.aborted) throw new DOMException("mount cancelled", "AbortError");
 
     mount(container, tpl("tpl-hardware"));
@@ -346,12 +335,8 @@ export default {
     subscribe(
       /** @param {Status} status */
       (status) => {
-        // Signed off the slice each region renders, which is what the two
-        // `names` sigs below already did. The rest signed the whole payload,
-        // and the payload carries the history buckets: one of those moves
-        // every second, so those sigs never matched and the settings table -
-        // which changes only when a backend restarts - was rebuilt once a
-        // second for the life of the tab.
+        // Sign each region with the slice it renders, never the whole payload:
+        // the history buckets move every second.
         const bes = backendsOf(status);
         const names = bes.map((b) => b.name).join(",");
         const noteText = machineNote(status);

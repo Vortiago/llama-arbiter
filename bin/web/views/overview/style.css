@@ -17,8 +17,7 @@
   }
   tr.slot td { font-size: .85rem; padding-block: .15rem; }
   tr.slot td:first-child { padding-inline-start: 1.7rem; color: var(--text-dim); }
-  /* A slot whose phase just changed settles from a wash of accent. Data-driven:
-     the class is added only when the payload's phase differs from the last. */
+  /* A slot whose phase just changed settles from a wash of accent. */
   tr.slot.changed td { animation: settle 1.2s ease-out; }
 
   .rows.waiting { --cols: max-content max-content max-content 1fr; }

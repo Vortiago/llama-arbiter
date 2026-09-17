@@ -1,9 +1,7 @@
 // @ts-check
 /**
- * Disk: what run/slots holds, and whether it is under control.
- *
- * Every number here is a count or size against a limit, because the limit is
- * the point. The whole view waits for a router that emits `disk`.
+ * Disk: what run/slots holds, against its limits. The view waits for a router
+ * that emits `disk`.
  */
 import { loadTemplates, tpl, pick, mount } from "../../lib/templates.js";
 import { renderRegion } from "../../lib/render.js";
@@ -34,9 +32,7 @@ function buildBudgets(disk) {
   const c = disk.copies;
   if (c.budget) add("conversation copies", (c.bytes || 0) / c.budget,
                     `${mib(c.bytes || 0)} of ${gib(c.budget)}, ${c.count} file${c.count === 1 ? "" : "s"}`);
-  // One bar, because it is one budget on one disk. The two counts say what
-  // each kind is using of it, which is what "24 of 24" used to say wrongly:
-  // the shelves have no cap of their own to be full against.
+  // One bar: the shelves share one budget and have no cap of their own.
   const o = disk.openings;
   if (o?.budget) add("saved openings", (o.bytes || 0) / o.budget,
                      `${mib(o.bytes || 0)} of ${gib(o.budget)}, `
@@ -55,8 +51,7 @@ function buildFiles(disk, status) {
     const row = tpl("tpl-disk-file");
     pick(row, "name").textContent = f.file || f.name;
     pick(row, "kind").textContent = f.kind;
-    // A copy names the backend that held it. One kept from a previous run
-    // names none that is live now, and that is a fact, not a gap.
+    // A copy kept from a previous run names no live backend.
     const where = f.backend && live.has(f.backend) ? `on ${f.backend}` : "from the last run";
     pick(row, "who").textContent = f.kind === "copy" ? `${f.conv || ""} · ${where}` : "";
     pick(row, "size").textContent = f.bytes ? mib(f.bytes) : "-";
@@ -95,12 +90,8 @@ export default {
     loadCSS(import.meta.url, "./style.css", signal);
     await loadTemplates(new URL("./disk.html", import.meta.url).href,
                         { signal });
-    // The shell aborts this controller when the reader clicks another
-    // view. Without the check a mount cancelled mid-fetch carried on and
-    // painted over whatever mounted after it - and worse, subscribe() and
-    // every() register their teardown on `signal`, which never fires again
-    // once it has aborted, so the dead view kept its SSE subscriber and its
-    // interval for the life of the tab. flow/index.js has had this guard.
+    // Stop a mount cancelled mid-fetch. subscribe() registers teardown on
+    // `signal`, which never fires again once aborted, so a dead view would leak it.
     if (signal.aborted) throw new DOMException("mount cancelled", "AbortError");
 
     mount(container, tpl("tpl-disk"));
@@ -114,14 +105,12 @@ export default {
       (status) => {
         const disk = status.disk;
         if (!disk) return;          // the payload always carries it; this narrows the type
-        // The slice each region renders, not the whole payload: signing with
-        // the payload meant signing the history buckets too, and one of those
-        // moves every second, so nothing here could ever skip.
+        // Sign each region with the slice it renders, never the whole payload:
+        // the history buckets move every second.
         const live = backendsOf(status).map((b) => b.name).join(",");
         renderRegion(budgets, () => buildBudgets(disk),
                      { sig: `b${JSON.stringify([disk.copies, disk.openings, disk.bases, disk.deeps])}` });
-        // buildFiles asks which backends are live, to tell a copy held now
-        // from one kept since the last run, so the names are part of the sig.
+        // buildFiles reads the live backend names, so they are part of the sig.
         renderRegion(files, () => buildFiles(disk, status),
                      { sig: `f${live}|${JSON.stringify(disk.files)}` });
         renderRegion(mounts, () => buildMounts(disk),
