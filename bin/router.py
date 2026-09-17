@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Send each turn to the backend that already holds its cache.
 
-A turn on the wrong backend reads the whole prompt again, at about 25 tokens a
-second. Every wait here is cheaper than that.
+A turn on the wrong backend reads the whole prompt again at about 25
+tokens a second. Every wait here is cheaper than that.
 
     ./router.py [--port 8090] [--host 0.0.0.0]
 
-Open /router for the dashboard. /router/json is the same data.
+/router is the dashboard. /router/json is the same data.
 docs/LAYOUT.md gives the measurements behind the defaults.
 """
 
@@ -19,13 +19,10 @@ import urllib.error, urllib.parse, urllib.request
 from collections import OrderedDict, deque
 from pathlib import Path
 
-# `prefill` and `generate` are separate settings because they are separate
-# work: a prefill is compute bound for tens of minutes, a generation is memory
-# bound for seconds. An instance that generates and does not prefill is a
-# generator, and turns migrate to it. `pref` orders those, lowest first.
-#
-# One slot per instance: a slot reading a long prompt holds up every other slot
-# on that instance, so a second slot buys a queue, not a second prefill.
+# A prefill is compute bound for tens of minutes. A generation is memory
+# bound for seconds. A `generate`-only instance is a generator: turns
+# migrate to it, `pref` lowest first. One slot per instance: a slot
+# reading a long prompt blocks every other slot on it.
 BACKENDS = [
     {"name": "solo", "url": "http://127.0.0.1:8080", "pref": 0,
      "prefill": True, "generate": True, "node": 0},
@@ -36,8 +33,7 @@ BACKENDS_FROM = "the built-in default"
 if os.environ.get("ROUTER_BACKENDS"):
     BACKENDS_FROM = os.environ["ROUTER_BACKENDS"]
     BACKENDS = json.loads(Path(BACKENDS_FROM).read_text())
-    # Checked here, not where each field is read: a backend missing one would
-    # otherwise start, serve, and fail on the turn that first needs it.
+    # Checked at startup, not on the first turn that needs the field.
     for be in BACKENDS:
         short = {"name", "url", "pref", "prefill", "generate", "node"} - set(be)
         if short:
@@ -53,8 +49,7 @@ if os.environ.get("ROUTER_BACKENDS"):
         if not any(be[job] for be in BACKENDS):
             raise SystemExit(f"[router] no backend in {BACKENDS_FROM} can "
                              f"{job}, so no request could be served")
-    # A turn can only leave the instance that read it through the handoff, so
-    # an instance that does not generate needs it on.
+    # A turn leaves its reader only through the handoff.
     if os.environ.get("HANDOFF") == "0" and not all(be["generate"]
                                                     for be in BACKENDS):
         raise SystemExit("[router] HANDOFF=0 keeps every turn on the backend "
@@ -73,81 +68,66 @@ def generates(be):
 MAX_PINS      = 512    # conversations to remember
 FORWARD_TIMEOUT = 7200.0  # longest a backend may take to answer a request
 READ_TIMEOUT    = 7200.0  # a read runs 30 to 40 minutes
-PIN_PATIENCE  = 20.0   # how long a conversation waits for the backend that
-                       # holds its cache before taking a free one instead
+PIN_PATIENCE  = 20.0   # seconds a conversation waits for the backend
+                       # that holds its cache before taking a free one
 POLL          = 2.0    # seconds between backend checks
 RATE_WINDOW   = 10.0   # seconds a per-slot rate is measured over
-PING_EVERY       = 15.0   # seconds of quiet before a ping. Clients drop a
-                          # stream after 300, and a read sends nothing.
+PING_EVERY       = 15.0   # seconds of quiet before a ping. Clients
+                          # drop a stream after 300 s of silence.
 POST_TIMEOUT     = 300.0  # a save waits for the slot to finish its turn
-DRAIN_DEADLINE   = 1800.0 # how long a drain waits for work already running.
-                          # Killing a read wastes the twenty minutes it has run.
-PARK_ALL_TIMEOUT = 75.0   # longest one save may take on the way out. Measured
-                          # median 11 s, p90 19 s; 77 of 952 saves exceeded 20.
-PARK_ALL_BUDGET  = 80.0   # wall-clock cap over all of them. stop-all.sh gives
-                          # the router 90 s, and the pin map is written last.
-PARK_FLOOR       = 64 * 1024 * 1024   # a real state carries the recurrent
-                          # state, about 112 MiB at any length. A smaller file
-                          # means the slot had changed hands.
-# Disk for the conversation copies, in bytes rather than files: a copy is
-# about 115 MiB plus 36.6 KiB a token, so 0.2 to 5.4 GiB at ctx 150000. Size it
-# to the disk RUN is on. Too low and a copy still in use is displaced, which
-# costs a full re-read.
+DRAIN_DEADLINE   = 1800.0 # seconds a drain waits for running work
+PARK_ALL_TIMEOUT = 75.0   # longest one save may take at shutdown.
+                          # Measured: median 11 s, p90 19 s, 77 of 952
+                          # saves over 20 s.
+PARK_ALL_BUDGET  = 80.0   # wall-clock cap over all shutdown saves.
+                          # stop-all.sh gives the router 90 s.
+PARK_FLOOR       = 64 * 1024 * 1024   # a real state file is about 112 MiB.
+                          # A smaller file means the slot changed hands.
+# Disk for the conversation copies, in bytes. A copy is about 115 MiB plus
+# 36.6 KiB a token: 0.2 to 5.4 GiB at ctx 150000. Size it to the disk RUN
+# is on. Too low displaces a copy still in use, which costs a full re-read.
 PARK_BUDGET = int(float(os.environ.get("PARK_BUDGET_GB") or 256) * 1024 ** 3)
-# A restored slot is only usable if the state file carries its context
-# checkpoints, which needs patches/slot-state-carries-checkpoints.patch.
-# Without it a move is followed by a full re-read: set HANDOFF=0.
+# A restored slot needs its context checkpoints in the state file, which
+# needs patches/slot-state-carries-checkpoints.patch. Without the patch a
+# move is followed by a full re-read: set HANDOFF=0.
 HANDOFF_ON = os.environ.get("HANDOFF", "1") == "1"
-PREFIX_MIN_CHARS = 8000   # about 2000 tokens. A shorter cut is not worth a
-                          # file: it only guesses what a later request shares.
+PREFIX_MIN_CHARS = 8000   # about 2000 tokens. A shorter cut is not
+                          # worth a file.
 BUILD_PATIENCE   = 1800.0 # longest a request waits for another to save the
                           # opening they share
-SYSTEM_MIN_CHARS = 2000   # The system prompt is the only cut two sessions
-                          # share, because anything deeper carries a first user
-                          # message that differs. Claude Code sends 6,100
-                          # characters: a minute to read, a fifth of a second
-                          # to load from disk.
-# Disk for the saved openings, in bytes rather than files: one block runs 0.6
-# to 3.7 GB, so a file count means anything. Least recently used goes first.
-# Size it to the disk BLOCK_DIR is on.
+SYSTEM_MIN_CHARS = 2000   # the only cut two sessions share. Claude Code
+                          # sends 6,100 characters: a minute to read, a
+                          # fifth of a second to load from disk.
+# Disk for the saved openings, in bytes. One block is 0.6 to 3.7 GB. Least
+# recently used goes first. Size it to the disk BLOCK_DIR is on.
 BLOCK_BUDGET = int(float(os.environ.get("BLOCK_BUDGET_GB") or 64) * 1024 ** 3)
-# Deeper openings: a cut where two conversations diverge, read and saved so a
-# branch of a session can start from it. Off by default - over two days of real
-# traffic here it was built 0 times and loaded 0 times, against several GB of
-# disk, and a fork is only visible while its parent still holds a slot.
-#
-# The machinery stays, and the detection still runs: the `choice` event records
-# how deep a fork could have started and whether some conversation's own copy
-# already held that cut. tools/cache-report.py reads it. Turn this on if it
-# says forks are real here.
+# Deeper openings: a cut where two conversations diverge. Off by default:
+# over two days of real traffic it was built 0 times and loaded 0 times.
+# The detection still runs, and the `choice` event records how deep a fork
+# could have started. tools/cache-report.py reads it.
 DEEP_OPENINGS = os.environ.get("DEEP_OPENINGS", "0") == "1"
-WANT_KEEP        = 8      # openings noted as missing but not built yet. They
-                          # cost nothing until built, and one dropped is an
-                          # opening read again from cold.
-IDLE_POLLS       = 2      # polls a slot must have looked idle for before the
-                          # builder reads into it. One poll can be two seconds
-                          # old, and a slot between two turns looks free in it.
+WANT_KEEP        = 8      # openings noted as missing but not built yet
+IDLE_POLLS       = 2      # polls a slot must look idle before the builder
+                          # reads into it. One poll can be two seconds old.
 BUILD_POLL       = 10.0   # seconds between builder passes
-STALL_RATE = 0.5          # tokens/s. Under this a generating slot is stalled
-                          # behind another slot's read, getting one step per
-                          # prompt chunk. Measured 0.02 to 0.06 against 6.3 solo.
+STALL_RATE = 0.5          # tokens/s. Under this a generating slot is
+                          # stalled behind another slot's read. Measured
+                          # 0.02 to 0.06 against 6.3 solo.
 HISTORY_STEP = 10.0       # seconds per history bucket
-HISTORY_KEEP = 60         # buckets kept: ten minutes of slot-time and load
-GPU_POLL = 10.0           # seconds between nvidia-smi runs. Each costs 50 to
-                          # 100 ms, so the poll collects a child rather than
-                          # waiting for one.
-RECENT_REQUESTS = 20      # requests the dashboard lists, with how each started
-RECENT_FILES = 24         # slot files the dashboard lists. A turn boundary can
-                          # write three inside one status push, so this holds
-                          # several pushes of them rather than one.
-FLOW_LOG = 150            # stage transitions the flow dashboard can replay, newest first
+HISTORY_KEEP = 60         # buckets kept: ten minutes
+GPU_POLL = 10.0           # seconds between nvidia-smi runs. Each costs 50
+                          # to 100 ms, so it runs as a child.
+RECENT_REQUESTS = 20      # requests the dashboard lists
+RECENT_FILES = 24         # slot files the dashboard lists. A turn
+                          # boundary can write three in one status push.
+FLOW_LOG = 150            # stage transitions the flow dashboard replays
 MOUNT_POLL = 30.0         # seconds between disk usage checks
 CHARS_PER_TOK = 4.0
 REPLY_TOKENS  = 1024   # room to reserve for the reply
-MAX_BODY = 256 * 1024 * 1024   # largest request body read into memory. A turn
-                       # at ctx 150000 is a few megabytes.
+MAX_BODY = 256 * 1024 * 1024   # largest request body read into memory.
+                       # A turn at ctx 150000 is a few megabytes.
 
-# These endpoints use a slot. The rest are cheap, so they skip the queue.
+# Endpoints that use a slot.
 INFERENCE = {
     "/completion", "/completions", "/v1/completions",
     "/chat/completions", "/v1/chat/completions",
@@ -155,9 +135,9 @@ INFERENCE = {
     "/embedding", "/embeddings", "/v1/embeddings",
 }
 
-# An allowlist, not a denylist. The backends run with --agent, which is shell
-# and file access with no key, so a path this does not name must never be
-# reachable from the public port. PASS_THROUGH adds to it, comma separated.
+# An allowlist. The backends run with --agent, which is shell and file
+# access with no key. A path not named here must never be reachable from
+# the public port. PASS_THROUGH adds to it, comma separated.
 PASSED = {
     "/health", "/props", "/slots", "/models", "/v1/models",
     "/tokenize", "/detokenize", "/apply-template",
@@ -170,27 +150,21 @@ DROP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "te", "trailer
                 "transfer-encoding", "upgrade", "content-length", "host"}
 
 
-# What a backend prints under "vision hparams" when it loads an mmproj, and
-# what to assume before one has. Pool.vision() reads the real thing.
+# Printed under "vision hparams" at load. Pool.vision() reads the real value.
 VISION = {"patch_size": 16, "n_merge": 2,
           "image_min_pixels": 8192, "image_max_pixels": 4194304}
 HEADER_B64 = 98304                        # base64 to decode looking for a size
 
 
 def image_size(head):
-    """Width and height from the front of an image file, or None.
-
-    Only the header is needed, so the caller decodes a prefix rather than the
-    whole picture."""
+    """Width and height from the front of an image file, or None."""
     if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
         return struct.unpack(">II", head[16:24])
     if head[:6] in (b"GIF87a", b"GIF89a"):
         return struct.unpack("<HH", head[6:10])
     if head[:2] == b"BM" and len(head) >= 26:
-        # biHeight is signed, and negative means the rows are stored top-down.
-        # Read as-is it made every top-down bitmap unmeasurable, so a 240x120
-        # screenshot was charged the 4096 tokens an unreadable header costs
-        # instead of 32 - enough to push a request past the 413.
+        # biHeight is signed. Negative means top-down rows. Read unsigned, a
+        # 240x120 top-down bitmap was charged 4096 tokens instead of 32.
         wide, high = struct.unpack("<ii", head[18:26])
         return abs(wide), abs(high)
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
@@ -220,12 +194,9 @@ def image_size(head):
 def image_tokens(payload, vision=None):
     """What a backend charges for one base64 image.
 
-    It resizes the picture to a multiple of patch_size * n_merge, holding the
-    aspect ratio and the pixel range, then spends a token per aligned square.
-    This is calc_size_preserved_ratio in mtmd-image.cpp followed by
-    clip_n_output_tokens; a 240x120 png measured 32 tokens, which is what this
-    returns. An unreadable header is charged the most an image can cost, so a
-    format we cannot measure is never let in under its weight."""
+    calc_size_preserved_ratio then clip_n_output_tokens (mtmd-image.cpp):
+    one token per aligned square after the resize. A 240x120 png measured
+    32 tokens. An unreadable header is charged the most an image can cost."""
     vision = vision or VISION
     align = vision["patch_size"] * vision["n_merge"]
     least, most = vision["image_min_pixels"], vision["image_max_pixels"]
@@ -242,7 +213,7 @@ def image_tokens(payload, vision=None):
     w, h = size
     up   = lambda x: math.ceil(x / align) * align
     down = lambda x: math.floor(x / align) * align
-    near = lambda x: math.floor(x / align + 0.5) * align    # c++ rounds half up
+    near = lambda x: math.floor(x / align + 0.5) * align    # c++ rounding
     w_bar, h_bar = max(align, near(w)), max(align, near(h))
     if w_bar * h_bar > most:
         beta = math.sqrt(w * h / most)
@@ -267,9 +238,7 @@ def images_in(body):
         if isinstance(source, dict) and isinstance(source.get("data"), str):
             if str(source.get("media_type", "")).startswith("image/"):
                 yield source["data"]
-        # openai: {"image_url": {"url": "data:image/png;base64,..."}}. Taking
-        # the url wherever it sits counts each picture once, however deep the
-        # client nested it.
+        # openai: {"image_url": {"url": "data:image/png;base64,..."}}
         for value in node.values():
             if isinstance(value, str) and value.startswith("data:image/"):
                 _, _, payload = value.partition("base64,")
@@ -287,16 +256,8 @@ def images_in(body):
 def request_cost(body, vision=None):
     """(tokens this request needs, pictures it carries, what they cost).
 
-    Four characters make about one token, except in a picture. Base64
-    is hundreds of times longer than what the vision encoder charges,
-    so counting it as text refuses a screenshot that would have fit.
-
-    All three come back together because the walk is the expensive
-    part: it parses a body of several megabytes and decodes the header
-    of every picture. Asking twice doubled that on the request path.
-
-    The dashboard needs pictures counted apart from text, or it cannot
-    tell a 4,000 token screenshot from 16,000 characters of prose."""
+    Base64 is hundreds of times longer than what the vision encoder charges.
+    One walk for all three: it parses megabytes and decodes every picture."""
     text, charged, count = len(body), 0, 0
     for payload in images_in(body):
         text -= len(payload)
@@ -311,11 +272,8 @@ def token_estimate(body, vision=None):
 
 
 def conversation_id(body):
-    """Identify a conversation by its opening, which does not change.
-
-    The system messages and the first user message are the same on every turn.
-    Anything after them grows, so including it would give every turn its own
-    id and defeat the pinning."""
+    """Identify a conversation by its opening: the system messages and the
+    first user message. Anything later grows every turn."""
     try:
         req = json.loads(body)
     except Exception:
@@ -325,23 +283,19 @@ def conversation_id(body):
     if isinstance(messages, list):
         opening = []
         for message in messages:
-            # A client may send anything. Without this a list of strings, or
-            # one null, threw AttributeError here - before a status line had
-            # been sent, so the client got a dropped connection rather than
-            # the 400 a backend would have answered. Every other body reader
-            # in this file guards the same way.
+            # A non-dict here raised before any status line went out.
             if not isinstance(message, dict):
                 break
             role = message.get("role")
             if role == "assistant":
-                break                      # the reply. Everything after grows.
+                break                      # the reply
             text = message.get("content")
             if isinstance(text, list):     # multimodal message
                 text = "".join(part.get("text", "") for part in text
                                if isinstance(part, dict))
             opening.append(f"{role}:{text}")
             if role == "user":
-                break                      # first user message, and stop
+                break                      # the first user message
         start = "\n".join(opening)
     elif isinstance(req.get("prompt"), str):
         start = req["prompt"]
@@ -353,29 +307,20 @@ def conversation_id(body):
 
 
 WEB = Path(__file__).with_name("web")          # the dashboard, a static app
-# Everything a run writes. bin/common.sh sets RUN and exports nothing else
-# about it, so a box that moves this has to export RUN for the router too.
+# Everything a run writes. RUN comes from bin/common.sh.
 RUN_DIR  = Path(os.environ.get("RUN")
                 or Path(__file__).resolve().parent.parent / "run")
 SLOT_DIR = RUN_DIR / "slots"
-# System blocks go on the faster disk where there are two: each is read at the
-# start of a new session, and BLOCK_BUDGET bounds what they take. A
-# conversation's copy stays with the rest - written once, read at most once,
-# and several gigabytes - under PARK_BUDGET. Two budgets because they can be
-# two disks; beside the rest by default, and BLOCK_DIR moves them.
+# Openings go on the faster disk where there are two, under BLOCK_BUDGET.
+# Conversation copies stay under RUN_DIR, under PARK_BUDGET.
 BLOCK_DIR = Path(os.environ.get("BLOCK_DIR") or RUN_DIR / "blocks")
 
-# Debugging only, off unless CAPTURE names a directory. A prompt read again and
-# again is a prompt whose opening changed, and nothing else here says what. A
-# capture holds a whole conversation, so only the newest few are kept.
+# Debugging only, on when CAPTURE names a directory.
 CAPTURE_DIR = Path(os.environ["CAPTURE"]) if os.environ.get("CAPTURE") else None
 CAPTURE_KEEP = 24
 
-# One JSON line per cache decision, in a dated file. The dashboard shows the
-# present; improving the cache needs the past - which openings paid for
-# themselves, which were never loaded, how long a want waited, whether a fork
-# started from its parent's opening. Events go through a queue and a thread, so
-# no request touches the disk for this. CACHE_LOG=0 turns it off.
+# One JSON line per cache decision, in a dated file. CACHE_LOG=0 turns it
+# off.
 CACHE_LOG_ON = os.environ.get("CACHE_LOG", "1") == "1"
 CACHE_LOG_DIR = Path(os.environ.get("CACHE_LOG_DIR") or RUN_DIR)
 
@@ -389,23 +334,17 @@ EVICTED_RE = re.compile(r"removing oldest entry \(size = ([\d.]+) MiB\)")
 SKIPPED_RE = re.compile(r"prompt state size ([\d.]+) MiB exceeds cache size limit")
 STATE_RE = re.compile(r"cache state: (\d+) prompts, ([\d.]+) MiB "
                       r"\(limits: ([\d.]+) MiB")
-# The backend says its limit once, at startup. Without this the dashboard has
-# nothing to show until the backend next touches its cache, which needs
-# traffic: cpu0_0 showed a pre-restart 16384 MiB for an hour after coming back
-# at 8192.
+# Printed once, at startup.
 LIMIT_RE = re.compile(r"prompt cache is enabled, size limit: (\d+) MiB")
-# A slot restored from a file has no checkpoint, and this model's recurrent
-# state cannot be rewound without one, so the backend re-reads the whole prompt
-# and says so. Each one is a request that took minutes longer than it needed.
+# A slot restored from a file has no checkpoint. The recurrent state cannot
+# be rewound without one, so the backend re-reads the whole prompt.
 REREAD_RE = re.compile(r"forcing full prompt re-processing")
-# A checkpoint the slot actually stepped back to, at -lv 4. Each one is a turn
-# that re-read only the tokens past this position instead of the whole prompt.
+# A checkpoint the slot stepped back to. Printed at -lv 4.
 CHECKPOINT_RE = re.compile(r"restored context checkpoint \(pos_min = \d+, "
                            r"pos_max = \d+, n_tokens = (\d+)")
-# What the backend mapped at startup, and the tensor it leaves on disk. Mapped
-# less lazy is what must stay in the page cache; when it does not, prefill
-# falls from 37 tokens a second to single digits. The shard sizes on disk say
-# something else, since one shard is almost all the lazy tensor.
+# Mapped less lazy is what must stay in the page cache. When it does not,
+# prefill falls from 37 tokens a second to single digits. Shard sizes on disk
+# say something else: one shard is almost all the lazy tensor.
 MAPPED_RE = re.compile(r"CPU_Mapped model buffer size = +([\d.]+) MiB")
 LAZY_RE = re.compile(r"add: tensor \S+ \(size = +([\d.]+) MiB\) lazy read enabled")
 
@@ -414,16 +353,13 @@ CONFIG_RE = re.compile(r"(n_ctx|n_batch|n_ubatch|kv_unified|n_slots)\s*=\s*"
                        r"'?([\w.]+)'?")
 CONFIG_KEYS = ("n_ctx", "n_batch", "n_ubatch", "kv_unified", "n_slots")
 
-# The mmproj's geometry, printed once under "vision hparams". The word break
-# matters: n_merges (the tokenizer's, in the hundreds of thousands) is printed
-# long before n_merge, and would otherwise be read instead.
+# Printed once under "vision hparams". The word break matters: the
+# tokenizer's n_merges is printed long before n_merge.
 VISION_RE = re.compile(r"\b(patch_size|n_merge|image_min_pixels|image_max_pixels)"
                        r"\b\s*[:=]\s*(\d+)")
 
 
-RATE_FLOOR = 1.0     # seconds. Below this a count is not a rate: just after a
-                     # reset a token lands against no elapsed time and the
-                     # division runs away.
+RATE_FLOOR = 1.0     # seconds. Under this a count is not a rate.
 
 
 def per_second(tokens, seconds):
@@ -432,11 +368,8 @@ def per_second(tokens, seconds):
 
 
 def read_config(lines):
-    """The settings a backend was started with, from what it printed.
-
-    llama-server does not report these on /props, so the only source is the log
-    it writes once at startup. A restart appends to the same file, so the first
-    of each wins."""
+    """The settings a backend started with, from its log. llama-server does
+    not report them on /props. A restart appends, so the first of each wins."""
     found = {}
     for line in lines:
         hit = CONFIG_RE.search(line)
@@ -456,10 +389,8 @@ def read_config(lines):
 
 
 def read_vision(lines):
-    """The vision encoder's geometry, from what a backend printed at startup.
-
-    Returns None unless the whole of it is there, so a backend with no mmproj
-    and a half-read log both say "nothing" rather than something wrong."""
+    """The vision encoder's geometry from a backend's startup log, or None
+    when any part of it is missing."""
     found = {}
     for line in lines:
         hit = VISION_RE.search(line)
@@ -507,15 +438,9 @@ def cache_event(line):
 
 class CacheWatch:
     """Follow one backend log and total what it says about the prompt cache.
+    The totals cover the life of that backend. `sink(kind, value)` gets the
+    per-request events."""
 
-    The counters run from the start of the log, which the backend truncates on
-    each start, so they cover the life of that backend.
-
-    `sink`, when given, is called as sink(kind, value) for the events worth a
-    line of their own in the cache event log."""
-
-    # The periodic and startup lines stay in the totals. Everything else
-    # happened to one request, so it goes to the sink.
     SUNK = ("evicted", "skipped", "reread", "checkpoint")
 
     def __init__(self, path, sink=None):
@@ -523,12 +448,10 @@ class CacheWatch:
         self.sink = sink
         self.offset = 0
         self.inode = None
-        # Bytes that were already in the log when this router started. They
-        # belong in the totals, which cover the life of the backend, but not in
-        # the sink: bin/restart-router.sh exists to restart the router with the
-        # backends left up, and every restart wrote that backend's whole
-        # history into today's cache-events file as if it had just happened.
-        # Four logs of 3.7 to 9.8 MB replayed 473 of them.
+        # Bytes already in the log when this router started: in the totals,
+        # not the sink. bin/restart-router.sh restarts the router with the
+        # backends up, and replaying four logs of 3.7 to 9.8 MB wrote 473
+        # stale events.
         try:
             self.replay_to = self.path.stat().st_size
         except OSError:
@@ -545,16 +468,11 @@ class CacheWatch:
             size, inode = stat.st_size, stat.st_ino
         except OSError:
             return
-        # Smaller, or a different file. The inode matters as much as the size:
-        # restart-backend.sh and start-all.sh both move the old log aside and
-        # the new backend creates its own, so watching the size alone missed
-        # every restart whose new log passed the old offset before the next
-        # poll - the counters kept the dead backend's totals and the new log's
-        # opening lines, which carry the cache size limit, were skipped for
-        # good. read_settings already reads the inode for the same reason.
+        # Smaller, or a different inode: a restarted backend writes a new
+        # log. See read_settings.
         if size < self.offset or (self.inode is not None and inode != self.inode):
             self.offset = 0
-            self.replay_to = 0        # a new log, so none of it predates this run
+            self.replay_to = 0        # a new log: none of it predates this run
             self.stats.update(evictions=0, evicted_mib=0.0, skipped=0, rereads=0,
                               checkpoints=0, mapped_mib=0.0, lazy_mib=0.0,
                               prompts=0, used_mib=0.0, limit_mib=0.0)
@@ -566,16 +484,12 @@ class CacheWatch:
                 self.offset = handle.tell()
         except OSError:
             return
-        # llama-server's log is block buffered, so a read can land mid line.
-        # Taking the offset to the end anyway split that line across two polls
-        # and neither half matched anything - and the cache size limit is
-        # printed once, at startup, so losing that one is losing it for good.
+        # Block buffered: a partial line waits for the next poll.
         cut = fresh.rfind(b"\n") + 1
         if cut < len(fresh):
             self.offset -= len(fresh) - cut
             fresh = fresh[:cut]
-        # Counted in bytes, like the offset: a decoded length is characters,
-        # and one non-ascii line in the trace would put the two out of step.
+        # Counted in bytes, like the offset. A decoded length is characters.
         at = self.offset - len(fresh)
         for line in fresh.splitlines(keepends=True):
             at += len(line)
@@ -606,12 +520,8 @@ class CacheWatch:
 
 
 class EventLog:
-    """Append cache events to a dated JSONL file, one json object a line.
-
-    Telemetry, not data: losing a line costs a number in a report, and nothing
-    here may make a request wait or fail. A writer queues the row and returns,
-    a thread empties the queue, and a full queue drops the newest event. The
-    file is named by the day its rows fall in, so the log rotates itself."""
+    """Append cache events to a dated JSONL file. Telemetry, not data: a
+    thread writes, and a full queue drops the newest event."""
 
     def __init__(self, directory=None, on=CACHE_LOG_ON, name="cache-events",
                  maxsize=10000):
@@ -635,7 +545,6 @@ class EventLog:
         try:
             self.queue.put_nowait(row)
         except queue.Full:
-            # Telemetry that costs a request has cost too much. Count the loss.
             self.dropped += 1
 
     def flush(self):
@@ -648,8 +557,7 @@ class EventLog:
             try:
                 self._emit(row)
             except Exception:
-                # One bad row must not end the thread, or every event after it
-                # is lost too.
+                # One bad row must not end the thread.
                 self.dropped += 1
             finally:
                 self.queue.task_done()
@@ -666,18 +574,14 @@ class EventLog:
         self.handle.flush()
 
 
-# The one log every cache hook writes to. Tests replace it with an EventLog on
-# a temporary directory; the hooks look the name up at call time.
+# Tests replace this with an EventLog on a temporary directory.
 EVENTS = EventLog()
 
 
-# Config files the dashboard offers for download. They are built per request
-# so the address inside matches the one the reader reached the dashboard on.
+# Client configs the dashboard offers, built for the address the reader used.
 CONFIG_FILES = {"opencode": "opencode.json", "claude": "settings.json"}
 
-# The provider id in a generated OpenCode config. It names the machine, not the
-# model: one client can reach two of these boxes, and this is how it tells them
-# apart and keys its own settings. PROVIDER overrides the hostname.
+# Names the machine in an OpenCode config. PROVIDER overrides the hostname.
 PROVIDER = os.environ.get("PROVIDER") or socket.gethostname().split(".")[0] or "llama"
 
 
@@ -685,12 +589,8 @@ HOST_RE = re.compile(r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$")
 
 
 def host_only(host):
-    """A Host header that is a host and a port, or None.
-
-    The generated client configs carry this address, and a client keeps one
-    for months. It arrives in a header anyone can set, so anything that is not
-    plainly a name or an address with a port is refused rather than written
-    into a file the reader will trust."""
+    """A Host header that is only a host and a port, or None. It goes into
+    a client config the reader keeps for months, and anyone can set it."""
     host = (host or "").strip()
     return host if HOST_RE.match(host) else None
 
@@ -698,23 +598,17 @@ def host_only(host):
 def client_config(kind, host, model, n_ctx):
     """Build a client config for this router, or return None.
 
-    The long timeouts are not padding. A backend reads at about 37 tokens a
-    second on an empty box and sends nothing while it does, so a first turn on
-    a full window is silent for hours. The divisor is the worst case, not the
-    best: cpu0_0 read 114,354 tokens at 17.2 to 20.6 a second on 13 September
-    with the other instances busy. At 25 the config was already short of a real
-    cold read."""
+    The timeouts are measured: cpu0_0 read 114,354 tokens at 17.2 to 20.6
+    tokens a second with the other instances busy, so the divisor is 15."""
     base = f"http://{host}"
     patience_ms = max(3600000, n_ctx // 15 * 1000)
     if kind == "opencode":
         return {
             "$schema": "https://opencode.ai/config.json",
             "model": f"{PROVIDER}/{model}",
-            # Title generation and other small jobs. Left unset it would reach
-            # for a model this backend does not have.
+            # Title generation. Unset, it names a model this backend lacks.
             "small_model": f"{PROVIDER}/{model}",
-            # This model is private to this machine, so nothing about a
-            # conversation should leave it.
+            # The model is private to this machine.
             "share": "disabled",
             "provider": {
                 PROVIDER: {
@@ -722,8 +616,7 @@ def client_config(kind, host, model, n_ctx):
                     "name": f"Qwen3.8 Flash Next ({PROVIDER})",
                     "options": {
                         "baseURL": f"{base}/v1",
-                        # Name the session in every request, so the router
-                        # does not have to guess it from the prompt.
+                        # Names the session in every request.
                         "setCacheKey": True,
                         "timeout": patience_ms,
                         "headerTimeout": patience_ms,
@@ -747,85 +640,61 @@ def client_config(kind, host, model, n_ctx):
             },
         }
     if kind == "claude":
-        # The backends serve the anthropic messages api, so Claude Code needs
-        # only the address. There is no key, but the client insists on one.
+        # The client insists on a key. The backend ignores it.
         return {
             "env": {
                 "ANTHROPIC_BASE_URL": base,
                 "ANTHROPIC_AUTH_TOKEN": "not-used-but-some-clients-require-one",
                 "ANTHROPIC_MODEL": model,
-                # Gateway discovery only keeps ids containing "claude" or
-                # "anthropic", so this model has to be offered by hand.
+                # Gateway discovery keeps only ids that contain "claude" or
+                # "anthropic".
                 "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
                 "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Qwen3.8 Flash Next (MTP)",
-                # Background work uses the haiku slot. Left alone it names a
-                # model this backend does not have.
+                # Background work uses the haiku slot.
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
                 "ANTHROPIC_SMALL_FAST_MODEL": model,
                 "API_TIMEOUT_MS": str(patience_ms),
-                # Both watchdogs give up after five minutes of quiet by
-                # default, which a prompt read outlasts easily.
+                # Both watchdogs give up after five minutes of quiet.
                 "CLAUDE_STREAM_IDLE_TIMEOUT_MS": str(patience_ms),
                 "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": str(patience_ms),
                 "API_FORCE_IDLE_TIMEOUT": "0",
-                # Nothing here needs the internet, and a slow backend should
-                # not wait on feature flags.
+                # Nothing here needs the internet.
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
                 "DISABLE_TELEMETRY": "1",
                 "DISABLE_ERROR_REPORTING": "1",
-                # The attribution block sits first in the system prompt and
-                # carries a per-conversation fingerprint. Dropping it lets two
-                # sessions share the system prompt, which is the difference
-                # between reading it once and reading it every time.
+                # The attribution block carries a per-conversation
+                # fingerprint. Without it two sessions share the prompt.
                 "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-                # Pre-release body fields draw a 400 from a backend that does
-                # not know them.
+                # Pre-release body fields draw a 400 from the backend.
                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-                # Claude Code does not know this model, so it would assume a
-                # 200k window and let a session outgrow the slot. State the
-                # real size, so auto-compact runs at the right point.
+                # Claude Code assumes a 200k window for an unknown model.
+                # The real size makes auto-compact run at the right point.
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(n_ctx),
             }
         }
     return None
 
 
-# The two shelves an opening can sit on, as the file names carry them. A
-# conversation's own copy must not be able to look like one: adopt_files sorts
-# the slot directory by these prefixes, so a key beginning with one put a
-# private cache on the shared shelf and lost the conversation its restore.
+# Opening file-name prefixes. A conversation key must not start with one.
 SHELF_MARKS = ("base-", "deep-")
 
 
 def copy_is_current(record):
-    """True when this conversation's copy on disk is of the turn it last ran.
-
-    A copy behind the slot is still a prefix, so it is worth keeping - but it
-    is not worth keeping *instead of* a newer one. ensure_parked and park_all
-    asked only whether a copy existed, so on a pool where nothing else writes
-    one - every backend reading, which is the shipped default and what
-    generator() returns None for - a conversation's copy froze at its first
-    park and every later turn re-read everything after it."""
+    """True when the copy on disk is of the turn the conversation last ran.
+    An older copy is a prefix, not a replacement for a newer one."""
     return bool(record.get("parked")) and record.get("parked_turn") == record.get("turns")
 
 
 def file_safe(key):
     """A conversation key that also works as a file name.
 
-    llama.cpp refuses a colon, a path separator and a control character;
-    each becomes a dash. A key that starts like an opening is moved out
-    of the way, so a client cannot name a shelf. The key must be unique
-    and stable, not readable."""
+    llama.cpp's fs_validate_filename (common/common.cpp) refuses a colon, a
+    path separator, a control character, ".." and a name over 255
+    characters, with a 400 on every save and restore."""
     keep = "-._"
     safe = "".join(c if c.isalnum() and c.isascii() or c in keep else "-"
                    for c in key).strip("-. ") or "conversation"
-    # llama.cpp's fs_validate_filename refuses ".." anywhere in a name and
-    # anything over 255 characters, and it is checked before the save is even
-    # attempted (common/common.cpp). A key carrying either came back 400 on
-    # every save and every restore, so that conversation was never parked and
-    # re-read its whole prompt every turn - with nothing in the log but
-    # "park failed". The tail is kept rather than the head because a key is
-    # usually prefixed, not suffixed, and ".park" goes on the end.
+    # The tail is kept: keys are prefixed, and ".park" goes on the end.
     while ".." in safe:
         safe = safe.replace("..", ".")
     safe = safe[-200:].strip("-. ") or "conversation"
@@ -833,45 +702,33 @@ def file_safe(key):
 
 
 def short_key(conv):
-    """A conversation key, short enough to read and still telling apart.
-
-    A subagent's key is its session with the agent joined on the end, so both
-    ends have to show, or a session and every subagent under it read alike."""
+    """A conversation key short enough to read. A subagent's key ends in
+    its agent id, so both ends show."""
     conv = conv or ""
     return conv[:8] if len(conv) <= 36 else f"{conv[:8]}/{conv[-6:]}"
 
 
 def mark_shelf(mark):
-    """The "base-" / "deep-" mark of an opening, or a want record, as a shelf.
-
-    The marks keep their trailing dash because the builder passes them to file
-    names."""
+    """The shelf of a "base-" / "deep-" mark or a want record. Marks keep
+    their dash for file names."""
     mark = mark.get("mark") if isinstance(mark, dict) else mark
     return (mark or "deep-").rstrip("-")
 
 
 def session_key(headers):
-    """Name the conversation from the client's own headers, or return None.
-
-    Claude Code sends its session id on every request, which beats guessing
-    from the opening of the prompt. A subagent runs its own prompt, so it is a
-    separate conversation."""
+    """Name the conversation from Claude Code's session headers, or None. A
+    subagent runs its own prompt, so it is a separate conversation."""
     lower = {str(name).lower(): value for name, value in dict(headers).items()}
     session = (lower.get("x-claude-code-session-id") or "").strip()
     if not session:
         return None
     agent = (lower.get("x-claude-code-agent-id") or "").strip()
-    # The key becomes the name of a slot file, so it may only hold characters
-    # a backend will accept in one. A colon is not one of them.
+    # The key names a slot file. A colon is not allowed in one.
     return file_safe(f"{session}-{agent}") if agent else file_safe(session)
 
 
 def client_kind(headers):
-    """Which client sent this, by its user agent, or None.
-
-    The two worth telling apart send their own name. Anything else keeps the
-    first word of its agent string, so a new client shows up in the event log
-    under its own name without a code change."""
+    """Which client sent this, by its user agent, or None."""
     agent = (dict(headers).get("User-Agent") or "").lower()
     if "claude" in agent:
         return "claude-code"
@@ -880,9 +737,9 @@ def client_kind(headers):
     return agent.split("/")[0][:24] or None
 
 
-# A keep-alive must be in the protocol the client speaks. A comment keeps an
-# OpenAI stream alive, but is not data to an anthropic parser, which reports a
-# stream that ended before any data arrived. That protocol has a ping event.
+# A keep-alive must be in the client's protocol. A comment keeps an OpenAI
+# stream alive. An anthropic parser reports a stream with only comments as
+# ended before any data. That protocol has a ping event.
 PING = b": ping\n\n"
 ANTHROPIC_PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 
@@ -904,10 +761,7 @@ def sse_event(name, data):
 
 
 def read_event(raw):
-    """The name and the json of one SSE event, or (None, None).
-
-    Anything else is left to the caller to pass on untouched: a comment, a
-    part of an event, or a body that is not an event stream at all."""
+    """The name and the json of one SSE event, or (None, None)."""
     name, data = None, []
     for line in raw.split(b"\n"):
         if line.startswith(b"event:"):
@@ -924,20 +778,11 @@ def read_event(raw):
 
 
 def opening_event(path, body):
-    """The event a stream of this protocol has to begin with, or nothing.
+    """The event a stream of this protocol must begin with, or nothing.
 
-    An anthropic stream is a message being built. A ping may sit
-    anywhere inside one, but a stream that has only pinged has begun no
-    message, and the client reports a 502 that was never sent. The
-    reply here comes half an hour after the stream opens, so this is
-    all the client holds on to until then.
-
-    The id is invented, because the router opens the stream before it
-    has a backend. Nothing after message_start carries one to disagree.
-    The usage counts are zero, and AnthropicSplice moves the real ones
-    onto the closing message_delta.
-
-    An OpenAI stream may open with a comment, so it needs no event."""
+    An anthropic stream that has only pinged has begun no message, and the
+    client reports a 502. The id is invented. AnthropicSplice moves the real
+    usage onto the closing message_delta."""
     if not anthropic(path):
         return b""
     try:
@@ -955,21 +800,13 @@ def opening_event(path, body):
 class AnthropicSplice:
     """Join a backend's stream onto one the router has already opened.
 
-    The router sends message_start when the stream opens, so the backend's own
-    must come out: two in one stream is not a message any parser will follow.
-    The one thing it carries that no later event does is the prompt token
-    count, which a client sizes its context window with, so that moves onto the
-    closing message_delta.
-
-    A socket delivers whatever arrived, not whole events, so a part event waits
-    for the rest of it."""
+    The backend's message_start must come out: two in one stream break every
+    parser. Its prompt token count moves onto the closing message_delta."""
 
     def __init__(self):
         self.rest = b""
         self.usage = None
-        # What the client ends up seeing: prompt counts from message_start,
-        # the generation count from message_delta. Nothing parses this stream
-        # twice to find out what it was told.
+        # What the client ends up seeing.
         self.reported = {}
 
     def feed(self, chunk):
@@ -997,7 +834,7 @@ class AnthropicSplice:
                 self.reported.update(self.usage)
             return b""
         if name == "message_delta" and self.usage:
-            # The backend counts what it generated, so its own figures win.
+            # The backend's own generation figures win.
             data["usage"] = merged = dict(self.usage, **(data.get("usage") or {}))
             self.reported.update(merged)
             self.usage = {}
@@ -1006,10 +843,8 @@ class AnthropicSplice:
 
 
 def wants_ping(content_type, content_length):
-    """True when extra bytes can be inserted into this reply safely.
-
-    Only a streamed event stream qualifies. A counted body has no room, and
-    the extra bytes would corrupt anything else."""
+    """True when extra bytes can be inserted into this reply safely: only a
+    streamed event stream."""
     if content_length:
         return False
     return "text/event-stream" in (content_type or "")
@@ -1026,13 +861,9 @@ def wants_usage(body):
 
 
 def with_usage(body):
-    """A copy of the body with stream_options.include_usage set, or None.
-
-    A streamed openai reply carries no usage unless the request asks for it,
-    so the router asks on the client's behalf and takes the chunk back out
-    unless the client wanted it. The answer arrives as its own final chunk with
-    no choices (probe-usage.py). The client's reply is unchanged, and the
-    router gets to read what its cache saved."""
+    """A copy of the body with stream_options.include_usage set, or None. A
+    streamed openai reply carries no usage unless asked. The answer is a
+    final chunk with no choices (probe-usage.py)."""
     try:
         fields = json.loads(body)
     except Exception:
@@ -1050,11 +881,8 @@ def with_usage(body):
 
 
 class OaiUsageSplice:
-    """Read the usage figures out of an openai stream as they pass.
-
-    The chunk carrying them holds no choices, so it is easy to take out again
-    when the client did not ask for it. The only bytes removed are the ones
-    the router's own ask put there."""
+    """Read the usage figures out of an openai stream as they pass. The
+    chunk carrying them has no choices, so it can be removed."""
 
     def __init__(self, strip=False):
         self.rest = b""
@@ -1091,10 +919,8 @@ class OaiUsageSplice:
 
 
 def prompt_key(body):
-    """Name the conversation from the body, or return None.
-
-    OpenCode sends prompt_cache_key when setCacheKey is on, which serves the
-    same purpose as Claude Code's session header."""
+    """Name the conversation from prompt_cache_key, or None. OpenCode sends
+    it when setCacheKey is on."""
     try:
         fields = json.loads(body)
     except Exception:
@@ -1104,11 +930,12 @@ def prompt_key(body):
     key = fields.get("prompt_cache_key")
     if not isinstance(key, str) or not key.strip():
         return None
-    return file_safe(key.strip())     # the client chose it, so check it
+    return file_safe(key.strip())     # the client chose it
 
 
 def text_of(value):
-    """The words in a system prompt, whether it is a string or a list of parts."""
+    """The words in a system prompt, whether it is a string or a list of
+    parts."""
     if isinstance(value, str):
         return value
     if isinstance(value, list):
@@ -1118,15 +945,9 @@ def text_of(value):
 
 
 def message_shape(message):
-    """Everything about one message that a later request has to match.
-
-    A cut name says "two requests open the same way", and the backend renders
-    the whole message, not the words in it. So this hashes the message as it
-    was sent, minus the keys a client varies without changing the prompt.
-
-    Sorted keys, and separators without spaces, so the same message always
-    gives the same bytes. Anything that will not serialise falls back to its
-    text, which is what this read before."""
+    """Everything about one message that a later request must match. The
+    backend renders the whole message, not only its words. Sorted keys and
+    compact separators, so the same message gives the same bytes."""
     try:
         return json.dumps(without_ignored(message),
                           sort_keys=True, separators=(",", ":"),
@@ -1135,20 +956,13 @@ def message_shape(message):
         return text_of(message.get("content")).encode("utf-8", "replace")
 
 
-# Fields a client may set per request without changing what the template
-# renders. `cache_control` is Anthropic's own cache hint and moves down the
-# transcript every turn, so hashing it would give every turn a new opening.
+# Per-request fields that do not change the rendered prompt.
 IGNORED_KEYS = frozenset(("cache_control",))
 
 
 def without_ignored(value):
     """The same body with IGNORED_KEYS dropped, however deep they sit.
-
-    `cache_control` is a property of a content block, not of a message - the
-    api puts it on a text, image or tool_result block - so dropping it from
-    the message's own keys dropped nothing at all. The marker then moved down
-    the transcript every turn and every cut name above it changed with it,
-    which is exactly the churn IGNORED_KEYS exists to stop."""
+    `cache_control` sits on a content block, not on the message."""
     if isinstance(value, dict):
         return {k: without_ignored(v) for k, v in value.items()
                 if k not in IGNORED_KEYS}
@@ -1158,12 +972,10 @@ def without_ignored(value):
 
 
 def closes(message):
-    """True when a template can end a prompt after this message.
-
-    An assistant message that calls a tool is the model part way through its
-    turn, and the template will not close one: "Cannot continue an assistant
-    message that contains tool calls". An opening cut there renders nothing and
-    is never saved. The tool result answering it is the next cut, and renders."""
+    """True when a template can end a prompt after this message. It refuses
+    to end after an assistant tool call: "Cannot continue an assistant
+    message that contains tool calls". The tool result that answers it is
+    the next cut."""
     if message.get("role") != "assistant":
         return True
     if message.get("tool_calls"):
@@ -1175,15 +987,10 @@ def closes(message):
 
 
 def prompt_cuts(body, least=PREFIX_MIN_CHARS):
-    """Every point in this request that another request could share.
-
-    A restored slot carries no checkpoints, so a block only helps when
-    the next request extends it exactly. Each cut is therefore at a
-    message boundary, and is hashed onto the one before it. Two requests
-    that open alike share the name of every cut in that opening.
-
-    Returns the cuts deepest last, the messages they cut, the system
-    prompt when the request keeps it apart, and the tools it declares."""
+    """Every point in this request that another request could share. Each
+    cut is at a message boundary, hashed onto the cut before it. Returns the
+    cuts deepest last, the messages, the system prompt when the request
+    keeps it apart, and the tools it declares."""
     try:
         fields = json.loads(body)
     except Exception:
@@ -1200,43 +1007,25 @@ def prompt_cuts(body, least=PREFIX_MIN_CHARS):
     running = hashlib.sha256()
     size = 0
     cuts = []
-    # The template renders the tools inside the system block, so they open the
-    # prompt rather than follow it. For Claude Code they are most of it: 25
-    # tools and 56,371 characters against 6,111 of system prompt, the same
-    # every session. A client that gains or loses one sends a different
-    # opening, which is what several shelves are for.
+    # The template renders the tools inside the system block. For Claude
+    # Code they are most of it: 25 tools and 56,371 characters against 6,111
+    # of system prompt.
     written = json.dumps(tools, separators=(",", ":")) if tools else ""
     if system or written:
-        # "replace", as conversation_id already does: json allows a lone
-        # surrogate (\ud800), str.encode refuses one, and the throw came out of
-        # _route before any status line had been sent - so the client got a
-        # dropped connection rather than an answer.
+        # "replace": json allows a lone surrogate, str.encode refuses one.
         running.update(b"system\x00" + system.encode("utf-8", "replace"))
         running.update(b"tools\x00" + written.encode("utf-8", "replace"))
         size += len(system) + len(written)
-        # Only a request that keeps the system prompt apart has anything to
-        # render before its first message. An openai body carries its system
-        # prompt as that first message, and tools alone are not a prompt: the
-        # template refuses an empty one, so the opening is never saved. Its cut
-        # is the one at the first message, which renders prompt and tools
-        # together the way the template lays them out.
+        # Tools alone are not a prompt: the template refuses an empty one.
         if system and size >= SYSTEM_MIN_CHARS:
             cuts.append((-1, running.hexdigest()[:16]))   # before any message
-    # An openai body's first message is the same opening as an anthropic body's
-    # system field, so it earns a cut on the same terms. Otherwise a client
-    # whose rules are shorter than a conversation shares nothing at all.
+    # An openai body carries its system prompt as its first message.
     lead = leading_system(messages)
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             break
-        # The whole message, not just its words. text_of reads `text` parts
-        # only, so a tool_use, a tool_result and an openai tool_calls list all
-        # hashed to nothing: two agentic conversations sharing a system prompt
-        # and a first user message produced the same cut names at every depth,
-        # however different the tools they had called and the files they had
-        # read. The router then loaded one session's saved block into the
-        # other's slot, which diverges at the first tool call - a restored slot
-        # has no checkpoint, so that is a full re-read, recorded as a hit.
+        # The whole message, not only its words: two agentic conversations
+        # hashed by text_of got the same cut names at every depth.
         running.update(f"{message.get('role')}\x00".encode())
         running.update(message_shape(message))
         size += len(text_of(message.get("content")))
@@ -1264,10 +1053,7 @@ def common_prefix(first, second):
 
 
 def request_shape(body):
-    """Describe a request without keeping its text.
-
-    A backend that refuses a request usually objects to its shape, not its
-    words. This records the shape and leaves the prompt out of it."""
+    """Describe a request's shape without keeping its text."""
     try:
         fields = json.loads(body)
     except Exception:
@@ -1295,20 +1081,11 @@ def leading_system(messages):
 
 
 def hoist_system(body):
-    """Make a late system message one the template will take, where it is.
+    """Turn a late system message into a user message, in place.
 
-    This model's template refuses a system message that is not at the
-    front, so an unchanged request cannot be served at all. Where the
-    change lands decides how much of the prompt can be reused.
-
-    Claude Code ends every turn with a token counter as a system
-    message, and its value differs every request. Carried to the front
-    it ends the shared prefix a few thousand tokens in, and the whole
-    conversation behind it is read again.
-
-    So the message keeps its index, and only its role changes. That
-    leaves two user messages in a row, which the template accepts. A
-    body already in order comes back unchanged."""
+    The template refuses a system message that is not at the front. Claude
+    Code ends every turn with a token counter as a system message. Moved to
+    the front it would end the shared prefix a few thousand tokens in."""
     try:
         fields = json.loads(body)
     except Exception:
@@ -1337,9 +1114,7 @@ PLACE_RE = re.compile(r"(\d+)_(\d+)$")
 
 def by_place(name):
     """Sort key from a backend name: the socket, then the instance on it.
-
-    A name is type, socket, instance, so gpu0_0 sits with cpu0_0 rather than
-    with the other gpu names. A name without a place sorts last."""
+    gpu0_0 sorts with cpu0_0. A name without a place sorts last."""
     found = PLACE_RE.search(name or "")
     if not found:
         return (9, 9, name or "")
@@ -1360,21 +1135,15 @@ def wants_stream(body):
 
 
 def template_route(path):
-    """Where to ask this backend what a body renders to.
-
-    The anthropic route converts the body first, as generation does, so a tool
-    call renders instead of being refused."""
+    """Where to ask this backend what a body renders to. The anthropic route
+    converts the body first, so a tool call renders."""
     return ("/v1/messages/apply-template" if (path or "").startswith("/v1/messages")
             else "/apply-template")
 
 
 def read_only(body, slot=None):
-    """The same request, asking for one token instead of an answer.
-
-    Reading the prompt is the slow part, and it happens on a backend that
-    reads. Asking for one token does that without settling where the answer
-    comes from, so the router can choose once the read is done and it knows
-    which backend is free."""
+    """The same request, asking for zero tokens. The read happens on a
+    prefiller. The router chooses where to generate after the read."""
     try:
         fields = json.loads(body)
     except Exception:
@@ -1385,24 +1154,18 @@ def read_only(body, slot=None):
     fields["stream"] = False          # the answer is thrown away
     fields["verbose"] = True          # so the reply names the slot it used
     fields.pop("stream_options", None)
-    # None at all. A generated token lands in the slot, so the slot would hold
-    # the prompt and one more, while the request that follows carries the
-    # prompt alone. A restored slot has no checkpoint to rewind to, so the
-    # backend would re-read everything.
+    # Zero, not one. A generated token lands in the slot, and a restored slot
+    # has no checkpoint to rewind to, so the next request re-reads everything.
     if "n_predict" in fields:
         fields["n_predict"] = 0
     else:
         fields["max_tokens"] = 0
-    # The responses api carries its own name for the same thing, and
-    # llama.cpp's converter copies it over max_tokens unconditionally
-    # (server_chat_convert_responses_to_chatcmpl). Left alone, this "read
-    # only" pass generated the whole reply - once here and once again on the
-    # forward - and the generated tokens landed in the slot, which is the one
-    # thing the zero is for.
+    # llama.cpp copies max_output_tokens over max_tokens unconditionally
+    # (server_chat_convert_responses_to_chatcmpl).
     if "max_output_tokens" in fields:
         fields["max_output_tokens"] = 0
     if slot is not None:
-        fields["id_slot"] = slot      # say which slot, rather than ask after
+        fields["id_slot"] = slot      # say which slot
     return fields
 
 
@@ -1415,8 +1178,7 @@ def http_post(url, path, payload, timeout=POST_TIMEOUT):
         with urllib.request.urlopen(request, timeout=timeout) as reply:
             return json.load(reply)
     except urllib.error.HTTPError as err:
-        # A backend puts the reason in the body. Without it a refused save
-        # reads as "400" and no more.
+        # A backend puts the reason in the body.
         raise OSError(f"{err.code} on {path}: {said(err)}") from None
 
 
@@ -1437,16 +1199,12 @@ class Gone(Exception):
 
 
 def http_post_wanted(url, path, payload, timeout, wanted, every=2.0):
-    """POST to a backend, and stop if nobody is waiting for the answer.
+    """POST to a backend. Stop when nobody waits for the answer.
 
-    An abandoned read holds a slot for tens of minutes, and the client that gave
-    up will send the turn again. Closing the connection cancels the task in
-    llama.cpp and frees the slot.
-
-    Use shutdown(), not close(): the reading thread holds the socket open through
-    its file object, so close() alone never reaches the backend.
-
-    Raises Gone when the client has left. Otherwise the same as http_post."""
+    Closing the connection cancels the task in llama.cpp and frees the slot.
+    Use shutdown(), not close(): the reading thread holds the socket open
+    through its file object, so close() alone never reaches the backend.
+    Raises Gone when the client has left."""
     parts = urllib.parse.urlsplit(url)
     secure = parts.scheme == "https"
     opener = http.client.HTTPSConnection if secure else http.client.HTTPConnection
@@ -1479,8 +1237,8 @@ def http_post_wanted(url, path, payload, timeout, wanted, every=2.0):
             try:
                 conn.sock.shutdown(socket.SHUT_RDWR)   # the backend sees this
             except (OSError, AttributeError):
-                pass                   # already gone, which is what we wanted
-            conn.close()               # the backend cancels what it was doing
+                pass                   # already gone
+            conn.close()               # the backend cancels the task
             thread.join(10)
             raise Gone("the client stopped waiting")
     conn.close()
@@ -1501,18 +1259,14 @@ def said_in(body):
 
 
 def capture(conv, body):
-    """Write one request body down, for comparing two turns offline.
-
-    Kept per conversation. One busy client sends a turn a minute and a quiet
-    one a turn an hour, so a single list of the newest bodies holds only the
-    busy one, and the quiet one is what is being looked for."""
+    """Write one request body down, for comparing two turns offline. Kept
+    per conversation, so a busy client cannot crowd out a quiet one."""
     if CAPTURE_DIR is None:
         return
     try:
         CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
         tag = short_key(conv).replace("/", "_")
-        # Nanoseconds, so two bodies of one conversation cannot share a name.
-        # Fixed width, so the names sort by time.
+        # Nanoseconds and fixed width: unique names that sort by time.
         name = f"{time.time_ns()}-{tag}.json"
         (CAPTURE_DIR / name).write_bytes(body)
         old = sorted(CAPTURE_DIR.glob(f"*-{tag}.json"))[:-CAPTURE_KEEP]
@@ -1523,11 +1277,9 @@ def capture(conv, body):
 
 
 def how_started(warm, recalled, loaded):
-    """Name what a request extended instead of reading.
-
-    `warm`: its own cache was still in a slot on the backend that serves it.
-    `recalled`: its own copy came back from disk. `loaded`: a saved opening
-    was put in the slot for it. Otherwise it read its whole prompt."""
+    """Name what a request extended instead of reading. `warm`: its own
+    cache was in a slot. `recalled`: its own copy came back from disk.
+    `loaded`: a saved opening was put in the slot."""
     if recalled:
         return "recalled"
     if loaded:
@@ -1544,8 +1296,7 @@ def disk_summary(pins, openings, opening_bytes, wants):
     return {"copies": {"count": len(copies),
                        "bytes": sum(p.get("bytes") or 0 for _, p in copies),
                        "budget": PARK_BUDGET},
-            # One budget over both shelves, so each count is what that kind
-            # happens to be using and neither is a cap on its own.
+            # One budget over both shelves.
             "openings": {"count": len(openings),
                          "bytes": sum(opening_bytes.values()),
                          "budget": BLOCK_BUDGET},
@@ -1555,12 +1306,9 @@ def disk_summary(pins, openings, opening_bytes, wants):
 
 
 class History:
-    """Slot-seconds by phase, one bucket a minute, for the last few minutes.
-
-    Fed from the poll. Between two polls a slot is taken to be in the phase the
-    earlier one reported, and a bucket edge inside the gap splits it. This is
-    what shows that a backend spent nine of the last ten minutes reading, which
-    the live view cannot."""
+    """Slot-seconds by phase, per history bucket. Between two polls a slot
+    stays in the phase the earlier poll reported. A bucket edge inside the
+    gap splits it."""
 
     def __init__(self, keep=HISTORY_KEEP, step=HISTORY_STEP):
         self.keep, self.step = keep, step
@@ -1568,7 +1316,7 @@ class History:
         self.since = None
         self.rows = {}        # backend name -> {"done": [...], "cur": {...}}
         self.state = {}       # backend name -> [(phase, tg_rate)] last seen
-        # Machine load shares the buckets, so every graph has one time axis.
+        # Machine load shares the buckets.
         # key -> {"done": [mean per bucket], "cur": [sum, count]}
         self.load = {}
 
@@ -1587,9 +1335,7 @@ class History:
                 if phase == "reading":
                     cur["read"] += dt
                 elif phase == "generating":
-                    # No rate yet is not evidence of a stall. The slot is
-                    # generating either way, so the second is still counted -
-                    # just not against the figure that says contention.
+                    # No rate yet is not a stall.
                     cur["gen" if tg_rate is None
                         else ("stalled" if tg_rate < STALL_RATE else "gen")] += dt
 
@@ -1605,8 +1351,8 @@ class History:
             row["cur"] = [0.0, 0]
 
     def push_load(self, gauges):
-        """Add one sample of each gauge to the bucket in progress. Call after
-        push, so the two share the roll."""
+        """Add one sample of each gauge to the current bucket. Call after
+        push."""
         for key, value in gauges.items():
             if value is None:
                 continue
@@ -1645,10 +1391,9 @@ class History:
 
 
 # ---------------------------------------------------------------- machine load
-# The weights are mmap'd, so they live in the page cache. When free memory gets
-# tight the kernel drops them and prefill falls from 37 tokens a second to
-# single digits, which is why the dashboard shows page cache against the model
-# size rather than only what is used.
+# The weights are mmap'd and live in the page cache. When free memory gets
+# tight the kernel drops them, and prefill falls from 37 tokens a second to
+# single digits. The dashboard shows page cache against the model size.
 
 def parse_cpulist(text):
     """'0-17,36-53' -> {0, 1, ..., 17, 36, ..., 53}."""
@@ -1681,13 +1426,14 @@ def cpu_times(text):
             continue
         fields = line.split()
         values = [int(v) for v in fields[1:]]
-        idle = values[3] + (values[4] if len(values) > 4 else 0)   # idle + iowait
+        idle = values[3] + (values[4] if len(values) > 4 else 0)   # +iowait
         out[int(fields[0][3:])] = (sum(values) - idle, sum(values))
     return out
 
 
 def node_busy(before, after, cpus):
-    """Per cent of a node's cpu time spent busy between two samples, or None."""
+    """Per cent of a node's cpu time spent busy between two samples, or
+    None."""
     busy = total = 0
     for n in cpus:
         if n in before and n in after:
@@ -1722,20 +1468,17 @@ GPU_CMD = ("nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
 
 
 def resident_bytes(be):
-    """What one backend needs in the page cache: the buffers it mapped, less
-    the tensor it reads lazily from disk. Both from its startup log."""
+    """Bytes one backend needs in the page cache: mapped less lazy, from its
+    startup log."""
     cache = be.get("cache") or {}
     mapped, lazy = cache.get("mapped_mib") or 0.0, cache.get("lazy_mib") or 0.0
     return int(max(0.0, mapped - lazy) * 1024 * 1024)
 
 
 class Machine:
-    """CPU, memory and GPU load, sampled beside the backend poll.
-
-    /proc/stat and the node meminfo files are read every poll. nvidia-smi costs
-    50 to 100 ms, so the poll starts it as a child and collects the answer on a
-    later pass. Nothing here is on a request's path, and a missing command
-    turns the gpu row off rather than raising."""
+    """CPU, memory and GPU load, sampled beside the backend poll. nvidia-smi
+    costs 50 to 100 ms, so it runs as a child and is collected on a later
+    pass. A missing command turns the gpu row off."""
 
     def __init__(self, nodes=None, stat=Path("/proc/stat"), gpu_cmd=GPU_CMD):
         self.nodes = read_nodes() if nodes is None else nodes
@@ -1806,8 +1549,7 @@ class Machine:
 
     def report(self, backends):
         """Current values for the dashboard. `resident_bytes` is the most any
-        backend on the node must keep in the page cache: they map the same
-        files, so the cache is shared."""
+        backend on the node needs: they map the same files."""
         nodes = []
         for node in self.nodes:
             here = [be for be in backends if be.get("node") == node["id"]]
@@ -1822,11 +1564,9 @@ class Machine:
 
 
 def link_block(name):
-    """Point the slot directory at a block on the faster disk.
-
-    A backend takes a bare filename under its own --slot-save-path and rejects
-    one with a directory in it, so a link is the only way to put a single file
-    elsewhere. Writing through it lands on the other disk."""
+    """Point the slot directory at a block on the faster disk. A backend
+    takes a bare filename under --slot-save-path and rejects a directory in
+    it, so a link is the only way to put one file elsewhere."""
     link = SLOT_DIR / name
     try:
         BLOCK_DIR.mkdir(parents=True, exist_ok=True)
@@ -1836,8 +1576,7 @@ def link_block(name):
         return
     if link.is_symlink() or link.exists():
         link.unlink()
-    # Absolute: the kernel resolves a link's target against the link's own
-    # directory, not the router's cwd, so a relative BLOCK_DIR would dangle.
+    # Absolute: the kernel resolves a relative target against the link's dir.
     link.symlink_to(BLOCK_DIR.resolve() / name)
 
 
@@ -1858,12 +1597,9 @@ def file_mtime(name):
 
 
 def drop_file(name):
-    """Delete a slot file, and whatever it points at. Never raises.
-
-    Called from _route's finally and from _take, both before the turn
-    ticket goes back. A throw here would claim the conversation for the
-    life of the process, because claim_turn has no deadline. A file that
-    will not go is worth a line in the log, not a conversation."""
+    """Delete a slot file, and whatever it points at. Never raises: it runs
+    before the turn ticket goes back, and claim_turn has no deadline, so a
+    throw here would hold the conversation for the life of the process."""
     path = SLOT_DIR / name
     try:
         if path.is_symlink():
@@ -1884,7 +1620,7 @@ def openings_file():
 
 
 def read_rows(path):
-    """The rows the last run wrote, or nothing if it wrote none we can use."""
+    """The rows the last run wrote, or [] when there are none to trust."""
     try:
         kept = json.loads(path.read_bytes())
     except Exception:
@@ -1893,11 +1629,9 @@ def read_rows(path):
 
 
 def write_rows(path, rows):
-    """Write a bookkeeping file so half of one can never be read back.
-
-    Beside the file and renamed over it, because write_text truncates first: a
-    stop or a full disk part way through would leave a half file, which reads
-    as empty, and adopt then deletes everything that file was vouching for."""
+    """Write beside the file and rename over it, so half of one can never
+    be read back. A half file reads as empty, and adopt then deletes every
+    file it vouched for."""
     spare = path.with_suffix(".json.new")
     try:
         spare.write_text(json.dumps(rows, indent=1))
@@ -1923,14 +1657,10 @@ def shelf_of(name):
 
 
 def adopt_files(names, vouched=(), size=None):
-    """Sort the files the last run left behind, oldest first.
-
-    A saved opening is named after its own contents, so it is always
-    good. A conversation's copy is good only if the pin file vouches for
-    it, because nothing else says whose cache it is.
-
-    The pin file is asked first. A conversation key comes from the
-    client, so a name can be made to look like an opening."""
+    """Sort the files the last run left behind, oldest first. A saved
+    opening is named after its contents. A conversation's copy is good only
+    if the pin file vouches for it. The pin file is asked first, because a
+    client can make a key look like an opening."""
     size = size or file_size
     openings, bytes_ = OrderedDict(), {}
     parked, spent = [], []
@@ -1943,23 +1673,17 @@ def adopt_files(names, vouched=(), size=None):
             openings[key] = name
             bytes_[key] = size(name)
         else:
-            spent.append(name)      # a copy nothing vouches for, or a deeper
-                                    # opening on a router that stopped making
-                                    # them and is giving the disk back
+            spent.append(name)      # unvouched copy, or a deep opening
+                                    # with DEEP_OPENINGS off
     spent += trim_openings(openings, bytes_)
     return openings, bytes_, parked, spent
 
 
 def trim_openings(openings, bytes_, keep=()):
-    """Drop openings until they fit BLOCK_BUDGET, least useful first.
-
-    Deeper cuts go before system prompts at any age: a system prompt
-    serves every new session, a deeper cut reaches further but serves
-    fewer. Within a kind the least recently used goes first.
-
-    Returns the file names dropped. One is always kept, however big, or
-    a budget under one block would delete the opening a request is about
-    to load. `keep` names openings being built, which are not on disk yet."""
+    """Drop openings until they fit BLOCK_BUDGET, least useful first: deeper
+    cuts before system prompts, then least recently used. One is always
+    kept. `keep` names openings being built, which are not on disk yet.
+    Returns the file names dropped."""
     order = sorted(openings, key=lambda k: shelf_of(openings[k]) == "base")
     dropped = []
     for key in order:
@@ -1974,18 +1698,12 @@ def trim_openings(openings, bytes_, keep=()):
 
 class Flow:
     """Every turn in flight and the stages it walks, for the flow dashboard.
-
-    A turn moves through `queued`, `prefill`, `generate-queue` and `generate`, then
-    `done`. There is no scheduler to notice this from outside - each request's
-    own thread makes every transition - so the threads say so where they
-    already make them.
-
-    The log outlives the live row: a turn can cross two stages between two
-    pushes of the payload, and the animation replays the log rather than miss a
-    stage it never saw. Held under Pool.cv."""
+    Each request's own thread notes its transitions. The log outlives the
+    live row, so the animation can replay a stage it never saw. Held under
+    Pool.cv."""
 
     def __init__(self):
-        self.live = {}                        # conv -> its current stage and where
+        self.live = {}                        # conv -> current stage and where
         self.log = deque(maxlen=FLOW_LOG)     # newest first, for the animation
 
     def note(self, conv, stage, backend=None, slot=None):
@@ -2018,11 +1736,9 @@ class Flow:
 class Pool:
     """Track free slots. Keep each conversation on one backend."""
 
-    # Metrics that are not running totals, so a difference of two readings is
-    # meaningless and since_reset leaves them as they stand. The first five are
-    # llama-server's own `gauges` list (server-task.cpp); n_tokens_max sits in
-    # its `counters` list but is built with std::max, so it is a maximum and
-    # belongs here - that is the one the dashboard shows as "longest".
+    # Not running totals, so since_reset leaves them alone. The first five
+    # are llama-server's own `gauges` (server-task.cpp). n_tokens_max sits
+    # in its `counters` list but is built with std::max.
     GAUGES = ("prompt_tokens_seconds", "predicted_tokens_seconds",
               "requests_processing", "requests_deferred",
               "n_busy_slots_per_decode", "n_tokens_max")
@@ -2033,68 +1749,43 @@ class Pool:
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
                               cache={}, idle_runs={}, draining=False)
                          for b in backends]
-        # Each backend reports prompt cache evictions in its own log, and
-        # nowhere else.
+        # Each backend reports prompt cache evictions only in its own log.
         self.cache_watch = {be["name"]: CacheWatch(
             RUN_DIR / f"{be['name']}.log",
             sink=lambda kind, value, name=be["name"]: EVENTS.write(
                 "backend", backend=name, kind=kind, amount=value))
             for be in self.backends}
         self.pins = OrderedDict()
-        # conversation -> the wait ticket of the turn serving it now.
-        #
-        # A conversation is one pin, one slot and one copy on disk, all named
-        # after it alone. Two turns at once move the same three: the second
-        # takes a prefiller, clears the slot the first is reading in, and
-        # writes over the first one's copy. The first then carries that copy to
-        # generate, restores a prompt it never read, and starts from nothing.
-        # Seen in production: one conversation recalled onto two backends
-        # ninety seconds apart. So a turn holds its conversation and the next
-        # one waits.
+        # conversation -> the wait ticket of the turn serving it now. A
+        # conversation is one pin, one slot and one copy on disk. Two turns at
+        # once corrupt all three: seen once as one conversation recalled onto
+        # two backends ninety seconds apart.
         self.turns = {}
-        # Opening name -> the file holding it, least recently used first. The
-        # file name says which kind it is: a system prompt on its own, which
-        # every new session needs, or a cut where two conversations diverge.
-        # One shelf, because they share a disk and BLOCK_BUDGET measures it.
+        # Opening key -> its file, least recently used first.
         self.openings = OrderedDict()
         self.opening_bytes = {}        # the same keys, and what each takes
-        # (backend, slot) -> the cuts that slot holds. A new request that opens
-        # the same way can start from one of them.
+        # (backend, slot) -> the cuts that slot holds.
         self.holds = {}
-        # (backend, slot) -> the deepest message index that slot holds a cut
-        # at, so the dashboard can say how far in another conversation could
-        # start. -1 is the system prompt alone.
+        # (backend, slot) -> deepest message index held. -1: system prompt.
         self.holds_depth = {}
         # conversation -> what warm_prefix found and did, for the dashboard.
-        # Without it, asking why an opening was not cut deeper means reading
-        # the code and guessing which branch it stopped at.
         self.choices = OrderedDict()
-        # conversation -> (parent, depth) for sessions branched off another's
-        # opening, so a fork is logged once per depth rather than once a turn.
+        # conversation -> (parent, depth), so a fork is logged once a depth.
         self.forked = OrderedDict()
-        # Counters at the last reset, per backend. A lifetime average carries
-        # every run since the backend started, and after a change the figure
-        # that matters is the one since the change.
+        # Counters at the last reset, per backend.
         self.rates_from = {}
         self.rates_since = None
-        # Opening name -> what it takes to read one, newest last. A request
-        # that could have used an opening the router lacks writes it here, and
-        # the builder reads it when a backend falls idle.
+        # Opening key -> what it takes to read one, newest last.
         self.wants = OrderedDict()
-        # Openings being read now, so sessions starting together wait for the
-        # first rather than each reading its own copy.
+        # Openings being read now. A session that needs one waits for it.
         self.building = {}
         self.waiting = 0          # requests with no free slot yet
-        self.waiters = {}         # ticket -> the request waiting, for the dashboard
-        # Turns read and parked, queued for a slot on the backend that
-        # generates. They hold nothing while they wait, so they appear nowhere
-        # else for the dashboard to count.
+        self.waiters = {}         # ticket -> the waiting request
+        # Turns read and parked, waiting for a generator slot.
         self.to_generate = 0
         self.wait_seq = 0
-        # Every turn in flight, at which stage, for the flow dashboard.
         self.flow = Flow()
-        # The last few slot files written or read, so the dashboard shows the
-        # disk side doing something.
+        # The last few slot files written or read.
         self.recent = deque(maxlen=RECENT_FILES)
         # The last few requests, with what each one started from.
         self.recent_requests = deque(maxlen=RECENT_REQUESTS)
@@ -2103,9 +1794,7 @@ class Pool:
         self.loads = {}           # opening key -> times a request loaded it
         self.mounts = []          # disk usage, refreshed every MOUNT_POLL
         self.mounts_at = 0.0
-        # Copies waiting to be written, and the one worker that writes them.
-        # Started on the first park rather than here, so a Pool that never
-        # parks - most of the test suite - never starts a thread.
+        # The park worker starts on the first park, so tests start no thread.
         self.park_jobs = queue.Queue()
         self.parker = None
         if watch:
@@ -2121,14 +1810,10 @@ class Pool:
                 if found.exists():
                     names.append(found.name)
                 else:
-                    found.unlink(missing_ok=True)   # a link with nothing behind
-        # What the openings earned last run: the order they were in, least
-        # recently used first, and how often each was loaded. Without it the
-        # only order left is the file's mtime, which link_block sets when the
-        # block is built and never touches again - so one loaded every morning
-        # for a week sorts ahead of one nobody has ever asked for, and the
-        # budget drops exactly the wrong one. An opening the file does not
-        # name keeps its place among the others, by mtime, at the back.
+                    found.unlink(missing_ok=True)   # a dangling link
+        # The order and load count each opening earned last run. Without it
+        # the only order is the file mtime, which link_block sets once. An
+        # opening the file does not name sorts at the back, by mtime.
         remembered = [row for row in read_rows(openings_file())
                       if isinstance(row, dict) and row.get("key")]
         was = {row["key"]: rank for rank, row in enumerate(remembered)}
@@ -2136,10 +1821,7 @@ class Pool:
                            for row in remembered})
         names.sort(key=lambda n: was.get(opening_key(n), len(was)))
         kept = read_rows(pins_file())
-        # Both fields, not just the file: read_rows already refuses a map it
-        # cannot parse, and a row without a conv would then KeyError out of
-        # adopt() in __main__ - before serve_forever, so the router never
-        # starts and says only "KeyError: 'conv'".
+        # Both fields: a row without a conv raised KeyError at startup.
         by_file = {row["file"]: row for row in kept
                    if isinstance(row, dict) and row.get("file") and row.get("conv")}
         openings, sizes, parked, spent = adopt_files(names, set(by_file))
@@ -2148,23 +1830,17 @@ class Pool:
             for name in parked:
                 row = by_file[name]
                 self.pins[row["conv"]] = {
-                    # The slot went with the backend that held it, so this
-                    # cache must be restored before it is served. Naming no
-                    # live backend is what makes that happen.
+                    # Not a live name, so recall restores the copy first.
                     "backend": "(before the restart)",
                     "slot": None, "tokens": row.get("tokens", 0),
                     "last": time.time(), "inflight": False,
                     "turns": row.get("turns", 1), "parked": name,
                     "bytes": row.get("bytes", 0),
-                    # When it was written, from the pin map or from the file
-                    # itself. Without it every copy that survived the restart
-                    # reads as age zero, so the budget sweep cannot tell the
-                    # oldest from the newest and the dashboard cannot say
-                    # which one goes next.
+                    # Without it every copy reads as age zero.
                     "parked_at": row.get("parked_at") or file_mtime(name)}
         for name in spent:
             remove(name)
-        self.save_openings()      # trimmed, so the file has to say so
+        self.save_openings()      # trimmed, so write it
         if openings or parked or spent:
             kinds = [shelf_of(name) for name in openings.values()]
             print(f"[router] kept {kinds.count('base')} system prompt(s), "
@@ -2202,12 +1878,8 @@ class Pool:
     def claim_turn(self, conv, ticket, wanted=None):
         """Hold this conversation until finish_turn. One turn of it at a time.
 
-        Returns True when the turn holds it. False means the client stopped
-        waiting, and nothing is held.
-
-        The wait has no deadline, for the reason acquire has none: the turn
-        ahead ends on its own, and reading a prompt again costs more than any
-        wait. A turn waiting here holds no backend, so nothing waits for it."""
+        Returns True when the turn holds it. False means the client left and
+        nothing is held. No deadline: a re-read costs more than any wait."""
         if not conv:
             return True
         began = None
@@ -2218,9 +1890,8 @@ class Pool:
                 began = began or time.time()
                 self.cv.wait(1.0)
             self.turns[conv] = ticket
-            # Noted here rather than in begin_wait: a turn waiting for the one
-            # ahead must not move that one's row on the flow dashboard, which
-            # is keyed by conversation too.
+            # Noted here, not in begin_wait: a waiting turn must not move the
+            # row of the turn ahead, which is keyed by conversation too.
             self.flow.note(conv, "queued")
         if began is not None:
             print(f"[router] {short_key(conv)} waited "
@@ -2229,10 +1900,8 @@ class Pool:
         return True
 
     def finish_turn(self, conv, ticket):
-        """Let the next turn of this conversation start.
-
-        The ticket must match: a turn that gave up waiting never held the
-        conversation, and must not release one that does."""
+        """Let the next turn of this conversation start. The ticket must
+        match: a turn that gave up waiting never held it."""
         if not conv:
             return
         with self.cv:
@@ -2241,17 +1910,9 @@ class Pool:
                 self.cv.notify_all()
 
     def _waiting_detail(self, now):
-        """Each waiter, and what it waits for. Held under the lock.
-
-        A turn waiting for the turn ahead of it waits for neither a slot
-        nor a pin. It says "turn".
-
-        A pin is only worth naming when acquire would wait for it, and
-        acquire waits only for a backend that prefills. Where one backend
-        generates for the rest, every conversation is pinned to it
-        afterwards, and naming that pin reads as a generator holding the
-        box up while it sits idle. It is not: acquire drops such a pin at
-        once and takes the first free prefiller."""
+        """Each waiter, and what it waits for. Held under the lock. A pin is
+        named only when acquire would wait for it: a pin to a generator is
+        dropped at once."""
         takers = [be for be in self.backends
                   if be["up"] and not be.get("draining") and prefills(be)]
         largest = max([be["n_ctx"] for be in takers], default=0)
@@ -2269,14 +1930,8 @@ class Pool:
                 wants = "big"
             else:
                 wants = "prefill"
-            # `tokens` is the ticket's, which carries REPLY_TOKENS of reply
-            # room as well, because room is what a waiter needs. The dashboard
-            # prints it as the size of the request and divides an image charge
-            # into it, so that share is low by the reserve on a small request.
-            # Taking it off here would make the number mean something different
-            # from what begin_wait was handed; the honest fix is for the ticket
-            # to carry the prompt and the room as two, which is a change to
-            # begin_wait and note_request together.
+            # `tokens` includes REPLY_TOKENS, as begin_wait was handed it. The
+            # fix is for the ticket to carry prompt and room as two numbers.
             rows.append({"conv": short_key(w["conv"]), "since": w["since"],
                          "waited": round(now - w["since"], 1),
                          "tokens": w["tokens"], "wants": wants,
@@ -2289,15 +1944,9 @@ class Pool:
     def note_request(self, conv, be, path, took, waited, started, tokens,
                      read_prompt_n=None, read_cache_n=None,
                      images=0, image_tokens_=0):
-        """Record one finished request for the dashboard.
-
-        `tokens` is this router's estimate, with the reply room already
-        taken off by the caller: the dashboard measures a turn against what
-        reading it cold would have cost, and 1,024 tokens nobody sent is 41
-        seconds of reading nobody did.
-
-        The two read counts come from the reply's own `timings`, and are
-        None for a turn that never read."""
+        """Record one finished request for the dashboard. `tokens` has the
+        reply room taken off. The two read counts come from the reply's
+        `timings`, None for a turn that never read."""
         with self.cv:
             self.recent_requests.appendleft({
                 "conv": short_key(conv), "backend": be["name"], "path": path,
@@ -2308,8 +1957,8 @@ class Pool:
                 "at": time.time()})
 
     def _read_mounts(self, now):
-        """Free space on the disks the slot files land on. Cheap, but not
-        worth a statvfs per status call."""
+        """Free space on the disks the slot files land on, refreshed every
+        MOUNT_POLL."""
         if now - self.mounts_at < MOUNT_POLL:
             return self.mounts
         rows = []
@@ -2343,19 +1992,10 @@ class Pool:
     def since_reset(self, be, counters):
         """The counters as they read since the last reset.
 
-        A counter that went backwards means the backend restarted and
-        counts from zero again, so it is taken as it stands.
-
-        GAUGES are left alone. The difference of two counters is a count,
-        but the difference of two gauges is nothing. n_tokens_max is a
-        running maximum and n_busy_slots_per_decode an average: subtracting
-        them read 0 for the longest prompt served, and turned a busy
-        average of 2.40 into 0.01. pp_total and tg_total multiply by that,
-        so the button understated the box 320-fold."""
-        # `is None`, not falsy: a backend that was down at the reset has an
-        # empty baseline, which is a baseline. Read as "no reset" it kept
-        # counting from process start while every other backend counted from
-        # the reset, and pressing the button again stored {} again.
+        A counter that went backwards means a restart, so it is taken as it
+        stands. GAUGES are left alone: subtracting n_tokens_max read 0, and
+        n_busy_slots_per_decode went from 2.40 to 0.01, 320-fold off."""
+        # `is None`: a backend down at the reset has an empty baseline.
         was = self.rates_from.get(be["name"])
         if was is None:
             return counters
@@ -2369,12 +2009,9 @@ class Pool:
         return out
 
     def read_settings(self, be):
-        """A backend's startup settings, read from the log it wrote them to.
-
-        Read again when the log is a different file. restart-backend.sh moves
-        the old one aside and the new backend creates its own, so the inode
-        changes; watching the size instead missed the restart whenever the new
-        log passed the old offset before this next looked."""
+        """A backend's startup settings, from its log. Read again when the
+        inode changes: restart-backend.sh moves the old log aside, and the
+        size alone misses a restart whose new log passes the old offset."""
         path = RUN_DIR / f"{be['name']}.log"
         try:
             stat = path.stat()
@@ -2387,7 +2024,7 @@ class Pool:
         head = []
         try:
             with open(path, errors="replace") as handle:
-                for _ in range(1500):   # loading prints hundreds of lines first
+                for _ in range(1500):   # loading prints hundreds of lines
                     head.append(next(handle))
         except (OSError, StopIteration):
             pass
@@ -2398,11 +2035,8 @@ class Pool:
         return be["config"]
 
     def vision(self):
-        """The geometry the vision encoder was built with.
-
-        Whichever backend printed it. They load the same mmproj, and one that
-        has not printed it has no vision at all. Read rather than held, so a
-        restart onto a different mmproj is picked up."""
+        """The vision encoder's geometry, from whichever backend printed it.
+        Read each time, so a restart onto a different mmproj is picked up."""
         for be in self.backends:
             self.read_settings(be)
             if be.get("vision"):
@@ -2430,19 +2064,16 @@ class Pool:
         value = self.since_reset(be, value)
 
         def rate(tokens, seconds):
-            # Over the life of the backend. The *_tokens_seconds gauges are
-            # rolling windows, so they read zero whenever it is idle.
+            # Lifetime. The *_tokens_seconds gauges read zero when idle.
             return per_second(value.get(tokens, 0), value.get(seconds, 0))
 
-        # prompt_tokens_total counts processed tokens and excludes cached ones,
-        # so the prompt is the sum of the two.
+        # prompt_tokens_total excludes cached tokens.
         processed = value.get("prompt_tokens_total", 0)
         cached = value.get("prompt_tokens_cached_total", 0)
         drafted = value.get("spec_decode_num_draft_tokens_total", 0)
 
-        # tokens_predicted_seconds_total sums per-request time and concurrent
-        # slots overlap, so these rates are per request. Times the average busy
-        # slot count is what the backend delivers overall.
+        # tokens_predicted_seconds_total sums per-request time. Concurrent
+        # slots overlap. These rates are per request.
         busy_per_decode = value.get("n_busy_slots_per_decode", 1) or 1
         be["stats"] = {
             "busy_per_decode": round(busy_per_decode, 2),
@@ -2453,8 +2084,6 @@ class Pool:
             "cached": round(100 * cached / (cached + processed), 1) if cached + processed else 0,
             "longest": int(value.get("n_tokens_max", 0)),
             "generated": int(value.get("tokens_predicted_total", 0)),
-            # Reading against generating is the split a generator is chosen on;
-            # reused against read is what the caches buy.
             "read_s": round(value.get("prompt_seconds_total", 0), 1),
             "gen_s": round(value.get("tokens_predicted_seconds_total", 0), 1),
             "prompt_tokens": int(processed),
@@ -2465,24 +2094,20 @@ class Pool:
         st["tg_total"] = round(st["tg_rate"] * busy_per_decode, 1)
 
     def _read_slots(self, be, raw=None):
-        """Per-slot state, so a 3-slot backend is not a single average.
-
-        `raw` is what /slots answered, so a test can hand it a reading instead
-        of standing a backend up to produce one."""
+        """Per-slot state, so a 3-slot backend is not a single average. `raw`
+        is what /slots answered, for tests."""
         if raw is None:
             try:
                 with urllib.request.urlopen(be["url"] + "/slots", timeout=3) as r:
                     raw = json.load(r)
             except Exception:
                 return
-        # /slots reports counters, not rates, and the backend average cannot
-        # show one slot crawling while another runs free.
+        # /slots reports counters, not rates.
         now = time.time()
         previous = be.get("slot_prev") or {}
         current, detail = {}, []
         for slot in raw if isinstance(raw, list) else []:
-            # llama.cpp sends this as a one-element array. Older builds sent a
-            # bare object, so both are read.
+            # A one-element array. Older builds sent a bare object.
             token = slot.get("next_token") or {}
             if isinstance(token, list):
                 token = token[0] if token else {}
@@ -2492,27 +2117,16 @@ class Pool:
             decoded = token.get("n_decoded", 0)
             processed = slot.get("n_prompt_tokens_processed", 0)
 
-            # Measured over a window, not between polls: the counters are
-            # integers, and a slot at 0.03 tokens/s does not move in two
-            # seconds, so every delta would read zero. Hold an anchor and
-            # recompute once the window can resolve a token.
+            # Measured over RATE_WINDOW, not between polls: a slot at 0.03
+            # tokens/s does not move in two seconds.
             was = previous.get(sid) or {"task": None, "decoded": 0, "processed": 0,
                                         "done_d": 0.0, "done_p": 0.0, "since": now,
                                         "pp_rate": 0.0, "tg_rate": 0.0,
-                                        # Whether a window has ever resolved
-                                        # here. Until one has there is no rate,
-                                        # which is not the same as a rate of
-                                        # zero: a slot that has just started
-                                        # generating would otherwise read as
-                                        # one stalled at 0.00 for a whole
-                                        # RATE_WINDOW, on the dashboard and in
-                                        # the stalled seconds the history keeps.
+                                        # False until a window has resolved.
                                         "measured": False}
-            # A new task restarts the counters at zero, so the delta is the
-            # whole count. Accumulating across that boundary is what lets a
-            # slot serving short requests still report a rate.
+            # A new task restarts the counters at zero.
             if was["task"] is None:
-                grew_d = grew_p = 0        # first sight: take a baseline, count nothing
+                grew_d = grew_p = 0        # first sight: take a baseline
             elif was["task"] == task:
                 grew_d = max(0, decoded - was["decoded"])
                 grew_p = max(0, processed - was["processed"])
@@ -2537,15 +2151,11 @@ class Pool:
                             "pp_rate": pp_rate, "tg_rate": tg_rate,
                             "measured": measured}
 
-            # n_prompt_tokens_total is the prompt the task arrived with, added
-            # by patches/slots-report-the-prompt-size.patch. What is left to
-            # read is that, less what was reused and what has been read.
-            #
-            # n_prompt_tokens is not that number: it counts what the slot holds
-            # now, growing while the prompt is read and again with every token
-            # generated. Read that way, a slot 98% served from cache reported
-            # "512 / 89,848 read". A backend without the patch has nothing
-            # better, so it falls back to the old arithmetic.
+            # n_prompt_tokens_total is the prompt the task arrived with, from
+            # patches/slots-report-the-prompt-size.patch. n_prompt_tokens
+            # grows while the prompt is read and with every token generated:
+            # a slot 98% served from cache reported "512 / 89,848 read".
+            # Without the patch the old arithmetic is the fallback.
             busy = bool(slot.get("is_processing"))
             whole = slot.get("n_prompt_tokens_total")
             if whole is None:
@@ -2561,33 +2171,29 @@ class Pool:
                 "done": processed,
                 "cached": cached,
                 "decoded": decoded,
-                # null, not 0.0, until a window has resolved: "no rate yet"
-                # and "a rate of zero" mean opposite things to a reader.
+                # null, not 0.0, until a window has resolved.
                 "pp_rate": round(pp_rate, 1) if measured else None,
                 "tg_rate": round(tg_rate, 1) if measured else None,
             })
         be["slot_prev"] = current
         be["slots_detail"] = detail
         self._note_idle(be, detail)
-        # What the backend delivers right now: the sum of its slots. /metrics
-        # gives a lifetime average per request, which understates a busy
-        # multi-slot backend by roughly its slot count.
+        # The sum of the slots, not /metrics' lifetime average.
         stats = be.setdefault("stats", {})
         stats["pp_live"] = round(sum(d["pp_rate"] or 0 for d in detail), 1)
         stats["tg_live"] = round(sum(d["tg_rate"] or 0 for d in detail), 1)
 
     @staticmethod
     def _note_idle(be, detail):
-        """Count the polls in a row each slot has looked idle for.
-
-        One poll cannot tell a free slot from one between two turns of the
-        same conversation. Two polls apart can."""
+        """Count the polls in a row each slot has looked idle. One poll
+        cannot tell a free slot from one between two turns."""
         was = be.get("idle_runs") or {}
         be["idle_runs"] = {s["id"]: 0 if s["busy"] else was.get(s["id"], 0) + 1
                            for s in detail}
 
     def _watch(self):
-        """Check each backend. Read its slot count, context size and counters."""
+        """Check each backend. Read its slot count, context size and
+        counters."""
         while True:
             for be in self.backends:
                 try:
@@ -2602,9 +2208,8 @@ class Pool:
                     up = True
                 except Exception:
                     up = False
-                # Two misses before declaring it down: a loaded box can miss a
-                # 3 second deadline once, and marking it down re-pins every
-                # conversation waiting on it.
+                # Two misses before down: a loaded box can miss a 3 second
+                # deadline once, and down re-pins every waiting conversation.
                 if up:
                     be["misses"] = 0
                 else:
@@ -2621,21 +2226,16 @@ class Pool:
                     be["up"] = up
                     if up:
                         be["seen"] = True
-                        # A backend that went away and came back is a new
-                        # process with empty slots. Nothing said so before, so
-                        # a conversation pinned here kept its slot number,
-                        # recall saw "already here, and still in a slot" and
-                        # refused, warm_prefix refused too because a copy
-                        # existed - and the turn read its whole prompt into an
-                        # empty slot with a good copy sitting on disk. That is
-                        # the case restart-backend.sh exists to make invisible.
+                        # A backend that came back has empty slots. Without
+                        # this recall refused and the turn read its whole
+                        # prompt with a good copy on disk.
                         if came_back:
                             self.forget_slots(be["name"])
                         self.cv.notify_all()
             now = time.time()
             try:
                 self.machine.sample(now)
-            except Exception as err:          # load is a nicety. Never the poll.
+            except Exception as err:          # never stop the poll for load
                 print(f"[router] machine sample failed: {err}", flush=True)
             with self.cv:
                 self.history.push(self.backends, now)
@@ -2643,10 +2243,7 @@ class Pool:
             time.sleep(POLL)
 
     def _read_cache(self, be):
-        """Total the prompt cache events this backend has logged.
-
-        An eviction is a conversation that lost its cached prefill. The count
-        says whether a disk tier below this cache would pay for itself."""
+        """Total the prompt cache events this backend has logged."""
         watch = self.cache_watch[be["name"]]
         before = watch.stats["evictions"]
         watch.poll()
@@ -2660,24 +2257,17 @@ class Pool:
                   f"{watch.stats['limit_mib']:.0f} MiB", flush=True)
 
     def pick_slot(self, be, conv):
-        """The slot this read should use on this backend.
-
-        The router says which slot rather than reading it back, because a
-        reply only names its slot on some paths.
-
-        A conversation already holding a slot here keeps it. Otherwise it
-        takes one no other request was handed. Judged by what the router
-        handed out, not by the poll: the poll is two seconds old, so requests
-        arriving together were all told the same slot."""
+        """The slot this read should use on this backend. The router chooses:
+        a reply names its slot only on some paths. A conversation holding a
+        slot here keeps it. Otherwise one no other request was handed: the
+        poll is two seconds old, so requests arriving together would all be
+        told the same slot."""
         with self.cv:
             record = self.pins.get(conv) if conv else None
             if (record and record["backend"] == be["name"]
                     and record["slot"] is not None):
-                # Written down as well as returned. `taken` below is built from
-                # `using`, and this branch never set it, so a conversation that
-                # kept its own warm slot was invisible to the next request: on
-                # a backend with more than one slot, one arriving while this
-                # turn ran could be handed the very slot it was reading in.
+                # `taken` below is built from `using`. Without this a
+                # second request could be handed this warm slot.
                 record["using"] = record["slot"]
                 return record["slot"]
             taken = {p.get("using") for name, p in self.pins.items()
@@ -2687,9 +2277,8 @@ class Pool:
             ids = [s["id"] for s in detail] or list(
                 range(max(1, be.get("slots", 1))))
             working = {s["id"] for s in detail if s.get("busy")}
-            # Free by both accounts first: nobody has been given it, and the
-            # backend was not working on it when last asked. Then merely not
-            # given out, because the poll is the older of the two.
+            # Free by both accounts first. Then merely not handed out: the
+            # poll is the older of the two.
             slot = next((i for i in ids if i not in taken and i not in working),
                         next((i for i in ids if i not in taken), ids[0]))
             if record is not None:
@@ -2697,13 +2286,9 @@ class Pool:
             return slot
 
     def _reading_rank(self, be):
-        """Order backends for a prompt that has to be read somewhere.
-
-        A socket already reading comes last. Reading is compute bound with
-        local memory, so two reads on one socket share its cores and roughly
-        halve each other, while a read on the other socket runs at full speed.
-        A generating slot does not count: it competes for nothing a read
-        needs."""
+        """Order backends for a prompt that must be read somewhere. A socket
+        already reading comes last: two reads on one socket roughly halve
+        each other. A generating slot competes for nothing a read needs."""
         def reads(backend):
             return sum(1 for slot in (backend.get("slots_detail") or [])
                        if slot.get("phase") == "reading")
@@ -2711,12 +2296,9 @@ class Pool:
         node = be.get("node")
         on_node = sum(reads(other) for other in self.backends
                       if other.get("node") == node)
-        # Within a node, a quiet instance beats a second slot on a busy one:
-        # llama.cpp lets the first reading slot take the whole batch.
-        #
-        # Then the opposite of pref, which says where a conversation would
-        # rather generate. Reading takes that order backwards and leaves the
-        # instances kept for generating free to do it.
+        # Within a node a quiet instance beats a second slot on a busy one:
+        # llama.cpp lets the first reading slot take the whole batch. Then
+        # the opposite of pref, which keeps the generating instances free.
         return (on_node, reads(be), -be["pref"], be["busy"])
 
     def _usable(self, be, tokens):
@@ -2725,11 +2307,8 @@ class Pool:
                 and be["busy"] < be["slots"] and tokens <= be["n_ctx"])
 
     def drain(self, name, post, deadline=DRAIN_DEADLINE):
-        """Take a backend out of service so it can be stopped and started.
-
-        Requests wait in acquire rather than fail, so a restart under them is
-        invisible however long it takes. What it does throw away is the caches
-        in its slots, so they are copied out first."""
+        """Take a backend out of service so it can be restarted. Requests wait
+        in acquire rather than fail. The caches in its slots are copied out."""
         be = next((b for b in self.backends if b["name"] == name), None)
         if be is None:
             return None
@@ -2737,8 +2316,7 @@ class Pool:
             be["draining"] = True
             self.cv.notify_all()      # waiters can pick the other backend now
 
-        # Let work already running finish. Killing it throws away a prompt
-        # that may have taken twenty minutes to read.
+        # Killing running work throws away a read of up to twenty minutes.
         stop = time.time() + deadline
         while True:
             with self.cv:
@@ -2748,10 +2326,8 @@ class Pool:
                 self.cv.wait(0.2)
 
         parked = self.park_all(post, only=name) if quiet else 0
-        # What is still only in a slot after the pass. A save that timed out or
-        # was refused leaves the pin unparked, and stopping the backend then
-        # throws that cache away - so the caller has to be told, or
-        # restart-backend.sh reads a 200 and kills it anyway.
+        # A save that timed out or was refused leaves a cache only in a slot.
+        # The caller must know, or restart-backend.sh kills it anyway.
         with self.cv:
             left = sum(1 for p in self.pins.values()
                        if p["backend"] == name and p["slot"] is not None
@@ -2773,25 +2349,17 @@ class Pool:
         return True
 
     def largest(self):
-        """The largest prompt any backend will read.
-
-        Prefillers only. A conversation pinned to a generator spills to a
-        prefiller before it is served, so a generator's ctx is not a size
-        this router can accept. Counting it let a turn past the 413 that
-        acquire then waited on with no deadline, holding its turn ticket."""
+        """The largest prompt any prefiller will read. A generator's ctx does
+        not count: a conversation pinned to one spills to a prefiller."""
         return max([be["n_ctx"] for be in self.backends
                     if be["up"] and prefills(be)], default=0)
 
     def acquire(self, conv, tokens, wanted=None):
         """Take a slot on the backend holding this conversation.
 
-        A busy box is a queue, not a refusal: a taken slot means this turn
-        starts later, never that it fails. So the wait has no deadline. It ends
-        when a slot frees, when no backend could ever serve the request, or
-        when `wanted` says the client has stopped waiting.
-
-        A pin holds through the wait: reading a long prompt again costs far
-        more, and a cache that has left its slot cannot be moved."""
+        A busy box is a queue, not a refusal, so the wait has no deadline. It
+        ends when a slot frees, when no backend can serve the request, or when
+        `wanted` says the client left. A pin holds for PIN_PATIENCE."""
         patience = time.time() + PIN_PATIENCE
         spill = False              # set once the pin is given up on
 
@@ -2805,33 +2373,26 @@ class Pool:
                 if target:
                     if prefills(target) and self._usable(target, tokens):
                         return self._take(target, conv, tokens)
-                    # A turn can carry a whole file, and a fifth of them
-                    # re-read everything, so a backend that does not read
-                    # cannot serve one however recently it generated there.
+                    # A fifth of turns re-read everything: prefillers only.
                     if (not target["up"] or tokens > target["n_ctx"]
                             or not prefills(target)):
                         spill = True          # it can never take this request
                         target = None
                 else:
-                    spill = spill or pinned is not None   # pin names a gone backend
+                    spill = spill or pinned is not None   # gone backend
 
                 if not target:
-                    # With no pin the prompt must be read somewhere, so only a
-                    # backend that reads will do. A pinned conversation skips
-                    # this: its next turn extends a cache already there.
                     free = [b for b in self.backends
                             if prefills(b) and self._usable(b, tokens)]
                     if free:
                         return self._take(min(free, key=self._reading_rank),
                                           conv, tokens)
 
-                # Nothing that reads is up, and this conversation has no cache
-                # on one that is. Waiting cannot help.
+                # Nothing that could serve this is up. Waiting cannot help.
                 served_by = target is not None or any(
                     b["up"] and prefills(b) for b in self.backends)
                 if not served_by:
                     return None
-                # The only other thing that ends the wait is the client.
                 if wanted is not None and not wanted():
                     return None
 
@@ -2845,17 +2406,11 @@ class Pool:
         be["busy"] += 1
         be["served"] += 1
         if conv:
-            # Updated in place. Building a fresh record dropped every field
-            # written elsewhere: `opening`, which note_holds writes at the end
-            # of a turn and forget_stale_park reads at the start of the next,
-            # and `parked_at`, which the PARK_BUDGET sweep sorts by - so a
-            # conversation that parked and ran again sorted as age 0 and was
-            # dropped first.
+            # Updated in place. A fresh record dropped `opening` and
+            # `parked_at`, which other paths write.
             record = self.pins.get(conv)
             if record is None:
-                # A copy survives losing the slot, and the budget is spent
-                # against its size, so the two travel together. Named here
-                # because several readers index them directly.
+                # Named here because several readers index them directly.
                 record = self.pins[conv] = {"parked": None, "bytes": 0}
             record.update(
                 backend=be["name"],
@@ -2864,7 +2419,6 @@ class Pool:
                 tokens=tokens,
                 last=time.time(),
                 inflight=True,
-                # A first turn still holds mostly system prompt.
                 turns=record.get("turns", 0) + 1)
             self.pins.move_to_end(conv)
             while len(self.pins) > MAX_PINS:
@@ -2874,15 +2428,9 @@ class Pool:
         return be
 
     def release(self, be, conv=None):
-        """Give the backend back. The copy on disk stays where it is.
-
-        The slot has moved past that copy, so the copy is behind. Behind is
-        still a prefix, and a prefix is where every read starts. Deleting it
-        left the only copy in a borrowed slot, which the next taker erases.
-
-        recall refuses to restore over a slot that still holds the
-        conversation, and the next save overwrites this file under the same
-        name, so keeping it costs one copy rather than a pile."""
+        """Give the backend back. The copy on disk stays: it is behind the
+        slot but still a prefix, and the next save overwrites it under the
+        same name."""
         with self.cv:
             be["busy"] -= 1
             record = self.pins.get(conv) if conv else None
@@ -2893,14 +2441,9 @@ class Pool:
 
     def forget_slots(self, name):
         """Forget which slot on this backend held what. Held under the lock.
-
-        A restarted backend keeps its name and its port and loses every slot,
-        so the router's slot numbers for it mean nothing afterwards. The pins
-        stay - the conversation still ran there, and its copy on disk is still
-        good - and clearing the slot is what lets recall put that copy back.
-
-        A conversation mid-turn is left alone: it is talking to the process
-        that is answering it, and its own thread owns that slot."""
+        A restarted backend loses every slot. The pins stay: the copies on
+        disk are still good. A conversation mid-turn is left alone, because
+        its own thread owns that slot."""
         for record in self.pins.values():
             if record.get("backend") == name and not record.get("inflight"):
                 record["slot"] = None
@@ -2916,17 +2459,15 @@ class Pool:
             return bool(record) and record["slot"] is not None
 
     def note_slot(self, conv, slot):
-        """Record which slot served this conversation. Needed to save it later."""
+        """Record which slot served this conversation, for the save."""
         with self.cv:
             record = self.pins.get(conv) if conv else None
             if record:
                 record["slot"] = slot
 
     def _builder(self):
-        """Read one wanted opening while a backend is idle.
-
-        Off the request path on purpose: an opening is tens of thousands of
-        tokens, and nobody should wait behind it."""
+        """Read one wanted opening while a backend is idle, off the request
+        path."""
         while True:
             time.sleep(BUILD_POLL)
             try:
@@ -2935,17 +2476,10 @@ class Pool:
                 print(f"[router] opening pass failed: {err}", flush=True)
 
     def _idle_slot(self, be):
-        """A slot the builder may read into, or None.
-
-        Stricter than _free_slot, which answers for a request that already has
-        one. Three things must agree: the backend is up, the router's own count
-        leaves room, and the poll has found the same slot idle more than once.
-        The count is what acquire gates on, so honouring it keeps the builder
-        out of the request path. The repeat keeps a two-second-old poll from
-        handing out a slot that is working."""
-        # A draining backend is about to be stopped. _usable already refuses
-        # one for a request; the builder must refuse it too, or it reads an
-        # opening into an instance that was just drained and parked.
+        """A slot the builder may read into, or None. Stricter than
+        _free_slot: the backend is up, the router's own count leaves room,
+        and the poll has found the slot idle IDLE_POLLS times."""
+        # A draining backend is about to be stopped.
         if not be["up"] or be.get("draining") or be["busy"] >= be["slots"]:
             return None
         runs = be.get("idle_runs") or {}
@@ -2965,15 +2499,10 @@ class Pool:
         return None
 
     def ensure_parked(self, be, skip_conv, post, remove=drop_file):
-        """Copy every cache on this backend to disk before anything displaces it.
-
-        Called before a request reaches the backend. A save reads a slot, so
-        it only works while the cache is still in one: once llama.cpp pushes a
-        cache out, only that backend can reach it again.
-
-        Each conversation is tried once. A save that does not stick - the
-        budget dropped it again, or any reason found later - must not come
-        round again, or this loop never ends and the request never lands."""
+        """Copy every cache on this backend to disk before a request lands. A
+        save reads a slot, so it only works while the cache is still in one.
+        Each conversation is tried once, or a save that does not stick loops
+        forever."""
         tried = set()
         while True:
             with self.cv:
@@ -2994,40 +2523,30 @@ class Pool:
             self._save_park(conv, be, slot, post, remove)
 
     def _save_park(self, conv, be, slot, post, remove=drop_file):
-        """Write one cache to disk. Mark the pin only if it really holds one."""
+        """Write one cache to disk. Mark the pin only if it holds one."""
         name = conv + ".park"
         short = short_key(conv)
         kept = False
         written = 0
-        # Two different failures. A short save means the slot holds somebody
-        # else now, so the router no longer knows where this conversation is.
-        # A save that fails outright says nothing about the slot: the cache is
-        # still there, and forgetting it costs the next turn the whole prompt.
+        # A short save means the slot holds somebody else. A failed save says
+        # nothing about the slot: the cache is still there.
         lost = False
         refused = False
         began = time.time()
-        # Which turn of this conversation this save belongs to. A save can take
-        # POST_TIMEOUT - five minutes for a multi-gigabyte slot - and nothing
-        # stops the conversation's own next turn starting inside that window:
-        # claim_turn looks only at self.turns, which the previous turn emptied.
-        # Clearing `inflight` afterwards then un-reserved a slot that was being
-        # read, and pick_slot handed it to somebody else, which is the "two
-        # turns move the same three things" failure the turn ticket exists to
-        # stop. _take counts the turns, so comparing the count says whether the
-        # record is still the one this save marked.
+        # Which turn this save belongs to. A save can take POST_TIMEOUT, and
+        # the conversation's next turn can start inside that window. Clearing
+        # `inflight` for the wrong turn un-reserves a slot being read.
         with self.cv:
             record = self.pins.get(conv)
             turn = record.get("turns") if record else None
         try:
             answer = post(be["url"], f"/slots/{slot}?action=save",
                           {"filename": name}) or {}
-            # Ask the disk, not the backend. PARK_BUDGET is spent against this
-            # number, so it has to be the file. A build without
-            # patches/slot-state-carries-checkpoints.patch counts the state and
-            # not the checkpoint trailer - a 107 MB file came back as 49 MB -
-            # and the cap would then be enforced against half the disk in use.
-            # The backend's figure is the fallback for a stub that writes no
-            # file. tests/live/test_llama_beliefs.py asserts the two agree.
+            # Ask the disk. Without
+            # patches/slot-state-carries-checkpoints.patch the backend
+            # reports the state without the checkpoint trailer: a 107 MB
+            # file came back as 49 MB. Its figure is the fallback for a
+            # stub. tests/live/test_llama_beliefs.py asserts the two agree.
             written = file_size(name) or (answer.get("n_written") or 0)
             kept = written >= PARK_FLOOR
             if not kept:
@@ -3042,10 +2561,8 @@ class Pool:
         with self.cv:
             record = self.pins.get(conv)
             if record:
-                # Only if no turn of this conversation started while the save
-                # ran. One that did owns `inflight` and `slot` now, and this
-                # save's answer is about a slot it has moved on from. What the
-                # file holds is still true, so the copy is still recorded.
+                # Only if no later turn started while the save ran. A later
+                # turn owns `inflight` and `slot` now.
                 mine = record.get("turns") == turn
                 if mine:
                     record["inflight"] = False
@@ -3053,30 +2570,22 @@ class Pool:
                     record["parked"] = name
                     record["bytes"] = written
                     record["parked_at"] = time.time()
-                    # Which turn this copy holds, so the next pass can tell a
-                    # copy of the slot as it stands from one several turns back.
+                    # For copy_is_current.
                     record["parked_turn"] = turn
                     self.note_file("parked", conv, be, slot, written)
                 elif not refused and mine:
                     record["parked"] = None
                     record["bytes"] = 0
-                # A refused call keeps the copy it had. The backend said
-                # nothing about the slot and nothing about the file, which is
-                # still on disk and still a prefix of this conversation.
-                # Clearing it orphaned the file - off the budget sweep and off
-                # MAX_PINS eviction, eating the cap uncounted until a restart,
-                # while the conversation re-read its whole prompt.
+                # A refused call keeps the copy it had: the file is still on
+                # disk and still a prefix. Clearing it orphaned the file, off
+                # the budget sweep and off MAX_PINS eviction.
                 if lost and mine:
-                    # The slot holds someone else. Saying so stops the caller
-                    # asking for the same empty copy again.
+                    # The slot holds someone else.
                     record["slot"] = None
             # Keep the newest copies that fit the budget, and the newest even
-            # if it fills the budget alone. Newest means most recently written,
-            # not pin order: by pin order the copy just written sits wherever
-            # its conversation started, so a full budget drops it the moment it
-            # lands, ensure_parked sees an unparked cache and writes it again.
-            # cpu1_0 wrote the same 9.45 GiB copy 1,456 times between 04:44 and
-            # 09:12 on 14 September, holding its slot throughout.
+            # if it fills the budget alone. Newest by parked_at, not pin order:
+            # by pin order a full budget dropped the copy just written, and
+            # cpu1_0 wrote the same 9.45 GiB copy 1,456 times in 4.5 hours.
             held = sorted((c for c, p in self.pins.items() if p.get("parked")),
                           key=lambda c: self.pins[c].get("parked_at") or 0)
             spent, total = [], 0
@@ -3089,11 +2598,9 @@ class Pool:
             self.cv.notify_all()
         for gone in spent:
             remove(gone)
-        # The map is what vouches for these files on the next run, and adopt
-        # deletes any copy it does not name. Written only from the signal
-        # handler it was a shutdown's worth behind at every other moment, so a
-        # crash, an OOM kill or a power cut threw away every copy this run had
-        # made. A park is rare - 952 in three days - and this is a small file.
+        # The map vouches for these files on the next run. Written from the
+        # signal handler only, a crash or an OOM kill threw away every copy
+        # this run made. A park is rare: 952 in three days.
         if kept or spent:
             self.save_pins()
         EVENTS.write("park", conv=short, backend=be["name"], slot=slot,
@@ -3104,19 +2611,14 @@ class Pool:
         return kept
 
     def recall(self, conv, be, slot, post):
-        """Put a parked cache back, on the backend about to serve it.
-
-        Returns True when the cache is now on that backend. Without it a
-        conversation that lost its slot reads its whole prompt again."""
+        """Put a parked cache back on the backend about to serve it. Returns
+        True when the cache is now on that backend."""
         with self.cv:
             record = self.pins.get(conv)
             if not record or not record.get("parked"):
                 return False
-            # Already here, and still in a slot. The slot has to be part of
-            # the test: acquire re-pins to the serving backend before this
-            # runs, so the name always matches and only the slot says whether
-            # the cache survived. _take keeps the slot across a backend that
-            # did not change, and clears it across one that did.
+            # Already here, and still in a slot. acquire re-pins before this
+            # runs, so only the slot says whether the cache survived.
             if record["backend"] == be["name"] and record["slot"] is not None:
                 return False
             target_slot = slot
@@ -3151,29 +2653,22 @@ class Pool:
     def warm_prefix(self, conv, cuts, messages, system, tools, be, slot,
                     post, path):
         """Load the opening this request shares into a slot on this backend.
-
-        Only one the router already has: that is a file read, and the request
-        that follows extends the same slot, so it costs almost nothing. Reading
-        one instead costs tens of thousands of tokens, so an opening this
-        request could have used and the router lacks is written down for the
-        builder and left there.
-
-        Returns True when an opening was loaded."""
+        Only an opening the router already has: that is a file read. An
+        opening the router lacks is written down for the builder. Returns
+        True when an opening was loaded."""
         with self.cv:
             if not cuts:
                 return False
             record = self.pins.get(conv)
             if record and (record.get("parked") or record["slot"] is not None):
-                return False       # it has a cache of its own, which is better
+                return False       # its own cache is better
             saved = self.openings
             stored = deepest_shared(cuts, saved)
 
             base = cuts[0]
-            # A key names its own contents, so a cut is on one shelf or on
-            # neither: the first cut is a system prompt by construction.
+            # The first cut is a system prompt by construction.
             wanted = base[1] not in saved
-            # Nobody has this opening. One request reads and saves it, and any
-            # that start meanwhile wait, rather than read the same tokens.
+            # Nobody has this opening: one request reads it, the others wait.
             plan = None
             if stored:
                 plan = ("load", stored[1], saved[stored[1]], slot)
@@ -3183,14 +2678,11 @@ class Pool:
                 else:
                     self.building[base[1]] = time.time()
                     plan = ("read", base[1], None, slot)
-            # Every new session starts from a system prompt on its own, so it
-            # is wanted whatever else is saved - unless it is already in hand,
-            # where a want on top would have the builder read it twice.
+            # Every new session wants the base, unless it is being read now.
             if wanted and plan is None:
                 self.note_want(base, "base-", system, tools,
                                messages[:base[0] + 1], path)
-            # Deeper only where a slot already holds more of the same opening,
-            # and only past what is saved.
+            # Deeper only past what is saved, where a slot holds it.
             seen = set().union(*self.holds.values()) if self.holds else set()
             shared = deepest_shared(cuts, seen)
             if (DEEP_OPENINGS and shared and shared[1] != base[1]
@@ -3199,12 +2691,9 @@ class Pool:
                 self.note_want(shared, "deep-", system, tools,
                                messages[:shared[0] + 1], path)
 
-            # What a fork could have started from, had anything offered it.
-            # Measurement only. `shared` above needs the parent to hold a slot,
-            # and there are always more parked conversations than slots, so the
-            # fork rate it shows is a floor. A parked copy is a saved state like
-            # any other - recall and _load_prefix issue the same restore call -
-            # so a hit here is a prompt read that need not have happened.
+            # Measurement only: what a fork could have started from. `shared`
+            # needs the parent to hold a slot, so the fork rate it shows is a
+            # floor. A parked copy restores the same way an opening does.
             copied, copied_from = None, None
             for other, other_pin in self.pins.items():
                 if other == conv or not other_pin.get("parked"):
@@ -3224,11 +2713,8 @@ class Pool:
             while len(self.choices) > RECENT_REQUESTS:
                 self.choices.popitem(last=False)
 
-            # A request sharing more than the opening everyone shares has
-            # branched off somebody's session: a subagent given the parent's
-            # transcript, or a second window on one conversation. The only sign
-            # of the parent is a slot holding the deep cut, and the pins say
-            # whose slot that is.
+            # A request sharing more than the base opening has branched off
+            # somebody's session. The pins say whose slot holds the deep cut.
             if shared and shared[1] != base[1]:
                 holder = next((c for c, p in self.pins.items()
                                if shared[1] in self.holds.get(
@@ -3236,21 +2722,15 @@ class Pool:
                 if holder and holder != conv \
                         and self.forked.get(conv) != (holder, shared[0]):
                     self.forked[conv] = (holder, shared[0])
-                    # Assigning an existing key leaves it where it was, so
-                    # without this a conversation that forked again still sat
-                    # at the front and was the next one dropped - and the
-                    # dedupe above then had nothing to compare against and
-                    # wrote the same fork twice. choices, wants and pins all
-                    # move_to_end at the same spot.
+                    # Assigning an existing key does not move it. Without
+                    # this the dedupe above wrote the same fork twice.
                     self.forked.move_to_end(conv)
                     while len(self.forked) > RECENT_REQUESTS:
                         self.forked.popitem(last=False)
                     EVENTS.write("fork", conv=short_key(conv),
                                  parent=short_key(holder), depth=shared[0],
                                  cuts=len(cuts))
-            # The cut keys, not just how deep: without them nothing offline
-            # can ask whether some copy already held the cut this request
-            # wanted, which is the whole question deep openings exist for.
+            # The cut keys, so an offline report can match them to copies.
             EVENTS.write("choice", conv=short_key(conv),
                          base=short_key(base[1]),
                          stored=stored[0] if stored else None,
@@ -3280,12 +2760,9 @@ class Pool:
                 self.cv.notify_all()
 
     def _wait_for_opening(self, key, be, slot, post):
-        """Wait for another request to save the opening, then use it.
-
-        Reading it here too would be the same tokens twice: five sessions
-        starting together read 92,000 tokens between them where 24,000 would
-        have done, and the last finished after seventeen minutes. The wait is
-        exactly as long as the read it replaces."""
+        """Wait for another request to save the opening, then load it.
+        Measured: five sessions starting together read 92,000 tokens where
+        24,000 would do, and the last finished after seventeen minutes."""
         deadline = time.time() + BUILD_PATIENCE
         with self.cv:
             while key in self.building and time.time() < deadline:
@@ -3297,10 +2774,7 @@ class Pool:
 
     def note_want(self, cut, mark, system, tools, head, path):
         """Write down an opening worth having, with what it takes to read it.
-
-        The text has to be kept, because the request it came from is gone by
-        the time the builder runs. Newest last, and a short list, so a prompt
-        nobody sends any more cannot hold a place forever."""
+        The request it came from is gone by the time the builder runs."""
         with self.cv:
             fresh = cut[1] not in self.wants
             self.wants[cut[1]] = {"cut": cut, "mark": mark, "system": system,
@@ -3317,31 +2791,23 @@ class Pool:
                              action="added")
 
     def build_once(self, post, remove=drop_file):
-        """Read one wanted opening into an idle slot. Return its name, or None.
-
-        One at a time, and only where the backend can spare a slot. The slot
-        is held for the read, so a request cannot be admitted into it."""
+        """Read one wanted opening into an idle slot. Return its key, or None.
+        The slot is held for the read."""
         with self.cv:
             if not self.wants:
                 return None
-            # Reading an opening is reading a prompt, so the same rule holds:
-            # only a backend that prefills may do it.
             idle = [(b, self._idle_slot(b)) for b in self.backends
                     if prefills(b)]
             idle = [pair for pair in idle if pair[1] is not None]
             if not idle:
                 return None
-            # The backend that keeps the most slots spare, so a single-slot
-            # instance is not tied up for minutes.
             be, slot = max(idle, key=lambda p: p[0]["slots"] - p[0]["busy"])
             key, want = next(reversed(self.wants.items()))
             be["busy"] += 1
 
-        # The builder is the second way into a slot, and the only one that did
-        # not copy out what was there. A cpu slot holds a finished
-        # conversation's only cache - the park runs on the generator - so reading
-        # an opening over it lost that cache while the pin still said the slot
-        # was held. IDLE_POLLS makes that rarer, not survivable.
+        # The builder is the second way into a slot. Reading an opening over
+        # a finished conversation's only cache lost that cache while the pin
+        # still said the slot was held. IDLE_POLLS makes that rarer only.
         self.ensure_parked(be, None, post, remove)
         began = time.time()
         try:
@@ -3351,8 +2817,7 @@ class Pool:
         finally:
             with self.cv:
                 be["busy"] -= 1
-                # Dropped either way: a read that failed will fail again, and
-                # the next request that misses this opening asks again.
+                # Dropped either way. A failed read fails again.
                 self.wants.pop(key, None)
                 self.cv.notify_all()
         EVENTS.write("want", key=short_key(key), shelf=mark_shelf(want),
@@ -3362,24 +2827,13 @@ class Pool:
         return key if kept else None
 
     def park_all(self, post, timeout=POST_TIMEOUT, only=None, budget=None):
-        """Copy live caches to disk, so a stop does not throw them away.
-
-        `only` names one backend, for a drain. Without it every backend is
-        copied, which is what a shutdown wants.
-
-        A conversation mid-turn is skipped, because its slot is busy and
-        the save would wait for the very turn the stop is ending.
-
-        Each conversation is tried once. A refused save leaves the pin as
-        it found it, so without this the same one is picked again and the
-        loop never ends. A full disk at SIGTERM spun here instead of
-        reaching save_pins."""
+        """Copy live caches to disk, so a stop does not throw them away. `only`
+        names one backend, for a drain. A conversation mid-turn is skipped:
+        its slot is busy. Each conversation is tried once, or a refused save
+        loops forever. A full disk at SIGTERM spun here."""
         parked = 0
-        # `budget` is a wall clock across every backend, for the caller that
-        # has one: the signal handler gets 90 s from stop-all.sh before it is
-        # SIGKILLed, and save_pins runs after this. A drain passes none - it
-        # has DRAIN_DEADLINE and nothing waiting on it, and cutting a save
-        # short there is the whole cost this exists to avoid.
+        # `budget` is a wall clock across every backend: the signal handler
+        # gets 90 s from stop-all.sh. A drain passes none.
         stop = time.time() + budget if budget else None
         for be in self.backends:
             if not be["up"] or (only and be["name"] != only):
@@ -3397,9 +2851,7 @@ class Pool:
                     if not live:
                         break
                     # The per-save timeout is capped by what is left of the
-                    # budget too, or a save started just inside it runs on well
-                    # past the end. Asked with the work in hand, so an empty
-                    # backend does not report running out of time.
+                    # budget, asked with work in hand.
                     each = timeout
                     if stop is not None:
                         each = min(timeout, stop - time.time())
@@ -3418,12 +2870,8 @@ class Pool:
         return parked
 
     def save_openings(self):
-        """Write down what each opening has earned, for the next run.
-
-        The order is the shelf's own, least recently used first, which is the
-        order the budget drops them in. `loads` is the count the dashboard
-        shows, which reset to zero on every restart while the openings it
-        counted stayed on disk."""
+        """Write down what each opening has earned, for the next run: the
+        shelf order and the load counts."""
         with self.cv:
             rows = [{"key": key, "file": name, "loads": self.loads.get(key, 0)}
                     for key, name in self.openings.items()]
@@ -3437,8 +2885,7 @@ class Pool:
                      "tokens": record.get("tokens", 0),
                      "bytes": record.get("bytes", 0),
                      "turns": record.get("turns", 1),
-                     # The budget sweep orders by this, so it has to survive
-                     # the restart with the file it describes.
+                     # The budget sweep orders by this.
                      "parked_at": record.get("parked_at")}
                     for conv, record in self.pins.items() if record.get("parked")]
         write_rows(pins_file(), kept)
@@ -3447,26 +2894,17 @@ class Pool:
     def hand_off(self, conv, source, tokens, post, remove=drop_file, wanted=None):
         """Move a conversation to the backend it generates on.
 
-        The prefiller is released before the wait to generate, not after,
-        so it takes the next prompt while this turn waits. Waiting the
-        other way round left three prefillers idle for seven minutes on
-        one reply.
-
-        Between the save and the restore the conversation is parked and
-        nowhere else, so a failure here leaves it parked, not lost.
-
-        Returns the backend to generate on. That is `source` when nothing
-        was carried. None means nobody is waiting any more, and the caller
-        holds no backend."""
+        The prefiller is released before the wait to generate. The other
+        order left three prefillers idle for seven minutes on one reply.
+        Between the save and the restore the conversation is parked, so a
+        failure leaves it parked, not lost. Returns the backend to generate
+        on: `source` when nothing was carried, None when nobody waits."""
         if not HANDOFF_ON:
             return self._stay(source, "the handoff is turned off")
         target = self.generator(tokens)
         while target is None and not generates(source):
-            # Nothing to carry this to, and the instance holding it is set not
-            # to generate. Wait for a generator rather than break the setting -
-            # the client leaving is what ends the wait, as everywhere else
-            # here. This one waits holding a prefill slot rather than parked,
-            # which is why it is the only wait that would rather not exist.
+            # Nothing to carry this to, and the instance holding it does
+            # not generate. Wait, holding a prefill slot.
             if wanted is not None and not wanted():
                 return None
             with self.cv:
@@ -3496,17 +2934,12 @@ class Pool:
             if wanted is not None and not wanted():
                 return None                # parked, and nobody to answer
             if generates(source):
-                # The generator went away. Answering slowly beats not
-                # answering, so take the prefiller back and generate where it
-                # read.
+                # The generator went away. A slow answer beats none.
                 with self.cv:
                     source["busy"] += 1
                 return source
-            # `generate: false` says this instance does not generate, and a
-            # convenient moment does not change that: an operator who set it
-            # meant it, and the turn is parked on disk, which is the cheapest
-            # place it could be waiting. So wait for a generator, the way
-            # everything else here waits - the client leaving is what ends it.
+            # `generate: false` is an operator's setting. The turn is parked
+            # on disk, the cheapest place to wait. Wait for a generator.
             target = self.generator(tokens)
             if target is None:
                 with self.cv:
@@ -3540,28 +2973,19 @@ class Pool:
         return target
 
     def _stay(self, source, why):
-        """Generate where the prompt was read, because carrying it failed.
-
-        Said out loud when the instance is one an operator set `generate` off
-        on. The main path waits for a generator instead - the turn is parked on
-        disk and costs nothing to hold there. These are the paths with nothing
-        left to wait with: nothing was carried, so there is no copy for a
-        generator to restore, and the alternative to breaking the preference is
-        throwing away a prompt that took tens of minutes to read."""
+        """Generate where the prompt was read, because carrying it failed. Said
+        aloud when the instance is set not to generate: nothing was carried,
+        so there is no copy for a generator to restore."""
         if not generates(source):
             print(f"[router] generating on {source['name']} though it is set "
                   f"not to: {why}", flush=True)
         return source
 
     def generator(self, tokens):
-        """The backend turns migrate to once their prompt is read, or None.
-
-        One that generates and does not prefill. Carrying a turn costs a
-        save and a restore, so it is only worth reaching an instance outside
-        the prefilling pool. Where every instance does both, a turn
-        generates in the slot its prompt already sits in, and this is None.
-
-        None also when the one configured is down, draining or too small."""
+        """The backend turns migrate to after their prompt is read, or None:
+        one that generates and does not prefill. Where every instance does
+        both, a turn generates where it read. None also when the configured
+        one is down, draining or too small."""
         with self.cv:
             for be in sorted(self.backends, key=lambda b: b["pref"]):
                 if prefills(be) or not generates(be):
@@ -3571,13 +2995,8 @@ class Pool:
             return None
 
     def _wait_to_generate(self, target, wanted):
-        """Hold on until the generator has a slot. Returns the slot id, or None.
-
-        A generation runs for seconds where a prefill runs for minutes, so this
-        queue drains quickly even where there is one slot to generate in.
-
-        None when the generator can no longer serve this turn, or when the
-        client has stopped waiting."""
+        """Wait until the generator has a slot. Returns the slot id, or None
+        when the generator cannot serve this turn or the client left."""
         with self.cv:
             self.to_generate += 1
         try:
@@ -3588,7 +3007,7 @@ class Pool:
                     if target["busy"] < target["slots"]:
                         free = self._free_slot(target)
                         if free is not None:
-                            target["busy"] += 1   # held against the request path
+                            target["busy"] += 1   # counted like a request
                             return free
                     if wanted is not None and not wanted():
                         return None
@@ -3598,22 +3017,14 @@ class Pool:
                 self.to_generate -= 1
 
     def park_later(self, be, conv, post, ticket, remove=drop_file):
-        """Copy a cache out of a backend that cannot read it again, on a worker.
-
-        The copy runs to gigabytes and the client already has its reply, so
-        the request thread does not wait for it. Two things go with the job.
-
-        The slot is reserved before this returns. `inflight` is what stops
-        pick_slot handing it to another conversation, wherever the copy runs.
-
-        The turn ticket goes too, because the copy overwrites the same file
-        the next turn would restore from. Holding the ticket is how that
-        turn waits.
-
-        Returns False when there is nothing to copy. The caller then still
-        owns the ticket."""
+        """Copy a cache out of a backend that cannot read it, on a worker: the
+        copy runs to gigabytes and the client already has its reply.
+        `inflight` reserves the slot before this returns. The turn ticket
+        goes with the job, because the copy overwrites the file the next turn
+        restores from. Returns False, with the ticket still the caller's,
+        when there is nothing to copy."""
         if prefills(be):
-            return False              # it can be read again where it is
+            return False              # it can be read again here
         with self.cv:
             record = self.pins.get(conv) if conv else None
             if not record or record["slot"] is None:
@@ -3628,11 +3039,8 @@ class Pool:
         return True
 
     def _run_parks(self):
-        """Write the queued copies, ending each turn once its copy has landed.
-
-        One worker rather than one thread a copy: two multi-gigabyte writes at
-        once only divide the same disk between them, and the turn behind each
-        waits either way."""
+        """Write the queued copies. One worker: two multi-gigabyte writes at
+        once only divide the same disk."""
         while True:
             job = self.park_jobs.get()
             conv, be, slot, post, remove, ticket = job
@@ -3642,11 +3050,8 @@ class Pool:
                 print(f"[router] {short_key(conv)} could not be put away: "
                       f"{err}", flush=True)
             finally:
-                # Whatever happened above, and before task_done so a drain
-                # cannot return while a ticket is still out. claim_turn has no
-                # deadline, so a ticket that never comes back wedges this
-                # conversation for as long as the router runs - which is worse
-                # than any copy not written.
+                # Whatever happened above. claim_turn has no deadline, so a
+                # lost ticket wedges the conversation until a restart.
                 self.finish_turn(conv, ticket)
                 self.park_jobs.task_done()
 
@@ -3661,14 +3066,10 @@ class Pool:
 
     def park_partial(self, conv, be, slot, post, remove=drop_file):
         """Keep what an abandoned read got through, so the retry starts there.
-
-        A prompt is read from the front, so a cancelled read leaves the slot
-        holding the front of the turn the client will send again.
-
-        Thrown away, a prompt too long for the client's patience can never
-        be read at all: every attempt starts from the shared opening and
-        gives up in the same place. Measured once at a 114,354 token turn,
-        abandoned twice after an hour, two thirds read each time."""
+        Thrown away, a prompt too long for the client's patience is never
+        read: every attempt gives up in the same place. Measured once at a
+        114,354 token turn, abandoned twice after an hour, two thirds read
+        each time."""
         if not conv:
             return False
         with self.cv:
@@ -3676,31 +3077,21 @@ class Pool:
             if not record:
                 return False
             if copy_is_current(record):
-                return False               # already on disk for this turn, and
-                                           # saving again from a slot it has
-                                           # left would find nothing and delete
-                                           # the copy. A copy from an earlier
-                                           # turn is exactly what this exists
-                                           # to get past: the slot holds the
-                                           # front of the turn that was
-                                           # abandoned, which is further on.
+                return False               # already on disk for this turn.
+                                           # A save from a slot it has left
+                                           # would delete the copy.
             record["inflight"] = True      # hold it still while it copies
         return self._save_park(conv, be, slot, post, remove)
 
     def note_holds(self, conv, be, cuts):
-        """Record what a slot holds now, so a later request can start from it."""
+        """Record what a slot holds now, for a later request to start from."""
         with self.cv:
             record = self.pins.get(conv) if conv else None
             if not record or not cuts:
                 return
-            # Which opening this conversation was last left on. Its copy on
-            # disk begins there, so the next turn can tell whether the copy is
-            # worth restoring before it sends anything.
+            # The opening this turn left on, for forget_stale_park.
             record["opening"] = cuts[0][1]
-            # Every cut, kept past the slot. The copy on disk holds all of
-            # them, so this is what says how deep a fork of this conversation
-            # could start - a question self.holds cannot answer, being wiped
-            # the moment the slot goes.
+            # Every cut, kept past the slot, for the fork measurement.
             record["holds"] = {key for _, key in cuts}
             if record["slot"] is None:
                 return
@@ -3708,19 +3099,11 @@ class Pool:
             self.holds_depth[(be["name"], record["slot"])] = max(i for i, _ in cuts)
 
     def forget_stale_park(self, conv, cuts, remove=drop_file):
-        """Drop a copy whose opening the client has changed since.
-
-        A copy is only useful as a prefix of the turn coming in, and every
-        turn starts with the opening. Change one sentence of one tool
-        description and every token after it differs.
-
-        llama.cpp then restores the state, finds no checkpoint at or before
-        where the prompts part, and reads everything again. Measured once at
-        117,847 tokens, for prompts that parted at token 503.
-
-        A conversation holding its own copy never looks for a shared opening,
-        so it loses that too. Declaring the copy dead here puts it back on
-        the path that loads one."""
+        """Drop a copy whose opening the client has changed since. llama.cpp
+        restores the state, finds no checkpoint before the point where the
+        prompts part, and reads everything again. Measured once at 117,847
+        tokens for prompts that parted at token 503. Without the copy the
+        conversation loads a shared opening instead."""
         if not conv or not cuts:
             return False
         with self.cv:
@@ -3751,10 +3134,7 @@ class Pool:
             EVENTS.write("load", key=short_key(key), backend=be["name"],
                          slot=slot, ok=False, error=str(err)[:120])
             return False
-        # Sized here rather than left at zero: this is the one file event that
-        # reads the nvme, and the dashboard draws each one crossing in the time
-        # its bytes take. Without a size the largest read on the page was drawn
-        # as "0 MiB" in the floor of half a second.
+        # Sized: the dashboard draws each file event over its byte count.
         read = file_size(name)
         with self.cv:
             shelf = None
@@ -3764,7 +3144,7 @@ class Pool:
             self.loads[key] = self.loads.get(key, 0) + 1
             self.note_file("loaded opening", key, be, slot, read)
             loads = self.loads[key]
-        self.save_openings()      # a load is what earns an opening its place
+        self.save_openings()      # a load earns an opening its place
         EVENTS.write("load", key=short_key(key), shelf=shelf,
                      backend=be["name"], slot=slot, ok=True,
                      bytes=read, secs=round(time.time() - began, 2),
@@ -3783,9 +3163,7 @@ class Pool:
         try:
             block = self._render_block(system, tools, messages[:index + 1],
                                        be, post, path)
-            # The reply to a zero-token read carries the timings: tokens
-            # processed and tokens the prompt cache skipped. The one place the
-            # cost of an opening is measured rather than guessed.
+            # The zero-token reply's timings: tokens processed and cached.
             read = post(be["url"], "/completion",
                         {"prompt": block, "n_predict": 0, "cache_prompt": True,
                          "id_slot": slot}, timeout=READ_TIMEOUT) or {}
@@ -3800,11 +3178,7 @@ class Pool:
                          error=str(err)[:120],
                          secs=round(time.time() - began, 1))
             return False
-        # Measured on the disk, as _save_park measures a conversation's copy:
-        # an unpatched backend reports the state without the checkpoint
-        # trailer, and judging an opening by that number would delete a good
-        # one as "changed hands" and read it again on the next pass. The
-        # backend's figure is the fallback for a stub that writes no file.
+        # From the disk, as _save_park: unpatched backends under-report.
         written = file_size(name) or (answer.get("n_written") or 0)
         if written < PARK_FLOOR:
             remove(name)           # the slot had already changed hands
@@ -3819,9 +3193,7 @@ class Pool:
             self.openings.move_to_end(key)      # just read, so the newest
             self.opening_bytes[key] = written
             self.note_file("kept opening", key, be, slot, written)
-            # Whatever is left over goes, least recently used first. `building`
-            # is spared: those have no file to count yet, and dropping one
-            # would delete an opening a waiting request is about to load.
+            # `building` has no file to count yet.
             dropped = trim_openings(self.openings, self.opening_bytes,
                                     keep=set(self.building))
         for extra in dropped:
@@ -3840,29 +3212,17 @@ class Pool:
 
     @staticmethod
     def _render_block(system, tools, head, be, post, path):
-        """One opening, as the backend's own template renders it.
-
-        Two renderings that differ only in what follows the opening share
-        exactly that opening, so there is no template to copy here.
-
-        Each message goes through the route its own protocol uses.
-        /apply-template reads openai-shaped messages and refuses anthropic
-        tool_use and tool_result blocks, so an opening from /v1/messages is
-        rendered by the anthropic route - the same conversion generation puts
-        it through."""
+        """One opening, as the backend's own template renders it: what two
+        renderings that differ only after the opening share. /apply-template
+        refuses anthropic tool_use and tool_result blocks, so an opening from
+        /v1/messages goes through the anthropic route."""
         route = template_route(path)
         extra = {"tools": tools} if tools else {}
-        # The anthropic route takes the system prompt in its own field, and
-        # llama.cpp normalises it there before it renders - Claude Code opens
-        # it with `x-anthropic-billing-header: ...cch=<hash>`, and the
-        # converter rewrites that hash to fffff (server-chat.cpp
-        # normalize_anthropic_billing_header). Sent as a message instead it
-        # went through untouched, so the block this saved began cch=<hash>
-        # where every real turn begins cch=fffff: the prompts part about
-        # fifteen tokens in, a restored slot has no checkpoint below that, and
-        # the whole prompt is read again - counted as a hit. The converter
-        # pushes the system field on as the first message, so the list it
-        # renders is the same one either way.
+        # The anthropic route takes the system prompt in its own field, where
+        # llama.cpp normalises it: server-chat.cpp
+        # normalize_anthropic_billing_header rewrites Claude Code's cch=<hash>
+        # to cch=fffff. Sent as a message it went through untouched, and the
+        # saved block parted from every real turn about fifteen tokens in.
         opening = list(head)
         if system:
             if route.startswith("/v1/messages"):
@@ -3876,19 +3236,15 @@ class Pool:
         return common_prefix(full["prompt"], alone["prompt"])
 
     def status(self):
-        """Report what the backends are really doing.
-
-        `busy` counts what this router admitted, `active` what the backend
-        says is processing. They differ when something else is talking to the
-        backends, or after a router restart, and the dashboard wants the truth
-        rather than this process's bookkeeping."""
+        """Report what the backends are doing. `busy` is what this router
+        admitted. `active` is what the backend says: they differ when
+        something else talks to the backends, or after a router restart."""
         now = time.time()
         mounts = self._read_mounts(now)
         with self.cv:
             keys = ("name", "url", "model", "slots", "n_ctx", "busy", "up", "served",
                     "stats", "slots_detail", "cache", "draining")
             rows = []
-            # Ordered by where they run, so one socket reads together.
             for be in sorted(self.backends, key=lambda b: by_place(b["name"])):
                 row = {k: be[k] for k in keys}
                 row["prefill"] = prefills(be)
@@ -3900,8 +3256,7 @@ class Pool:
                                  else be["busy"])
                 rows.append(row)
 
-            # Sizes from opening_bytes, not a stat each: this runs under the
-            # lock on every push, and the shelves hold tens of files.
+            # Sizes from opening_bytes, not a stat each, under the lock.
             def shelf(which, kind):
                 return [{"name": key[:8], "file": name, "kind": kind,
                          "bytes": self.opening_bytes.get(key, 0),
@@ -3912,15 +3267,9 @@ class Pool:
                         "deeps": shelf("deep", "shared history"),
                         "wants": [{"name": key[:8], "kind": want["mark"].rstrip("-")}
                                   for key, want in self.wants.items()]}
-            # `backend` is the instance this conversation last ran on; `slot` is
-            # set only while that instance's slot still holds the cache, and is
-            # cleared the moment something displaces it. Without the slot the
-            # dashboard cannot tell "its cache is in that slot" from "it ran
-            # there once", and three copies naming one single-slot backend look
-            # like three caches in one slot.
-            # `parked_at` is what the PARK_BUDGET sweep orders by: it keeps the
-            # newest copies and drops the oldest, so without it the dashboard
-            # can only list the copies, never say which one goes next.
+            # `slot` is set only while the slot still holds the cache, or
+            # three copies naming one single-slot backend look like three
+            # caches in one slot. `parked_at` is the PARK_BUDGET sweep order.
             copies = [{"name": p["parked"], "kind": "copy", "conv": short_key(conv),
                        "bytes": p.get("bytes") or 0, "backend": p["backend"],
                        "slot": p.get("slot"), "parked_at": p.get("parked_at")}
@@ -3957,11 +3306,8 @@ PAGE_FILES = ("index.html", "shell.js", "shell.css")
 
 
 def on_the_page(rel):
-    """True for a path the browser needs to draw the dashboard.
-
-    The web directory also holds what built the page: node_modules, the
-    checks, the package files. None of it belongs on the wire, and
-    node_modules alone is 31 MB of someone else's code."""
+    """True for a path the browser needs. The web directory also holds
+    node_modules, 31 MB that must not go on the wire."""
     rel = (rel or "").strip("/")
     if not rel:
         return True                       # a directory, answered by its index
@@ -3980,17 +3326,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/router/json":
             return self._send(200, json.dumps(POOL.status(), indent=2).encode())
         if self.command == "GET" and self.path.split("?")[0] in ("", "/", "/router"):
-            # The backends serve their own web ui at the root, which is not
-            # what a reader wants here. /router needs the trailing slash so the
-            # page's relative urls resolve under /router/ rather than the root.
-            # Exact matches only: /router/ itself must reach the static handler.
+            # The backends serve their own web ui at the root. /router needs
+            # the trailing slash so relative urls resolve under /router/.
+            # Exact matches only: /router/ must reach the static handler.
             return self._redirect("/router/")
         if self.path.startswith("/router/"):
             rest = self.path[len("/router/"):].split("?")[0]
             if rest == "events":
                 return self._events()
-            # Take a backend out of service, or put it back, so it can be
-            # restarted under the requests waiting for it.
             if rest.startswith("drain/") or rest.startswith("resume/"):
                 return self._service(*rest.split("/", 1))
             if rest == "reset-rates":
@@ -4017,9 +3360,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         report = POOL.drain(name, http_post)
         if report is None:
             return self._error(404, f"no backend called {name}")
-        # A drain that gave up waiting parked nothing, and one whose saves
-        # failed left caches only in slots. Either way say so, rather than let
-        # a script stop a backend that still holds live caches.
+        # A drain that gave up, or whose saves failed, left caches only in
+        # slots. Say so, or a script stops a backend that holds live caches.
         ok = report["quiet"] and not report["left"]
         return self._send(200 if ok else 409, json.dumps(report).encode())
 
@@ -4030,13 +3372,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def _config(self, kind):
-        """Offer a ready client config, addressed to whatever host was used.
-
-        The address has to come from the request - a config built with
-        127.0.0.1 is no use to the laptop that downloaded it - but it is the
-        client's own header, so it is checked before it goes into a file the
-        reader will point a client at for months. A name, or an address, and a
-        port: nothing that could carry a path, a scheme or credentials."""
+        """Offer a ready client config, addressed to the host the reader used.
+        The Host header is checked: the reader keeps the file for months."""
         host = host_only(self.headers.get("Host"))
         if not host or kind not in CONFIG_FILES:
             return self._error(404, "no such config")
@@ -4050,7 +3387,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = json.dumps(config, indent=2).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        # Make the browser save it instead of showing it.
         self.send_header("Content-Disposition",
                          f'attachment; filename="{CONFIG_FILES[kind]}"')
         self.send_header("Content-Length", str(len(payload)))
@@ -4065,10 +3401,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _error(self, code, message, say=None):
-        """Answer with an error, and write it down.
-
-        An error that leaves no trace here is visible only to the client it
-        was sent to, and cannot be diagnosed from this side."""
+        """Answer with an error, and log it."""
         (say or _say)(f"[router] {code} on {self.command} "
                       f"{self.path.split('?')[0]}: {message}")
         self._send(code, json.dumps({"error": {"message": message}}).encode())
@@ -4081,7 +3414,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         base = WEB.resolve()
         try:
             target = (base / rel).resolve()
-            target.relative_to(base)              # refuse to escape the web dir
+            target.relative_to(base)              # no escaping the web dir
         except (ValueError, OSError):
             return self._error(403, "outside the web directory")
         if target.is_dir():
@@ -4107,10 +3440,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _events(self):
-        """Push the pool status, but only when it changed.
-
-        The client does not poll: it opens one EventSource, which reconnects
-        by itself, so a router restart heals without a reload."""
+        """Push the pool status when it changes. The client's EventSource
+        reconnects by itself."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -4130,10 +3461,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass                                   # the viewer closed the tab
 
     def _pool_props(self, path):
-        """Answer /props and /slots for the whole pool.
-
-        Forwarding these to one backend makes the router look like a one-slot
-        server, and clients plan their concurrency around that."""
+        """Answer /props and /slots for the whole pool. One backend's answer
+        makes the router look like a one-slot server."""
         live = [be for be in POOL.backends if be["up"]]
         if not live:
             return self._error(503, "no backend is up")
@@ -4161,28 +3490,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._send(200, json.dumps(props).encode())
 
     def _route(self):
-        # A client's header, so it may be anything. int() on junk raised before
-        # a status line had been sent, and BaseHTTPRequestHandler catches only
-        # TimeoutError, so the client got a dropped connection and the log got
-        # a traceback instead of a 400.
+        # A client's header. int() on junk raised before a status line went
+        # out, and BaseHTTPRequestHandler catches only TimeoutError.
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             return self._error(400, "Content-Length is not a number")
         if length < 0:
             return self._error(400, "Content-Length is negative")
-        # Read before anything else looks at it, so a header alone could ask
-        # this process to hold arbitrary memory - on the one port the design
-        # says is public, on a box whose whole budget is the weights. The 413
-        # below is a real limit but it runs after the body is in hand.
+        # Checked before the body is read, or a header alone could ask
+        # this process for arbitrary memory.
         if length > MAX_BODY:
             self.close_connection = True
             return self._error(413, f"body of {length} bytes; this router "
                                     f"reads at most {MAX_BODY}")
-        # Nothing here decodes chunked, and `transfer-encoding` is dropped on
-        # the way out. Refused rather than read as an empty body: that loses the
-        # prompt, and leaves the unread chunks in the socket for the next
-        # request on it to parse as a request line.
+        # Nothing here decodes chunked. Read as an empty body, the unread
+        # chunks become the next request line on this connection.
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
             self.close_connection = True
             return self._error(411, "send the body with a Content-Length: "
@@ -4193,17 +3516,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.command == "GET" and path in ("/props", "/slots"):
             return self._pool_props(path)
 
-        # Both chat apis are POST only, and so is llama.cpp. Without this a
-        # bodiless GET on one of these paths took a slot, parked every other
-        # cache on the backend, restored gigabytes and loaded an opening -
-        # all of it before _forward sent the backend a request it answers 404
-        # to. From an unauthenticated public port.
+        # Both chat apis are POST only. A bodiless GET took a slot, parked
+        # every cache on the backend and restored gigabytes before the
+        # backend answered 404. From an unauthenticated public port.
         if path in INFERENCE and self.command != "POST":
             return self._error(405, f"post to {path}")
         if path not in INFERENCE:
-            # Named, not "everything else". The backends run with --agent, so
-            # anything this forwards is shell and file access handed to whoever
-            # reached the router's public port. PASS_THROUGH widens it.
+            # An allowlist, see PASSED.
             if path not in PASSED:
                 return self._error(404, f"this router does not serve {path}")
             be = next((b for b in POOL.backends if b["up"]), None)
@@ -4213,10 +3532,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         vision = POOL.vision()
         tokens, images, image_charge = request_cost(body, vision)
-        # `tokens` is what has to fit, so it carries REPLY_TOKENS of room for
-        # the answer. The prompt is what was sent, and it is what the dashboard
-        # measures a finished turn against: 1,024 tokens nobody sent is 41
-        # seconds of reading nobody did, on every turn with no exact split.
+        # `tokens` carries REPLY_TOKENS of room. The dashboard measures a
+        # turn against the prompt sent: 1,024 tokens nobody sent is 41
+        # seconds of reading nobody did.
         prompt_tokens = max(0, tokens - REPLY_TOKENS)
         largest = POOL.largest()
         if largest and tokens > largest:
@@ -4225,18 +3543,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not largest:
             return self._error(503, "no backend is up yet")
 
-        # The client's own session id beats a guess from the prompt, and
-        # covers /v1/messages, where the system prompt is a separate field
-        # conversation_id never sees.
-        #
-        # `conv_source` says how it was recognised, so a report can tell a
-        # client that sends its session id from one identified by a hash that
-        # any edit to the opening silently changes. Decided here rather than
-        # in a second expression over the same three calls: that one re-parsed
-        # the body twice more to learn which branch had just won - on a ctx
-        # 150000 turn, megabytes each time - and it carried the precedence
-        # separately, so changing the order above would have left every hashed
-        # conversation labelled "cache_key".
+        # The session id beats a guess from the prompt, and covers
+        # /v1/messages, where the system prompt is a separate field.
+        # `conv_source` says how the conversation was recognised. Decided
+        # here: a re-parse of a ctx 150000 turn is megabytes.
         conv, conv_source = session_key(self.headers), "header"
         if not conv:
             conv, conv_source = prompt_key(body), "cache_key"
@@ -4255,12 +3565,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             EVENTS.write("start_over", conv=short_key(conv) if conv else None,
                          reason="late_system", client=client, path=path)
         body = ordered
-        # Every point this request could share with another. One saved copy of
-        # the deepest starts them both.
         cuts, messages, system, tools = prompt_cuts(body)
-        # A full box is a queue, not a refusal. The wait for a slot is part of
-        # the reply, so the stream and its keep-alive open before the slot is
-        # asked for and run through the wait and the read alike.
+        # The stream and its keep-alive open before the slot is asked for.
         start = time.time()
         asked = read_only(body)
         opened = asked is not None and wants_stream(body)
@@ -4272,21 +3578,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         ticket = POOL.begin_wait(conv, tokens, images, image_charge)
         try:
-            # The turn ahead in the same conversation holds the pin, the slot
-            # and the copy this one needs. Waiting for it before asking for a
-            # backend is what stops a second reader moving the same three.
+            # The turn ahead holds the pin, slot and copy this one needs.
             mine = POOL.claim_turn(conv, ticket, self._still_there)
             be = POOL.acquire(conv, tokens, self._still_there) if mine else None
         finally:
             POOL.end_wait(ticket)
         waited = time.time() - start
         if not be:
-            # Either nothing that reads is up, or the client stopped waiting.
-            # Only if this turn held the conversation: Flow is keyed by
-            # conversation, so a turn that gave up in claim_turn saying "done"
-            # deleted the live row of the turn actually running - a 40 minute
-            # prefill vanished off the flow view and replayed a completion that
-            # never happened.
+            # `done` only if this turn held the conversation: Flow is keyed
+            # by conversation, and a turn that gave up in claim_turn deleted
+            # the live row of the turn running.
             if mine:
                 POOL.note_stage(conv, "done")
             POOL.finish_turn(conv, ticket)
@@ -4295,33 +3596,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if opened:
                 return self._say_and_end("no backend can serve this request")
             return self._error(503, "no backend can serve this request")
-        # Read here, then generate wherever is free. Which backend that is
-        # cannot be known before the read, and the read takes minutes.
+        # Read here, then generate wherever is free after the read.
         serving = be
         left = False                           # the client gave up mid-read
         read_stats = {}
         recalled = loaded = warm = False
         slot = None
-        # The backend is held from here, and the conversation with it. Every
-        # way out of this block runs the same ending, because a claim left
-        # behind stops the conversation for good. Nothing may sit between the
-        # claim and the try for the same reason: the claim has no deadline, so
-        # a throw before it would hold the conversation until a restart.
+        # The backend and the conversation are held from here. Every way out
+        # runs the same ending: claim_turn has no deadline, so a claim left
+        # behind stops the conversation for good.
         try:
-            # Its own cache is still in a slot here, so the turn extends it.
             warm = bool(conv) and POOL.holds_slot(conv)
-            # One slot, decided once, because whatever is put there - this
-            # conversation's copy, or the opening it shares - is put there for
-            # the read below to extend. Asking once per step answered from a
-            # two-second-old poll and landed the opening in a slot nothing
-            # then read.
+            # One slot, decided once, for the read below to extend.
             slot = POOL.pick_slot(be, conv)
             POOL.note_stage(conv, "prefill", be["name"], slot)
-            # Nothing reaches the backend until the caches on it are safe on
-            # disk and this conversation's own cache is back where it will run.
+            # Nothing reaches the backend until the caches on it are on disk.
             POOL.ensure_parked(be, conv, http_post)
-            # A copy beginning with an opening the client no longer sends
-            # cannot be extended. Dropping it lets the opening load instead.
+            # A copy with an opening the client no longer sends is no prefix.
             if POOL.forget_stale_park(conv, cuts):
                 EVENTS.write("start_over", conv=short_key(conv) if conv else None,
                              reason="stale_copy", client=client, path=path)
@@ -4330,10 +3621,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       and POOL.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, http_post, path))
             if asked is not None:
-                # Watch the client through the read: one nobody waits for
-                # holds the slot its own retry needs. The reply's timings say
-                # what the backend processed against its prompt cache, which
-                # is the number every cache question comes down to.
+                # Watch the client. The timings say what the cache saved.
                 answer = http_post_wanted(be["url"], path, read_only(body, slot),
                                           READ_TIMEOUT, self._still_there)
                 timing = (answer or {}).get("timings") or {}
@@ -4343,29 +3631,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 serving = POOL.hand_off(conv, be, tokens, http_post,
                                         wanted=self._still_there)
                 if serving is None:
-                    # The client left while it waited to generate. Its cache
-                    # is parked, and no backend is held.
+                    # The cache is parked, and no backend is held.
                     raise Gone("the client stopped waiting for a slot to generate in")
             if serving is be:
-                # Nothing was carried, so the slot that read answers where it
-                # stands. hand_off already noted a carried turn.
+                # Nothing was carried. hand_off already noted a carried turn.
                 POOL.note_stage(conv, "generate", be["name"], slot)
             if stop_ping:
                 stop_ping()                    # waits for a ping in flight
             self._forward(serving, body, conv, opened=opened)
         except Gone:
-            # Nobody to answer. The slot goes back below, and what the read
-            # got through is parked so the retry starts there.
+            # Nobody to answer. What the read got through is parked below.
             print(f"[router] {short_key(conv)} left while {be['name']} was "
                   f"reading, {time.time() - start:.0f}s in ({self.went})",
                   flush=True)
             left = True
         except Exception as err:
-            # Reading is how a request is served, not a step with a way round
-            # it. If it fails, the request failed.
             if opened:
-                # The reply already started, so there is no status left to
-                # send. Say it in the stream and end it.
+                # The reply already started, so say it in the stream.
                 self._say_and_end(f"{be['name']}: {err}")
             else:
                 self._error(502, f"{be['name']}: {err}")
@@ -4377,29 +3659,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if serving is not None:
                     POOL.note_holds(conv, serving, cuts)
                     POOL.release(serving, conv)
-                # Both after the release, which drops the copy on disk because
-                # a served turn leaves the slot ahead of it. These write the
-                # copy that is not behind.
+                # After the release: these write the copy that is not behind.
                 if left:
                     POOL.park_partial(conv, be, slot, http_post)
                 # A backend that does not read cannot serve the next turn, so
-                # leave a copy for whichever one does. On a worker: the copy
-                # runs to gigabytes and the client already has its reply, so
-                # only the next turn of this conversation waits for it.
+                # leave a copy for one that does, on a worker.
                 if serving is not None:
                     parking = POOL.park_later(serving, conv, http_post, ticket)
             except Exception as err:
-                # A copy not written costs the next turn its prompt. A turn
-                # ticket not given back costs the conversation every turn
-                # after it, because claim_turn has no deadline - so whatever
-                # happens here, the lines below still run.
+                # A ticket not given back costs the conversation every later
+                # turn: claim_turn has no deadline. The lines below must run.
                 print(f"[router] {short_key(conv)} could not be put away: "
                       f"{err}", flush=True)
             took = time.time() - start
             POOL.note_stage(conv, "done")
-            # The worker ends the turn once the copy has landed, because the
-            # next turn restores from the file it is writing. Only when there
-            # is no copy to write does this thread still own the ticket.
+            # The worker ends the turn once the copy has landed.
             if not parking:
                 POOL.finish_turn(conv, ticket)
             POOL.note_request(conv, be, path, took, waited,
@@ -4421,17 +3695,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     went = "closed its end"                    # why the client stopped waiting
 
     def _still_there(self):
-        """False once the client has closed its end.
-
-        A queued request waits without a deadline, so the client leaving is
-        the only thing that ends the wait. The body is already read, so
-        nothing more arrives: ready to read, with nothing on it, means gone.
-
-        `self.went` records which case it was, because a clean close and a
-        broken socket send you to different logs.
-
-        poll, not select: select refuses a descriptor at or above FD_SETSIZE,
-        1024, and raises ValueError for a socket whose client is still there."""
+        """False once the client has closed its end. The body is already read,
+        so readable with nothing on it means gone. `self.went` records which
+        case. poll, not select: select refuses a descriptor at or above
+        FD_SETSIZE (1024) and raises ValueError for a live client."""
         try:
             watch = select.poll()
             watch.register(self.connection, select.POLLIN)
@@ -4441,22 +3708,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return True
             self.went = "closed its end"
         except (OSError, ValueError) as err:
-            # A closed socket has no descriptor left to poll - fileno() is -1,
-            # which poll refuses - and an open one is never out of range. So
-            # either of these means the same thing: nobody is there.
+            # fileno() is -1 on a closed socket, which poll refuses.
             self.went = f"{type(err).__name__}: {err}"
         return False
 
     def _open_stream(self, opening=b""):
-        """Answer the client now, before the prompt is read.
-
-        Reading runs for tens of minutes and sends nothing, and a client drops
-        a stream that goes quiet, so the reply starts before the read and is
-        kept alive through it.
-
-        The stream opens with whatever its protocol opens with. A keep-alive is
-        not that: it holds a stream open and starts nothing, and a client
-        waiting for a message that never started leaves."""
+        """Answer the client now, before the prompt is read: a read sends
+        nothing for tens of minutes, and a client drops a quiet stream. The
+        stream opens with its protocol's opening event, not a keep-alive."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -4471,12 +3730,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _ping_until(self):
-        """Fill the silence with keep-alives. Returns the way to stop.
-
-        Stopping joins the thread. A flag is not enough: the thread can be
-        part way through a chunk frame when the next writer starts, and a frame
-        carries its own length, so half of one makes the rest of the stream
-        unreadable. Both writers take the same lock."""
+        """Fill the silence with keep-alives. Returns the way to stop, which
+        joins the thread: a chunk frame carries its own length, so half a
+        frame makes the rest of the stream unreadable. Both writers take the
+        same lock."""
         stop = threading.Event()
         began = time.time()
         beat = ping_for(self.path.split("?")[0])
@@ -4489,8 +3746,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     try:
                         self._chunk(beat)
                     except Exception as err:
-                        # Without this the keep-alive stops silently and the
-                        # client times out with nothing said on either side.
+                        # Without this the keep-alive stops silently.
                         print(f"[router] keep-alive stopped after "
                               f"{time.time() - began:.0f}s: {err}", flush=True)
                         return
@@ -4505,14 +3761,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _say_and_end(self, message):
         """Put an error into a stream that has already started, and close it.
-
-        The stream opened with a message_start, so a bare data line is
-        nothing an anthropic parser can place. That protocol names an event
-        for a stream that ends badly, and this ends in it.
-
-        Under `sending`, like every other writer: the keep-alive thread can
-        still be running here, and a ping inside this frame is the
-        unreadable stream _ping_until's lock exists to prevent."""
+        An anthropic stream ends in its error event. Under `sending`: the
+        keep-alive thread may still be running."""
         print(f"[router] {message}", flush=True)
         if anthropic(self.path.split("?")[0]):
             event = sse_event("error", {"type": "error",
@@ -4532,14 +3782,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _forward(self, be, body, conv=None, opened=False):
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in DROP_HEADERS}
-        # llama-server 404s on a trailing slash, which clients joining a base
-        # url ending in /v1 with /models produce.
+        # llama-server 404s on a trailing slash, which a base url ending in
+        # /v1 joined with /models produces.
         path, sep, query = self.path.partition("?")
         target = (path.rstrip("/") or "/") + sep + query
-        # A streamed openai reply reports no usage unless asked, and usage is
-        # what the cache is measured in. So the router asks, reads the figures
-        # as they pass, and removes the chunk when the client did not ask. The
-        # anthropic route reports usage unprompted and needs only the tee.
+        # A streamed openai reply reports no usage unless asked. The router
+        # asks, reads the figures and removes the chunk when the client did
+        # not ask. The anthropic route reports usage unprompted.
         data, oai_tee = body or None, None
         if opened and body and not anthropic(path):
             if wants_usage(body):
@@ -4555,11 +3804,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             upstream = e                       # pass the backend error through
         except Exception as e:
-            # The same split every other error path here makes. With `opened`
-            # the status line went out half an hour ago, so _error would write
-            # a whole second HTTP response inside the chunked body in flight -
-            # unparseable, and it poisons the keep-alive connection for the
-            # request after it.
+            # With `opened` the status line went out long ago. A second HTTP
+            # response inside the chunked body poisons the connection.
             if opened:
                 return self._say_and_end(f"{be['name']}: {e}")
             return self._error(502, f"{be['name']}: {e}")
@@ -4569,17 +3815,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             print(f"[router] {be['name']} refused {self.path.split('?')[0]} "
                   f"with {upstream.status}: {shape}", flush=True)
             if opened:
-                # The reply started long ago, so there is no status left to
-                # send, and a refusal body is not an event: passing it through
-                # leaves a json object where an SSE frame should be.
+                # No status left to send, and a refusal body is not an event.
                 with upstream:
                     reason = said_in(upstream.read()) or upstream.reason
                 return self._say_and_end(f"{be['name']}: {reason}")
 
         with upstream:
-            # The reply may already have started, to give the client something
-            # to hold while the prompt was read. Then it is chunked and the
-            # headers are long gone.
+            # With `opened` the headers went out long ago.
             length = None if opened else upstream.headers.get("Content-Length")
             if not opened:
                 self.send_response(upstream.status)
@@ -4592,12 +3834,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
 
-            # read1 returns what arrived. read waits for a full buffer, which
-            # delays streamed tokens.
+            # read1 returns what arrived. read waits for a full buffer.
             read = getattr(upstream, "read1", upstream.read)
 
-            # The backend sends nothing while it reads, which can be an hour,
-            # and a client drops a stream quiet for five minutes.
+            # The backend sends nothing while it reads, which can be an hour.
+            # A client drops a stream quiet for five minutes.
             sending = self.sending or threading.Lock()
             done = threading.Event()
             last = [time.time()]
@@ -4620,7 +3861,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         try:
                             put(ping_for(self.path.split("?")[0]))
                         except Exception:
-                            return             # client left. The reader sees it too.
+                            return             # client left
 
             pinger = None
             streamed = wants_ping(upstream.headers.get("Content-Type"), length)
@@ -4628,8 +3869,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pinger = threading.Thread(target=keep_alive, daemon=True)
                 pinger.start()
 
-            # This stream began with a message_start of the router's own, so
-            # the backend's cannot be let through as well.
+            # The stream began with the router's own message_start.
             splice = (AnthropicSplice()
                       if opened and streamed and anthropic(path) else None)
 
@@ -4641,7 +3881,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if splice:
                         chunk = splice.feed(chunk)
                         if not chunk:
-                            continue           # a part event, or the one dropped
+                            continue           # partial, or the dropped one
                     elif oai_tee:
                         chunk = oai_tee.feed(chunk)
                         if not chunk:
@@ -4654,9 +3894,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     with sending:
                         put(left)
                 if splice and splice.reported:
-                    # What the client was finally told. These events pass
-                    # through here anyway, so it costs one dict read and
-                    # answers "did the cache read show up" for real turns.
                     names = {"input_tokens": "input", "output_tokens": "output",
                              "cache_read_input_tokens": "cache_read",
                              "cache_creation_input_tokens": "cache_write"}
@@ -4682,15 +3919,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(b"0\r\n\r\n")
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
-                pass                           # client left. The caller frees the slot.
+                pass                           # client left
             except (OSError, http.client.HTTPException) as err:
-                # The backend went away part way through the reply. The status
-                # line and some of the body are already on the wire, so there
-                # is no second reply to send: letting this reach _route's
-                # `except Exception` wrote a whole HTTP response *inside* the
-                # one in flight, which no client can parse and which poisons a
-                # keep-alive connection. Say it in the stream when the stream
-                # can carry it, and otherwise stop.
+                # The backend went away mid-reply. The status line is on the
+                # wire, so there is no second reply: reaching _route's handler
+                # wrote a whole HTTP response inside the one in flight.
                 print(f"[router] {be['name']} stopped mid-reply: {err}", flush=True)
                 done.set()
                 if pinger:
@@ -4698,7 +3931,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not length:
                     self._say_and_end(f"{be['name']}: {err}")
                 else:
-                    self.close_connection = True   # the body is short of its count
+                    self.close_connection = True   # body short of its count
             finally:
                 done.set()
 
@@ -4708,20 +3941,16 @@ class Server(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
 
     def server_bind(self):
-        # Accept IPv4 on the IPv6 socket. Tailscale gives a machine both, and
-        # macOS clients try the IPv6 one first.
+        # Accept IPv4 on the IPv6 socket. Tailscale gives a machine both,
+        # and macOS clients try IPv6 first.
         if self.address_family == socket.AF_INET6:
             self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         super().server_bind()
 
     def handle_error(self, request, address):
-        """A client hanging up is not an error worth a page of traceback.
-
-        Every client holds its connection open for a next request and drops it
-        when it has none. Python's request loop is reading the next request
-        line when that happens, so it raises and the default handler prints a
-        traceback. A healthy session leaves several in the log, which are the
-        first thing read when something really is wrong."""
+        """A client hanging up is not an error worth a traceback. Python's
+        request loop is reading the next request line when a client drops
+        its keep-alive connection."""
         if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError,
                                           ConnectionAbortedError)):
             return
@@ -4729,11 +3958,8 @@ class Server(http.server.ThreadingHTTPServer):
 
 
 class Stamped:
-    """Put the time in front of every line the router prints.
-
-    The log is read hours later, when the question is what happened when.
-    Every print in this file writes through this, so no call site has to
-    remember."""
+    """Put the time in front of every line the router prints. Every print
+    in this file goes through this."""
 
     def __init__(self, out):
         self.out = out
@@ -4764,19 +3990,14 @@ if __name__ == "__main__":
     stopping = threading.Event()
 
     def shut_down(signum, frame):
-        """Copy every live cache out before the backends go away.
-
-        A cache only exists in a slot. Stopping a backend throws it away, and
-        every conversation then reads its whole prompt again."""
+        """Copy every live cache out before the backends go away. A cache
+        only exists in a slot."""
         if stopping.is_set():
             sys.exit(1)           # a second signal means stop arguing
         stopping.set()
         print("[router] stopping, parking caches", flush=True)
-        # What the worker still holds, first. park_all skips a record that is
-        # being copied, and the worker is a daemon thread that the sys.exit
-        # below kills wherever it has got to - so without this a stop during a
-        # copy loses that copy, and costs that conversation its whole prompt.
-        # Free when the queue is empty, which it almost always is.
+        # The worker's copy first. park_all skips a record being copied, and
+        # sys.exit kills the daemon worker mid-copy.
         began = time.time()
         if not POOL.drain_parks(PARK_ALL_TIMEOUT):
             print("[router] a copy on the worker did not land in time",
@@ -4787,9 +4008,7 @@ if __name__ == "__main__":
         kept = POOL.save_pins()
         print(f"[router] parked {parked} conversation(s), wrote {kept} pin(s)",
               flush=True)
-        # The writer is a daemon thread, so sys.exit drops whatever is still
-        # queued - and this is the largest batch of park rows the router ever
-        # writes, the one tools/cache-report.py reads to say what a stop cost.
+        # sys.exit drops what the daemon writer still holds.
         EVENTS.flush()
         sys.exit(0)
 
