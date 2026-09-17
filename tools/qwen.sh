@@ -7,7 +7,7 @@ MODEL=$MODEL_Q6
 SERVER=$SERVER_MAIN
 ALIAS=qwen3.8-flash-next
 
-CPU_MOE=46    # expert layers kept in RAM; 48 = all, leaving max VRAM for context
+CPU_MOE=46    # expert layers in RAM. 48 = all, most VRAM left for context
 
 ARGS=(
   --n-cpu-moe "$CPU_MOE"

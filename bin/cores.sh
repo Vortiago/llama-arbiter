@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # cores_on_node <node> -- physical cores on one NUMA node.
 #
-# Counted rather than written down, so the tree runs anywhere. A thread per
-# hyperthread would put two threads on one core, which is slower than one.
-# Falls back to nproc: right on a single-node machine, too high on any other,
-# so set THREADS where there is no lscpu.
+# One thread per hyperthread puts two threads on one core, which is slower
+# than one. Without lscpu this falls back to nproc: right on a single-node
+# machine, too high on any other. Set THREADS there.
 cores_on_node() {
   local count
   count=$(lscpu -p=Core,Node 2>/dev/null |

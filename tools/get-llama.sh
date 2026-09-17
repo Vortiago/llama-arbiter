@@ -3,15 +3,12 @@
 #
 #   tools/get-llama.sh                 clone, patch, build
 #   BUILD=0 tools/get-llama.sh         clone and patch, stop before cmake
-#   LLAMA_REF=<commit> tools/...       pin upstream instead of taking its tip
-#   CUDA=0 tools/get-llama.sh          build without CUDA, however the box looks
+#   LLAMA_REF=<commit> tools/...       pin upstream instead of its tip
+#   CUDA=0 tools/get-llama.sh          build without CUDA
 #   CMAKE_ARGS='-DGGML_HIPBLAS=ON' …   anything else cmake needs
 #
-# It lands at llama.cpp-mtp/build/bin/llama-server, which is what SERVER_MTP
-# already defaults to, so a box with an nvidia card needs no config for it.
-#
-# Safe to run again: a patch already in the tree is skipped rather than failing
-# the rest, so this is also how to re-apply them after moving upstream.
+# The build lands at llama.cpp-mtp/build/bin/llama-server, the default
+# SERVER_MTP. Safe to run again: a patch already in the tree is skipped.
 set -euo pipefail
 
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
@@ -45,9 +42,8 @@ patches=("$ROOT"/patches/*.patch)
 shopt -u nullglob
 (( ${#patches[@]} )) || die "no patches in $ROOT/patches"
 
-# One at a time, and reverse-checked first: an already-applied patch is a
-# re-run, not a failure. Only a patch that will neither apply nor un-apply is
-# a real problem, and then upstream has moved under it.
+# Reverse-check first: an already-applied patch is a re-run, not a failure.
+# A patch that neither applies nor un-applies means upstream has moved.
 applied=0 already=0
 for patch in "${patches[@]}"; do
   name=${patch##*/}
@@ -71,10 +67,9 @@ if [[ ${BUILD:-1} != 1 ]]; then
   exit 0
 fi
 
-# CUDA when the box has a working nvidia driver and nothing says otherwise.
-# Every other accelerator is somebody else's flag, which is what CMAKE_ARGS is
-# for. Written as an if rather than a && chain because `set -e` takes the
-# failure of the last command in a chain as the script failing.
+# CUDA when nvidia-smi sees a card and CUDA is unset. Other accelerators go
+# through CMAKE_ARGS. An `if`, not a `&&` chain: `set -e` exits on the failure
+# of the last command in a chain.
 if [[ -z ${CUDA:-} ]]; then
   CUDA=0
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then

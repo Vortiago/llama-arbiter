@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # Process control shared by the start and restart scripts. Source it after
-# bin/common.sh, which has already read config.local.sh.
+# bin/common.sh.
 
 RUN=${RUN:-$ROOT/run}
 ROUTER_PORT=${ROUTER_PORT:-8090}
 
-# Keep the last run's log: a restart is exactly when the question is what the
-# run before it did, and the tools that read these logs read whole files.
+# Keep the last run's log. A restart is when it is needed, and the tools that
+# read these logs read whole files.
 keep_log() { [[ -f $RUN/$1.log ]] && mv -f "$RUN/$1.log" "$RUN/$1.log.prev"; return 0; }
 
 alive() { [[ -f $RUN/$1.pid ]] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
 
-# Is this pid still what we started? A pid file goes stale the moment anyone
-# starts a server by hand, and Linux reuses pids.
+# Is this pid still what we started? A pid file goes stale when anyone starts
+# a server by hand, and Linux reuses pids.
 ours() {
   local cmd
   cmd=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
   [[ $cmd == *llama-server* || $cmd == *router.py* || $cmd == *qwen-mtp* ]]
 }
 
-# Who holds a port, by asking the kernel rather than a file.
+# Who holds a port, from the kernel rather than a file.
 pid_on_port() {
   ss -ltnp 2>/dev/null | grep ":$1 " | grep -o 'pid=[0-9]*' | cut -d= -f2 | head -1
 }
@@ -34,9 +34,8 @@ wait_for() { # wait_for <port> <name> <seconds> [path]
   echo "$name did not start within ${limit}s" >&2; return 1
 }
 
-# The one place the router is launched, so start-all.sh and restart-router.sh
-# cannot drift apart on its flags. Both reach it having sourced common.sh, which
-# is what puts ROUTER_BACKENDS in the environment.
+# The one place the router starts. Source common.sh first: it reads
+# config.local.sh, which exports ROUTER_BACKENDS.
 start_router() {
   keep_log router
   nohup python3 "$ROOT/bin/router.py" --host "${ROUTER_HOST:-::}" \

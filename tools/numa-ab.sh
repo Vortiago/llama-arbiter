@@ -8,11 +8,9 @@ ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 
 MODEL=${MODEL:-${MODELS:-$ROOT/models}/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}
 SERVER=${SERVER:-$ROOT/llama.cpp-mtp/build/bin/llama-server}
-# Not 8080: that is the production backend's port in both the shipped default
-# table and backends.local.json, and stop_server below kills whatever is
-# listening. Running this with no arguments took the live gpu backend down and
-# left every conversation pinned to it without its cache. tests/live/harness.py
-# skips 8080-8083 and 8090 for the same reason.
+# Not 8080: that is the production backend's port, and stop_server kills
+# whatever listens on PORT. tests/live/harness.py skips 8080-8083 and 8090
+# for the same reason.
 PORT=${PORT:-18080}
 LOG_DIR=${LOG_DIR:-/tmp/numa-ab}
 started=
@@ -23,25 +21,22 @@ SERVER_FLAGS=(--model "$MODEL" --n-gpu-layers 99 --load-mode none --n-cpu-moe 46
               --numa numactl --ctx-size 32768 --flash-attn on --parallel 1
               --host 127.0.0.1 --port "$PORT")
 
-# ignore_eos forces exactly n_predict tokens so decode is always measured;
+# ignore_eos forces exactly n_predict tokens: decode is always measured.
 # cache_prompt false makes every config redo the same prefill work.
 REQUEST=$(python3 -c "import json; print(json.dumps(
   {'prompt': 'The quick brown fox jumps over the lazy dog. ' * 200,
    'n_predict': 200, 'ignore_eos': True, 'cache_prompt': False}))")
 
-# Ask the socket who is listening, the way bin/restart-backend.sh does. A
-# pattern match on the binary path hits every llama-server on the box, and the
-# production backends run the same binary: `pkill -f "$SERVER"` here killed all
-# four of them, and anything else whose command line mentions the path.
+# Ask the socket who listens. A pattern match on the binary path hits every
+# llama-server on the box, and the production backends run the same binary.
 server_pid()     { ss -ltnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | cut -d= -f2 | head -1; }
 server_running() { local p; p=$(server_pid); [[ -n $p ]] && kill -0 "$p" 2>/dev/null; }
 server_ready()   { curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; }
 port_busy()      { ss -ltn 2>/dev/null | grep -q ":$PORT "; }
 
-# Only ever the server this script started. `started` is the pid the launch
-# below handed back; without it, something else owns the port and this script
-# has no business signalling it - the production backends run the same binary,
-# so a cmdline check like bin/run-lib.sh's `ours` could not tell them apart.
+# Signal only the server this script started: `started` is the pid the launch
+# handed back. A cmdline check like `ours` in bin/run-lib.sh cannot tell this
+# server from a production backend.
 stop_server() {
   local pid deadline=$((SECONDS + STOP_TIMEOUT))
   pid=$(server_pid)
