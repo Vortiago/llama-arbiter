@@ -1,8 +1,8 @@
 # Patches to llama.cpp
 
-Changes to the fork in `../llama.cpp-mtp`, kept apart so each can be read and
-offered upstream on its own. Apply with `git apply patches/<name>.patch` from
-inside `llama.cpp-mtp`.
+Changes to llama.cpp, kept apart so each can be read and offered upstream on
+its own. `tools/get-llama.sh` clones a checkout and applies all of them; to
+apply one by hand, `git apply <name>.patch` from inside that checkout.
 
 ## slot-state-carries-checkpoints.patch
 

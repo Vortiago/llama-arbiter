@@ -28,13 +28,16 @@ openings a new session starts from.
 not optional: `slot-state-carries-checkpoints` is what lets a restored slot be
 extended without re-reading, `slots-report-the-prompt-size` is what the
 dashboard's "still to read" is computed from, and `anthropic-pass-id-slot` is
-how the router names a slot on `/v1/messages`. Build a checkout beside this one
-and point `SERVER_MTP` at it:
+how the router names a slot on `/v1/messages`.
 
-    git clone https://github.com/ggml-org/llama.cpp llama.cpp-mtp
-    cd llama.cpp-mtp
-    for p in ../patches/*.patch; do git apply "$p"; done
-    cmake -B build -DGGML_CUDA=ON && cmake --build build -j --target llama-server
+    tools/get-llama.sh
+
+clones llama.cpp beside this checkout, applies the patches and builds
+`llama-server` at the path `SERVER_MTP` already defaults to, so a box with an
+nvidia card needs no configuring for it. `BUILD=0` stops before cmake,
+`CUDA=0` and `CMAKE_ARGS` build it some other way, and `LLAMA_REF` pins an
+upstream commit if its tip has moved under the patches. Running it again is
+safe: a patch already in the tree is skipped rather than reapplied.
 
 The launch scripts also pass `--agent`, `--no-cache-idle-slots`,
 `--ctx-checkpoints`, `--checkpoint-min-step`, `--n-cpu-moe` and `--spec-type
