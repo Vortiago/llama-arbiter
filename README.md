@@ -9,6 +9,12 @@ them, and keeps the system-prompt openings every new session would otherwise
 read for itself. Measured over one afternoon: the gpu backend read 80 prompt
 tokens and reused 2,035,350.
 
+![The flow view: a turn moving left to right from arriving, through reading on three cpu backends, to parked on disk, to generating on the gpu, above a strip of every conversation's cache on disk and the shelf of saved system prompts.](docs/flow.png)
+
+The dashboard's **flow** view, on the router's own port. Left to right is one
+turn's journey; below it, every cache on disk against its budget, and the saved
+openings a new session starts from.
+
     ./start-all.sh      start the backends and the router
     ./stop-all.sh       stop them
 
