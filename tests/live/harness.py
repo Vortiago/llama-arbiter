@@ -404,7 +404,7 @@ class LiveCase(unittest.TestCase):
         """One instance, sharing this test's slot directory and log directory.
 
         Every instance writes <name>.log into the same root, which is what the
-        router's CacheWatch expects to find under RUN_DIR, and they share one
+        router's CacheWatch expects to find in the store's run directory, and
         --slot-save-path so a state saved on one can be restored on another.
         """
         kw.setdefault("kind", self.KIND)

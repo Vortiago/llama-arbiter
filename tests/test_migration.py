@@ -240,7 +240,8 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
                                  for n, v in self.kept.items()])
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.pool = router.Pool([{"name": "cpu", "url": "http://cpu",
-                                  "pref": 0}], watch=False)
+                                  "pref": 0}],
+                                store=router.STORE, watch=False)
         self.be = self.pool.backends[0]
         self.be.update(slots=4, slots_detail=[{"id": i, "busy": False}
                                               for i in range(4)])
@@ -1518,7 +1519,6 @@ class PrefixCase:
     CUTS = [(0, "k1"), (1, "k2"), (2, "k3")]
 
     def setUp(self):
-        # Before the Pool: it takes its store when it is built.
         root = Path(tempfile.mkdtemp())
         (root / "slots").mkdir()
         self.was = router.STORE
@@ -1526,7 +1526,8 @@ class PrefixCase:
         self.addCleanup(shutil.rmtree, root)
         self.addCleanup(self.put_back)
         self.pool = router.Pool(
-            [{"name": "cpu", "url": "http://cpu", "pref": 0}], watch=False)
+            [{"name": "cpu", "url": "http://cpu", "pref": 0}],
+            store=router.STORE, watch=False)
         self.cpu = self.pool.backends[0]
         self.cpu.update(up=True, slots=3, n_ctx=150000,
                         slots_detail=[{"id": 0, "busy": True},
@@ -2205,7 +2206,6 @@ class ShutDownCleanly(unittest.TestCase):
     conversation reads its whole prompt again when it comes back."""
 
     def setUp(self):
-        # Before the Pool: it takes its store when it is built.
         self.root = Path(tempfile.mkdtemp())
         self.was = router.STORE
         router.STORE = router.Store(self.root)
@@ -2213,7 +2213,8 @@ class ShutDownCleanly(unittest.TestCase):
         self.addCleanup(self.put_back)
         self.pool = router.Pool(
             [{"name": "gpu", "url": "http://gpu", "pref": 0},
-             {"name": "cpu", "url": "http://cpu", "pref": 1}], watch=False)
+             {"name": "cpu", "url": "http://cpu", "pref": 1}],
+            store=router.STORE, watch=False)
         self.gpu, self.cpu = self.pool.backends
         self.gpu.update(up=True, slots=1, n_ctx=150000)
         self.cpu.update(up=True, slots=3, n_ctx=150000)
@@ -2262,10 +2263,13 @@ class ShutDownCleanly(unittest.TestCase):
         self.assertEqual(router.STORE.read_pins(), [])
 
     def test_reads_nothing_when_there_is_no_pin_file(self):
-        self.assertEqual(router.Store._rows(self.root / "gone.json"), [])
+        self.assertEqual(router.Store(self.root / "empty").read_pins(), [])
 
     def test_reads_nothing_from_a_damaged_pin_file(self):
-        (self.root / "pins.json").write_bytes(b"not json")
+        """The branch that matters most. A pin file adopt() half believes is
+        how every copy it does not name gets deleted."""
+        router.STORE.slots.mkdir(parents=True, exist_ok=True)
+        (router.STORE.slots / "pins.json").write_bytes(b"not json")
         self.assertEqual(router.STORE.read_pins(), [])
 
 
@@ -2297,7 +2301,7 @@ class ComeBackAfterRestart(unittest.TestCase):
         (router.STORE.slots / "pins.json").write_text(json.dumps(
             [{"conv": "a", "file": "a.park", "tokens": 99, "cuts": [[0, "k1"]]}]))
         pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
-                           watch=False)
+                           store=router.STORE, watch=False)
         pool.adopt(["a.park"], remove=lambda name: None)
         self.assertEqual(pool.pins["a"]["parked"], "a.park")
         self.assertEqual(pool.pins["a"]["tokens"], 99)
@@ -2342,7 +2346,7 @@ class ComeBackAfterRestart(unittest.TestCase):
         self.addCleanup(lambda: setattr(router, "STORE", was))
         (router.STORE.slots / "openings.json").write_text(json.dumps(openings))
         pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
-                           watch=False)
+                           store=router.STORE, watch=False)
         pool.adopt(list(names), remove=lambda name: None)
         return pool
 
@@ -2365,7 +2369,7 @@ class ComeBackAfterRestart(unittest.TestCase):
         (router.STORE.slots / "pins.json").write_text(json.dumps(
             [{"conv": "a", "file": "a.park", "tokens": 99, "cuts": []}]))
         pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
-                           watch=False)
+                           store=router.STORE, watch=False)
         pool.adopt(["a.park"], remove=lambda name: None)
         self.assertNotEqual(pool.pins["a"]["backend"], "cpu")
 
@@ -2377,17 +2381,18 @@ class DrainABackend(unittest.TestCase):
     and started under them. What must not be lost is the caches in its slots."""
 
     def setUp(self):
-        self.pool = router.Pool(
-            [{"name": "gpu", "url": "http://gpu", "pref": 0},
-             {"name": "cpu", "url": "http://cpu", "pref": 1}], watch=False)
-        self.gpu, self.cpu = self.pool.backends
-        self.gpu.update(up=True, slots=1, n_ctx=150000)
-        self.cpu.update(up=True, slots=3, n_ctx=150000)
         self.root = Path(tempfile.mkdtemp())
         self.was = router.STORE
         router.STORE = router.Store(self.root)
         self.addCleanup(shutil.rmtree, self.root)
         self.addCleanup(lambda: setattr(router, "STORE", self.was))
+        self.pool = router.Pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1}],
+            store=router.STORE, watch=False)
+        self.gpu, self.cpu = self.pool.backends
+        self.gpu.update(up=True, slots=1, n_ctx=150000)
+        self.cpu.update(up=True, slots=3, n_ctx=150000)
 
     def saver(self, written=200_000_000):
         return FakePost(written=written)
@@ -2457,21 +2462,22 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
     runs there; nothing in the rule is about the hardware."""
 
     def setUp(self):
-        self.pool = router.Pool(
-            [{"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": False, "generate": True},
-             {"name": "cpu", "url": "http://cpu", "pref": 1, "prefill": True, "generate": True},
-             {"name": "cpu2", "url": "http://cpu2", "pref": 2, "prefill": True, "generate": True}],
-            watch=False)
-        self.gpu, self.cpu, self.cpu2 = self.pool.backends
-        for be in self.pool.backends:
-            be.update(up=True, slots=1, n_ctx=150000)
         # The builder test reaches _read_prefix, which links a file into the
-        # slot directory. Without this it writes into the running router's own.
+        # slot directory. The pool is given this store, so that link cannot
+        # land in a running router's own.
         root = Path(tempfile.mkdtemp())
         (root / "slots").mkdir()
         self.was = router.STORE
         router.STORE = router.Store(root)
         self.addCleanup(shutil.rmtree, root)
+        self.pool = router.Pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": False, "generate": True},
+             {"name": "cpu", "url": "http://cpu", "pref": 1, "prefill": True, "generate": True},
+             {"name": "cpu2", "url": "http://cpu2", "pref": 2, "prefill": True, "generate": True}],
+            store=router.STORE, watch=False)
+        self.gpu, self.cpu, self.cpu2 = self.pool.backends
+        for be in self.pool.backends:
+            be.update(up=True, slots=1, n_ctx=150000)
         self.addCleanup(lambda: setattr(router, "STORE", self.was))
 
     def test_a_new_conversation_is_not_read_on_the_gpu(self):
@@ -3190,7 +3196,6 @@ class ACopyIsMeasuredOnTheDisk(unittest.TestCase):
     tests/live/test_llama_beliefs.py asserts the two agree on a real one."""
 
     def setUp(self):
-        # Before the Pool: it takes its store when it is built.
         root = Path(tempfile.mkdtemp())
         (root / "slots").mkdir()
         self.was = router.STORE
@@ -3198,7 +3203,7 @@ class ACopyIsMeasuredOnTheDisk(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root)
         self.addCleanup(lambda: setattr(router, "STORE", self.was))
         self.pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
-                                watch=False)
+                                store=router.STORE, watch=False)
         self.cpu = self.pool.backends[0]
         self.cpu.update(up=True, slots=1, n_ctx=150000)
         self.pool.pins["a"] = pin("cpu", slot=0)

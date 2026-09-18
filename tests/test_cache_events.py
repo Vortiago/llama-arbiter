@@ -132,7 +132,8 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         router.STORE = router.Store(self.dir)
         router.STORE.slots.mkdir(parents=True, exist_ok=True)
         self.pool = router.Pool([{"name": "cpu", "url": "http://cpu",
-                                  "pref": 0}], watch=False)
+                                  "pref": 0}],
+                                store=router.STORE, watch=False)
 
     def tearDown(self):
         router.EVENTS = self.old

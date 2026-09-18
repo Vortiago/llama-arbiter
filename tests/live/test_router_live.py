@@ -96,10 +96,12 @@ class LiveRouter(LiveCase):
                       "HANDOFF_ON")}
         self.had_pool = getattr(router, "POOL", None)
         router.HANDOFF_ON = self.HANDOFF
-        # The backends share this test's slot directory, and a backend only
-        # takes a bare filename under its own --slot-save-path.
-        # Every instance writes <name>.log here, which is where CacheWatch
-        # looks, so the cache counters are read off a real log for once.
+        # One store over this test's whole run directory. The backends share
+        # its slot directory, because a backend takes only a bare filename
+        # under its own --slot-save-path. Every instance also writes
+        # <name>.log there, which is where CacheWatch looks, so the cache
+        # counters are read off a real log for once. harness.Server builds
+        # both paths the same way from the same root.
         router.STORE = router.Store(self.root)
         router.STORE.slots.mkdir(parents=True, exist_ok=True)
         router.POLL = 0.2

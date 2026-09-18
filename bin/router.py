@@ -99,7 +99,7 @@ SYSTEM_MIN_CHARS = 2000   # the only cut two sessions share. Claude Code
                           # sends 6,100 characters: a minute to read, a
                           # fifth of a second to load from disk.
 # Disk for the saved openings, in bytes. One block is 0.6 to 3.7 GB. Least
-# recently used goes first. Size it to the disk BLOCK_DIR is on.
+# recently used goes first. Size it to the disk the blocks are on.
 BLOCK_BUDGET = int(float(os.environ.get("BLOCK_BUDGET_GB") or 64) * 1024 ** 3)
 # Deeper openings: a cut where two conversations diverge. Off by default:
 # over two days of real traffic it was built 0 times and loaded 0 times.
@@ -373,8 +373,8 @@ class Store:
             self.slots.mkdir(parents=True, exist_ok=True)
             self.blocks.mkdir(parents=True, exist_ok=True)
         except OSError as err:
-            print(f"[router] {self.blocks} is not usable, keeping blocks with "
-                  f"the rest: {err}", flush=True)
+            print(f"[router] cannot make {self.slots} and {self.blocks}, "
+                  f"keeping blocks with the rest: {err}", flush=True)
             return
         if link.is_symlink() or link.exists():
             link.unlink()
