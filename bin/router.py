@@ -59,11 +59,9 @@ def prefills(be):
     """May a new conversation have its prompt read on this backend."""
     return be.get("prefill", True)
 
-
 def generates(be):
     """May a reply be generated on this backend."""
     return be.get("generate", True)
-
 
 MAX_PINS      = 512    # conversations to remember
 FORWARD_TIMEOUT = 7200.0  # longest a backend may take to answer a request
@@ -149,12 +147,10 @@ PASSED |= {p.strip() for p in os.environ.get("PASS_THROUGH", "").split(",")
 DROP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "te", "trailers",
                 "transfer-encoding", "upgrade", "content-length", "host"}
 
-
 # Printed under "vision hparams" at load. Pool.vision() reads the real value.
 VISION = {"patch_size": 16, "n_merge": 2,
           "image_min_pixels": 8192, "image_max_pixels": 4194304}
 HEADER_B64 = 98304                        # base64 to decode looking for a size
-
 
 def image_size(head):
     """Width and height from the front of an image file, or None."""
@@ -190,7 +186,6 @@ def image_size(head):
             i += 2 + int.from_bytes(head[i + 2:i + 4], "big")
     return None
 
-
 def image_tokens(payload, vision=None):
     """What a backend charges for one base64 image.
 
@@ -223,7 +218,6 @@ def image_tokens(payload, vision=None):
         w_bar, h_bar = max(align, up(w * beta)), max(align, up(h * beta))
     return (w_bar // align) * (h_bar // align)
 
-
 def images_in(body):
     """Every base64 image in a request body, whichever api sent it."""
     def walk(node):
@@ -252,7 +246,6 @@ def images_in(body):
     except Exception:
         return []
 
-
 def request_cost(body, vision=None):
     """(tokens this request needs, pictures it carries, what they cost).
 
@@ -265,11 +258,9 @@ def request_cost(body, vision=None):
         count += 1
     return int(max(0, text) / CHARS_PER_TOK) + charged + REPLY_TOKENS, count, charged
 
-
 def token_estimate(body, vision=None):
     """Tokens this request needs. The first of request_cost's three."""
     return request_cost(body, vision)[0]
-
 
 def conversation_id(body):
     """Identify a conversation by its opening: the system messages and the
@@ -305,21 +296,15 @@ def conversation_id(body):
         return None
     return hashlib.sha256(start.encode("utf-8", "replace")).hexdigest()
 
-
 WEB = Path(__file__).with_name("web")          # the dashboard, a static app
 
-
 class Store:
-    """Everything one run keeps on disk: the conversation copies, the saved
-    openings, the two maps that say what they are, and the backend logs.
+    """Everything one run keeps on disk: the parked copies, the openings,
+    the two maps that say what they are, and the backend logs.
 
-    A caller names a file. Where that file lives is this class's business
-    and nothing outside it reads a directory. That is deliberate: these
-    were module globals, and every test redirected them by assignment. That
-    works only while the readers live in the same module, so the first time
-    one moved out the redirect would have kept the suite green while it
-    wrote into the live run/slots -- where a stray pins.json is adopt()'s
-    instruction to delete every conversation copy it does not name.
+    A caller names a file. Where that file lives is this class's business.
+    Nothing outside it reads a directory, so nothing outside it can be
+    pointed at a live router's run/slots.
     """
 
     def __init__(self, run_dir, block_dir=None):
@@ -328,14 +313,12 @@ class Store:
         # must name the same directory.
         self.slots = self.run / "slots"
         # Openings go on the faster disk where there are two, under
-        # BLOCK_BUDGET. Conversation copies stay under run, under
+        # BLOCK_BUDGET. Parked copies stay under the run directory, under
         # PARK_BUDGET.
         self.blocks = Path(block_dir) if block_dir else self.run / "blocks"
 
     def __repr__(self):
         return f"Store({str(self.run)!r}, {str(self.blocks)!r})"
-
-    # -- one file ---------------------------------------------------------
 
     def size(self, name):
         """Bytes in one slot file, or 0 when it is gone."""
@@ -382,10 +365,8 @@ class Store:
         # directory.
         link.symlink_to(self.blocks.resolve() / name)
 
-    # -- what the last run left -------------------------------------------
-
     def parked_names(self):
-        """Every copy the last run left, oldest first, dropping the links
+        """Every parked copy the last run left, oldest first. Drops a link
         whose target is already gone."""
         if not self.slots.is_dir():
             return []
@@ -397,8 +378,6 @@ class Store:
             else:
                 found.unlink(missing_ok=True)   # a dangling link
         return names
-
-    # -- the two maps -----------------------------------------------------
 
     def read_pins(self):
         """The pin rows the last run wrote."""
@@ -439,16 +418,15 @@ class Store:
             spare.unlink(missing_ok=True)
             return False
 
-    # -- the rest of what a run writes ------------------------------------
-
     def log(self, name):
-        """A backend's own log. The router reads it for the settings it was
-        started with, and for the cache lines only it reports."""
+        """A backend's own log. The router reads it for the settings that
+        backend started with. It also reads the cache lines that appear in no
+        other file."""
         return self.run / f"{name}.log"
 
     def disks(self):
-        """Free space on the disks the slot files land on. One row a disk:
-        slots and blocks are often the same one."""
+        """Free space on the disks the slot files land on. One row for each
+        disk. Slots and blocks are often on the same one."""
         rows, seen = [], set()
         for path in (self.slots, self.blocks):
             try:
@@ -463,10 +441,9 @@ class Store:
                 continue
         return rows
 
-
-# Everything a run writes. RUN comes from bin/common.sh. One store is built
-# here so that importing this module reads the environment once; a test
-# builds its own on a temporary directory and hands it to Pool.
+# Everything a run writes. RUN comes from bin/common.sh. This module builds
+# one store at import, so that it reads the environment once. A test builds
+# its own on a temporary directory and hands it to Pool.
 STORE = Store(os.environ.get("RUN")
               or Path(__file__).resolve().parent.parent / "run",
               os.environ.get("BLOCK_DIR"))
@@ -483,8 +460,6 @@ CACHE_LOG_DIR = Path(os.environ.get("CACHE_LOG_DIR") or STORE.run)
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8",  ".json": "application/json",
         ".svg": "image/svg+xml", ".ico": "image/x-icon", ".map": "application/json"}
-
-
 
 EVICTED_RE = re.compile(r"removing oldest entry \(size = ([\d.]+) MiB\)")
 SKIPPED_RE = re.compile(r"prompt state size ([\d.]+) MiB exceeds cache size limit")
@@ -504,7 +479,6 @@ CHECKPOINT_RE = re.compile(r"restored context checkpoint \(pos_min = \d+, "
 MAPPED_RE = re.compile(r"CPU_Mapped model buffer size = +([\d.]+) MiB")
 LAZY_RE = re.compile(r"add: tensor \S+ \(size = +([\d.]+) MiB\) lazy read enabled")
 
-
 CONFIG_RE = re.compile(r"(n_ctx|n_batch|n_ubatch|kv_unified|n_slots)\s*=\s*"
                        r"'?([\w.]+)'?")
 CONFIG_KEYS = ("n_ctx", "n_batch", "n_ubatch", "kv_unified", "n_slots")
@@ -514,14 +488,11 @@ CONFIG_KEYS = ("n_ctx", "n_batch", "n_ubatch", "kv_unified", "n_slots")
 VISION_RE = re.compile(r"\b(patch_size|n_merge|image_min_pixels|image_max_pixels)"
                        r"\b\s*[:=]\s*(\d+)")
 
-
 RATE_FLOOR = 1.0     # seconds. Under this a count is not a rate.
-
 
 def per_second(tokens, seconds):
     """A rate, or zero when there is not enough time to divide by."""
     return round(tokens / seconds, 1) if seconds and seconds >= RATE_FLOOR else 0
-
 
 def read_config(lines):
     """The settings a backend started with, from its log. llama-server does
@@ -543,7 +514,6 @@ def read_config(lines):
                 found[key] = raw
     return found
 
-
 def read_vision(lines):
     """The vision encoder's geometry from a backend's startup log, or None
     when any part of it is missing."""
@@ -555,7 +525,6 @@ def read_vision(lines):
     if set(found) != set(VISION) or not all(found.values()):
         return None
     return found
-
 
 def cache_event(line):
     """Classify one backend log line, or return None.
@@ -590,7 +559,6 @@ def cache_event(line):
         return "state", (int(found.group(1)), float(found.group(2)),
                          float(found.group(3)))
     return None
-
 
 class CacheWatch:
     """Follow one backend log and total what it says about the prompt cache.
@@ -674,7 +642,6 @@ class CacheWatch:
                 prompts, used, limit = value
                 self.stats.update(prompts=prompts, used_mib=used, limit_mib=limit)
 
-
 class EventLog:
     """Append cache events to a dated JSONL file. Telemetry, not data: a
     thread writes, and a full queue drops the newest event."""
@@ -729,10 +696,8 @@ class EventLog:
         self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         self.handle.flush()
 
-
 # Tests replace this with an EventLog on a temporary directory.
 EVENTS = EventLog()
-
 
 # Client configs the dashboard offers, built for the address the reader used.
 CONFIG_FILES = {"opencode": "opencode.json", "claude": "settings.json"}
@@ -740,16 +705,13 @@ CONFIG_FILES = {"opencode": "opencode.json", "claude": "settings.json"}
 # Names the machine in an OpenCode config. PROVIDER overrides the hostname.
 PROVIDER = os.environ.get("PROVIDER") or socket.gethostname().split(".")[0] or "llama"
 
-
 HOST_RE = re.compile(r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$")
-
 
 def host_only(host):
     """A Host header that is only a host and a port, or None. It goes into
     a client config the reader keeps for months, and anyone can set it."""
     host = (host or "").strip()
     return host if HOST_RE.match(host) else None
-
 
 def client_config(kind, host, model, n_ctx):
     """Build a client config for this router, or return None.
@@ -830,16 +792,13 @@ def client_config(kind, host, model, n_ctx):
         }
     return None
 
-
 # Opening file-name prefixes. A conversation key must not start with one.
 SHELF_MARKS = ("base-", "deep-")
-
 
 def copy_is_current(record):
     """True when the copy on disk is of the turn the conversation last ran.
     An older copy is a prefix, not a replacement for a newer one."""
     return bool(record.get("parked")) and record.get("parked_turn") == record.get("turns")
-
 
 def file_safe(key):
     """A conversation key that also works as a file name.
@@ -856,20 +815,17 @@ def file_safe(key):
     safe = safe[-200:].strip("-. ") or "conversation"
     return "c-" + safe if safe.startswith(SHELF_MARKS) else safe
 
-
 def short_key(conv):
     """A conversation key short enough to read. A subagent's key ends in
     its agent id, so both ends show."""
     conv = conv or ""
     return conv[:8] if len(conv) <= 36 else f"{conv[:8]}/{conv[-6:]}"
 
-
 def mark_shelf(mark):
     """The shelf of a "base-" / "deep-" mark or a want record. Marks keep
     their dash for file names."""
     mark = mark.get("mark") if isinstance(mark, dict) else mark
     return (mark or "deep-").rstrip("-")
-
 
 def session_key(headers):
     """Name the conversation from Claude Code's session headers, or None. A
@@ -882,7 +838,6 @@ def session_key(headers):
     # The key names a slot file. A colon is not allowed in one.
     return file_safe(f"{session}-{agent}") if agent else file_safe(session)
 
-
 def client_kind(headers):
     """Which client sent this, by its user agent, or None."""
     agent = (dict(headers).get("User-Agent") or "").lower()
@@ -892,29 +847,24 @@ def client_kind(headers):
         return "opencode"
     return agent.split("/")[0][:24] or None
 
-
 # A keep-alive must be in the client's protocol. A comment keeps an OpenAI
 # stream alive. An anthropic parser reports a stream with only comments as
 # ended before any data. That protocol has a ping event.
 PING = b": ping\n\n"
 ANTHROPIC_PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 
-
 def anthropic(path):
     """True for the endpoint that speaks the anthropic protocol."""
     return "/messages" in (path or "")
-
 
 def ping_for(path):
     """The keep-alive this endpoint's client understands."""
     return ANTHROPIC_PING if anthropic(path) else PING
 
-
 def sse_event(name, data):
     """One named SSE event, laid out as the backends lay theirs out."""
     return (f"event: {name}\ndata: ".encode()
             + json.dumps(data).encode() + b"\n\n")
-
 
 def read_event(raw):
     """The name and the json of one SSE event, or (None, None)."""
@@ -931,7 +881,6 @@ def read_event(raw):
     except ValueError:
         return None, None
     return (name, fields) if isinstance(fields, dict) else (None, None)
-
 
 def opening_event(path, body):
     """The event a stream of this protocol must begin with, or nothing.
@@ -951,7 +900,6 @@ def opening_event(path, body):
                     "role": "assistant", "model": model or "unknown",
                     "content": [], "stop_reason": None, "stop_sequence": None,
                     "usage": {"input_tokens": 0, "output_tokens": 0}}})
-
 
 class AnthropicSplice:
     """Join a backend's stream onto one the router has already opened.
@@ -997,14 +945,12 @@ class AnthropicSplice:
             return sse_event(name, data)
         return raw
 
-
 def wants_ping(content_type, content_length):
     """True when extra bytes can be inserted into this reply safely: only a
     streamed event stream."""
     if content_length:
         return False
     return "text/event-stream" in (content_type or "")
-
 
 def wants_usage(body):
     """True when an openai stream request asked for the usage chunk itself."""
@@ -1014,7 +960,6 @@ def wants_usage(body):
         return False
     opts = fields.get("stream_options") if isinstance(fields, dict) else None
     return bool(isinstance(opts, dict) and opts.get("include_usage"))
-
 
 def with_usage(body):
     """A copy of the body with stream_options.include_usage set, or None. A
@@ -1034,7 +979,6 @@ def with_usage(body):
         return json.dumps(fields).encode()
     except (TypeError, ValueError):
         return None
-
 
 class OaiUsageSplice:
     """Read the usage figures out of an openai stream as they pass. The
@@ -1073,7 +1017,6 @@ class OaiUsageSplice:
                     return b""
         return raw
 
-
 def prompt_key(body):
     """Name the conversation from prompt_cache_key, or None. OpenCode sends
     it when setCacheKey is on."""
@@ -1088,7 +1031,6 @@ def prompt_key(body):
         return None
     return file_safe(key.strip())     # the client chose it
 
-
 def text_of(value):
     """The words in a system prompt, whether it is a string or a list of
     parts."""
@@ -1098,7 +1040,6 @@ def text_of(value):
         return "".join(part.get("text", "") for part in value
                        if isinstance(part, dict))
     return ""
-
 
 def message_shape(message):
     """Everything about one message that a later request must match. The
@@ -1111,10 +1052,8 @@ def message_shape(message):
     except (TypeError, ValueError):
         return text_of(message.get("content")).encode("utf-8", "replace")
 
-
 # Per-request fields that do not change the rendered prompt.
 IGNORED_KEYS = frozenset(("cache_control",))
-
 
 def without_ignored(value):
     """The same body with IGNORED_KEYS dropped, however deep they sit.
@@ -1125,7 +1064,6 @@ def without_ignored(value):
     if isinstance(value, list):
         return [without_ignored(v) for v in value]
     return value
-
 
 def closes(message):
     """True when a template can end a prompt after this message. It refuses
@@ -1140,7 +1078,6 @@ def closes(message):
     return not (isinstance(content, list)
                 and any(isinstance(part, dict) and part.get("type") == "tool_use"
                         for part in content))
-
 
 def prompt_cuts(body, least=PREFIX_MIN_CHARS):
     """Every point in this request that another request could share. Each
@@ -1190,14 +1127,12 @@ def prompt_cuts(body, least=PREFIX_MIN_CHARS):
             cuts.append((index, running.hexdigest()[:16]))
     return cuts, messages, system, tools
 
-
 def deepest_shared(cuts, known):
     """The furthest cut in this request that something else also has."""
     for cut in reversed(cuts):
         if cut[1] in known:
             return cut
     return None
-
 
 def common_prefix(first, second):
     """The text two renderings share. It ends where the messages differ."""
@@ -1206,7 +1141,6 @@ def common_prefix(first, second):
     while n < limit and first[n] == second[n]:
         n += 1
     return first[:n]
-
 
 def request_shape(body):
     """Describe a request's shape without keeping its text."""
@@ -1223,9 +1157,7 @@ def request_shape(body):
             "roles": roles,
             "tools": len(fields.get("tools") or [])}
 
-
 SYSTEM_ROLES = ("system", "developer")
-
 
 def leading_system(messages):
     """How many messages at the front of this list are the system prompt."""
@@ -1234,7 +1166,6 @@ def leading_system(messages):
             and messages[lead].get("role") in SYSTEM_ROLES:
         lead += 1
     return lead
-
 
 def hoist_system(body):
     """Turn a late system message into a user message, in place.
@@ -1264,9 +1195,7 @@ def hoist_system(body):
         for m in messages[lead:]]
     return json.dumps(fields).encode()
 
-
 PLACE_RE = re.compile(r"(\d+)_(\d+)$")
-
 
 def by_place(name):
     """Sort key from a backend name: the socket, then the instance on it.
@@ -1276,10 +1205,8 @@ def by_place(name):
         return (9, 9, name or "")
     return (int(found.group(1)), int(found.group(2)), name)
 
-
 def _say(line):
     print(line, flush=True)
-
 
 def wants_stream(body):
     """True when the client asked for a streamed reply."""
@@ -1289,13 +1216,11 @@ def wants_stream(body):
         return False
     return isinstance(fields, dict) and bool(fields.get("stream"))
 
-
 def template_route(path):
     """Where to ask this backend what a body renders to. The anthropic route
     converts the body first, so a tool call renders."""
     return ("/v1/messages/apply-template" if (path or "").startswith("/v1/messages")
             else "/apply-template")
-
 
 def read_only(body, slot=None):
     """The same request, asking for zero tokens. The read happens on a
@@ -1324,7 +1249,6 @@ def read_only(body, slot=None):
         fields["id_slot"] = slot      # say which slot
     return fields
 
-
 def http_post(url, path, payload, timeout=POST_TIMEOUT):
     """POST json and read the reply. Used for the slot save and restore."""
     request = urllib.request.Request(
@@ -1337,7 +1261,6 @@ def http_post(url, path, payload, timeout=POST_TIMEOUT):
         # A backend puts the reason in the body.
         raise OSError(f"{err.code} on {path}: {said(err)}") from None
 
-
 def said(err):
     """The reason a backend gave, out of the body of its error reply."""
     try:
@@ -1349,10 +1272,8 @@ def said(err):
         return trouble.get("message") or err.reason
     return trouble or err.reason
 
-
 class Gone(Exception):
     """The client stopped waiting, so what it asked for is no longer wanted."""
-
 
 def http_post_wanted(url, path, payload, timeout, wanted, every=2.0):
     """POST to a backend. Stop when nobody waits for the answer.
@@ -1402,7 +1323,6 @@ def http_post_wanted(url, path, payload, timeout, wanted, every=2.0):
         raise got["error"]
     return got.get("answer") or {}
 
-
 def said_in(body):
     """The reason inside a backend's error body, or None."""
     try:
@@ -1412,7 +1332,6 @@ def said_in(body):
     if isinstance(trouble, dict):
         return trouble.get("message")
     return trouble
-
 
 def capture(conv, body):
     """Write one request body down, for comparing two turns offline. Kept
@@ -1431,7 +1350,6 @@ def capture(conv, body):
     except OSError as err:
         print(f"[router] could not write the capture: {err}", flush=True)
 
-
 def how_started(warm, recalled, loaded):
     """Name what a request extended instead of reading. `warm`: its own
     cache was in a slot. `recalled`: its own copy came back from disk.
@@ -1443,7 +1361,6 @@ def how_started(warm, recalled, loaded):
     if warm:
         return "warm slot"
     return "cold"
-
 
 def disk_summary(pins, openings, opening_bytes, wants):
     """What the two slot directories hold against their budgets."""
@@ -1459,7 +1376,6 @@ def disk_summary(pins, openings, opening_bytes, wants):
             "bases": {"count": kinds.count("base")},
             "deeps": {"count": kinds.count("deep")},
             "wants": {"count": len(wants), "keep": WANT_KEEP}}
-
 
 class History:
     """Slot-seconds by phase, per history bucket. Between two polls a slot
@@ -1545,7 +1461,6 @@ class History:
                                        if row["cur"][1] else None)}
                          for key, row in self.load.items()}}
 
-
 # ---------------------------------------------------------------- machine load
 # The weights are mmap'd and live in the page cache. When free memory gets
 # tight the kernel drops them, and prefill falls from 37 tokens a second to
@@ -1561,7 +1476,6 @@ def parse_cpulist(text):
         cpus.update(range(int(low), int(high or low) + 1))
     return cpus
 
-
 def read_nodes(root=Path("/sys/devices/system/node")):
     """The NUMA nodes and their cpus, from sysfs."""
     nodes = []
@@ -1572,7 +1486,6 @@ def read_nodes(root=Path("/sys/devices/system/node")):
             continue
         nodes.append({"id": int(path.name[4:]), "cpus": cpus, "path": path})
     return nodes
-
 
 def cpu_times(text):
     """/proc/stat -> {cpu index: (busy, total)}, in jiffies."""
@@ -1586,7 +1499,6 @@ def cpu_times(text):
         out[int(fields[0][3:])] = (sum(values) - idle, sum(values))
     return out
 
-
 def node_busy(before, after, cpus):
     """Per cent of a node's cpu time spent busy between two samples, or
     None."""
@@ -1596,7 +1508,6 @@ def node_busy(before, after, cpus):
             busy += after[n][0] - before[n][0]
             total += after[n][1] - before[n][1]
     return round(100.0 * busy / total, 1) if total > 0 else None
-
 
 def node_meminfo(text):
     """A node's meminfo -> bytes: total, free, and cache (FilePages)."""
@@ -1608,7 +1519,6 @@ def node_meminfo(text):
             out[want[parts[2]]] = int(parts[3]) * 1024
     return out
 
-
 def gpu_query(text):
     """One nvidia-smi line 'util, used, total' in MiB -> a dict, or None."""
     try:
@@ -1618,10 +1528,8 @@ def gpu_query(text):
     return {"util": util, "vram_used": int(used * 1024 * 1024),
             "vram_total": int(total * 1024 * 1024)}
 
-
 GPU_CMD = ("nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
            "--format=csv,noheader,nounits")
-
 
 def resident_bytes(be):
     """Bytes one backend needs in the page cache: mapped less lazy, from its
@@ -1629,7 +1537,6 @@ def resident_bytes(be):
     cache = be.get("cache") or {}
     mapped, lazy = cache.get("mapped_mib") or 0.0, cache.get("lazy_mib") or 0.0
     return int(max(0.0, mapped - lazy) * 1024 * 1024)
-
 
 class Machine:
     """CPU, memory and GPU load, sampled beside the backend poll. nvidia-smi
@@ -1718,7 +1625,6 @@ class Machine:
                           "backends": [be["name"] for be in here]})
         return {"nodes": nodes, "gpu": self.gpu if self.gpu_ok else None}
 
-
 def opening_key(name):
     """The key inside a saved opening's file name, or None if it is not one."""
     for mark in SHELF_MARKS:
@@ -1726,11 +1632,9 @@ def opening_key(name):
             return name[len(mark):-len(".park")]
     return None
 
-
 def shelf_of(name):
     """Which shelf a saved opening's file name puts it on."""
     return "base" if name.startswith("base-") else "deep"
-
 
 def adopt_files(names, vouched=(), size=None, store=None):
     """Sort the files the last run left behind, oldest first. A saved
@@ -1754,7 +1658,6 @@ def adopt_files(names, vouched=(), size=None, store=None):
     spent += trim_openings(openings, bytes_)
     return openings, bytes_, parked, spent
 
-
 def trim_openings(openings, bytes_, keep=()):
     """Drop openings until they fit BLOCK_BUDGET, least useful first: deeper
     cuts before system prompts, then least recently used. One is always
@@ -1770,7 +1673,6 @@ def trim_openings(openings, bytes_, keep=()):
         bytes_.pop(key, None)
         dropped.append(openings.pop(key))
     return dropped
-
 
 class Flow:
     """Every turn in flight and the stages it walks, for the flow dashboard.
@@ -1807,7 +1709,6 @@ class Flow:
     def report(self):
         """What the dashboard animates. Held under the lock."""
         return {"live": list(self.live.values()), "log": list(self.log)}
-
 
 class Pool:
     """Track free slots. Keep each conversation on one backend."""
@@ -3370,10 +3271,8 @@ class Pool:
                     "openings": openings,
                     "disk": disk}
 
-
 ON_THE_PAGE = ("lib", "views", "components")   # directories the browser needs
 PAGE_FILES = ("index.html", "shell.js", "shell.css")
-
 
 def on_the_page(rel):
     """True for a path the browser needs. The web directory also holds
@@ -3383,7 +3282,6 @@ def on_the_page(rel):
         return True                       # a directory, answered by its index
     head = rel.split("/", 1)[0]
     return head in ON_THE_PAGE or rel in PAGE_FILES
-
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -4005,7 +3903,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             finally:
                 done.set()
 
-
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -4026,7 +3923,6 @@ class Server(http.server.ThreadingHTTPServer):
             return
         super().handle_error(request, address)
 
-
 class Stamped:
     """Put the time in front of every line the router prints. Every print
     in this file goes through this."""
@@ -4044,7 +3940,6 @@ class Stamped:
 
     def flush(self):
         self.out.flush()
-
 
 if __name__ == "__main__":
     sys.stdout = Stamped(sys.stdout)

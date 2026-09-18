@@ -29,13 +29,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 
 import router
 
-# The same reasoning as CACHE_LOG above, for what this run writes. STORE is the
-# default a Pool takes when it is handed none, so a case that forgets to give
-# it one reads and writes inside the checkout's own run/slots - where a live
-# router keeps conversation caches worth hundreds of gigabytes, and where a
-# stray pins.json is adopt()'s instruction to delete every copy it does not
-# name. One sandbox for the whole run, under the temporary directory; a case
-# wanting its own builds another Store.
+# The same reasoning as CACHE_LOG above, for what this run writes.
+# STORE is the default store a Pool takes when it is handed none.
+# A case that forgets to hand it one reads and writes inside the checkout's
+# own run/slots. A live router keeps parked copies there worth hundreds of
+# gigabytes. A stray pins.json tells adopt() to delete every copy it does not
+# name. One sandbox serves the whole run, under the temporary directory. A
+# case that wants its own builds another Store.
 router.STORE = router.Store(tempfile.mkdtemp(prefix="router-run-"))
 
 
@@ -1187,15 +1187,15 @@ class PinIsAbsolute(unittest.TestCase):
 
 
 class TheSuiteCannotTouchARunningRouter(unittest.TestCase):
-    """The one test that is about the tests.
+    """The one case that is about the tests.
 
-    STORE is the store a Pool takes when it is handed none. A case that
-    forgets to give it one writes into the checkout's own run/slots, and two
-    of the files there are instructions: pins.json says which conversation
-    caches to keep, and adopt() deletes every copy it does not name. A
-    fixture pins.json is therefore a delete-everything order, against caches
-    that cost twenty minutes each to rebuild. Guarded at the top of this
-    module, and here so that removing the guard fails rather than goes
+    STORE is the default store a Pool takes when it is handed none.
+    A case that forgets to hand it one writes into the checkout's own
+    run/slots. Two of the files there are instructions. pins.json says which
+    parked copies to keep, and adopt() deletes every copy it does not name.
+    A fixture pins.json is therefore a delete-everything order, against
+    copies that cost twenty minutes each to rebuild. Guarded at the top of
+    this module, and here so that removing the guard fails rather than goes
     quiet."""
 
     def test_the_slot_directory_is_not_the_one_a_router_uses(self):
@@ -1209,30 +1209,32 @@ class TheSuiteCannotTouchARunningRouter(unittest.TestCase):
             self.assertTrue(str(path).startswith(tempfile.gettempdir()), path)
 
     def test_the_directories_are_not_module_globals(self):
-        """While RUN_DIR, SLOT_DIR and BLOCK_DIR were module globals, a test
+        """Store owns the directories, where no test can redirect them.
+
+        While RUN_DIR, SLOT_DIR and BLOCK_DIR were module globals, a test
         redirected them by assignment. That works only while every reader
-        lives in this one module: a reader in another module binds the name
-        at import and never sees the redirect, so the suite would have gone
-        on passing while it wrote into the live run/slots. Store owns the
-        directories now, and there is nothing left to redirect."""
+        lives in this one module. A reader in another module binds the name
+        at import and never sees the redirect. The suite would have gone on
+        passing while that reader wrote into the live run/slots."""
         for name in ("RUN_DIR", "SLOT_DIR", "BLOCK_DIR"):
             self.assertFalse(
                 hasattr(router, name),
                 f"router.{name} is a module global again. A test can redirect "
-                f"it, and a reader outside this module will not see the "
-                f"redirect - which is how a test comes to write into a live "
-                f"router's slot directory.")
+                f"it. A reader outside this module does not see the redirect, "
+                f"and that is how a test comes to write into a live router's "
+                f"slot directory.")
 
 
 class SlotDirCase(unittest.TestCase):
     """A test case whose slot files land in a temporary directory.
 
-    STORE is the store a Pool takes when it is handed none, so a class that
-    leaves it alone reads and deletes inside the checkout's own run/slots -
-    where a running router keeps live caches, several of them symlinks into
-    the block directory that Store.drop follows. A fixture named like a live
-    file would take a real cache with it, and adopt() would read the live
-    pins.json. Replaced in setUp, put back after."""
+    STORE is the default store a Pool takes when it is handed none.
+    A class that leaves it alone reads and deletes inside the checkout's own
+    run/slots. A running router keeps parked copies there. Several of them
+    are symlinks into the block directory that Store.drop follows. A fixture
+    named like a live file would take a real copy with it, and adopt() would
+    read the live pins.json. setUp replaces STORE. The cleanup puts it
+    back."""
 
     def setUp(self):
         super().setUp()
@@ -2266,8 +2268,8 @@ class ShutDownCleanly(unittest.TestCase):
         self.assertEqual(router.Store(self.root / "empty").read_pins(), [])
 
     def test_reads_nothing_from_a_damaged_pin_file(self):
-        """The branch that matters most. A pin file adopt() half believes is
-        how every copy it does not name gets deleted."""
+        """The branch that matters most. adopt() half believes a damaged pin
+        file, and then deletes every copy the file does not name."""
         router.STORE.slots.mkdir(parents=True, exist_ok=True)
         (router.STORE.slots / "pins.json").write_bytes(b"not json")
         self.assertEqual(router.STORE.read_pins(), [])
@@ -2462,9 +2464,10 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
     runs there; nothing in the rule is about the hardware."""
 
     def setUp(self):
-        # The builder test reaches _read_prefix, which links a file into the
-        # slot directory. The pool is given this store, so that link cannot
-        # land in a running router's own.
+        # test_the_builder_does_not_read_on_the_gpu_either reaches
+        # _read_prefix, which links a file into the slot directory. setUp
+        # hands this store to the pool, so the link cannot land in a running
+        # router's own.
         root = Path(tempfile.mkdtemp())
         (root / "slots").mkdir()
         self.was = router.STORE
