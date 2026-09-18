@@ -560,9 +560,15 @@ class DrainUnderLoad(LiveRouter):
         backend was up and had a slot spare -- so a drain reported an instance
         quiet, parked its caches, and the builder then read a whole opening into
         it: work a restart was about to throw away, on an instance somebody was
-        waiting to stop. `_idle_slot` now looks at `draining` as well."""
-        # One turn, so the builder has an opening it wants.
-        self.turn(self.url, "wanting", self.head + [{"role": "user", "content": "Hi."}])
+        waiting to stop. `_idle_slot` now looks at `draining` as well.
+
+        The want is noted here rather than left over from a turn. A turn reads
+        its own base opening inline in warm_prefix, so it leaves nothing
+        wanted, and the only want a turn can leave is a deep one, which needs
+        DEEP_OPENINGS. tests/test_migration.py notes wants the same way."""
+        self.pool_.note_want((0, "wanted-by-the-builder"), "base-",
+                             self.head[0]["content"], [], self.head[:1],
+                             "/v1/chat/completions")
         self.assertTrue(self.pool_.wants, "nothing was wanted, so nothing is proved")
         for name in ("cpu1_0", "cpu1_1"):
             self.pool_.drain(name, router.http_post, deadline=PATIENCE)
