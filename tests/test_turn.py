@@ -353,20 +353,18 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
 
     hand_off gives up in two places. The later one releases the prefiller
     before it waits for a generator, and its caller reads None as `nothing is
-    held`. The earlier one gives up before any of that, so it has to release
-    the prefiller too.
+    held`. The earlier one gives up before any of that, so it says so the way
+    the rest of the turn says it: a Gone, which the ending already handles.
     """
 
-    def test_giving_up_before_the_handoff_gives_the_slot_back(self):
+    def test_giving_up_before_the_handoff_says_the_client_went(self):
         pool = one_backend()
         pool.backends[0]["generate"] = False
         pool.acquire("c1", 10)             # the prefiller is held from here
         self.assertEqual(pool.backends[0]["busy"], 1)
 
-        self.assertIsNone(pool.hand_off("c1", pool.backends[0], 10,
-                                        wanted=lambda: False))
-
-        self.assertEqual(pool.backends[0]["busy"], 0)
+        with self.assertRaises(router.Gone):
+            pool.hand_off("c1", pool.backends[0], 10, wanted=lambda: False)
 
     def test_a_turn_that_loses_its_client_before_the_handoff_holds_nothing(self):
         pool = one_backend()
@@ -376,6 +374,22 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
                   FakeClient(alive=False))
 
         self.assertEqual(pool.backends[0]["busy"], 0)
+        # `inflight` is the other half of holding a slot. Left set, the pin is
+        # skipped by ensure_parked, park_all and the drain report, and no
+        # other conversation can be given that slot.
+        self.assertFalse(pool.pins["c1"]["inflight"])
+
+    def test_the_read_it_finished_is_kept(self):
+        """The read is the expensive half, and it completed. A turn that ends
+        here has to leave it on disk, the same as a client that goes during
+        the read itself."""
+        pool = one_backend()
+        pool.backends[0]["generate"] = False
+
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient(alive=False))
+
+        self.assertEqual(pool.link.ops(), ["read", "save"])
 
 
 class ACacheIsWrittenToDiskOnce(unittest.TestCase):

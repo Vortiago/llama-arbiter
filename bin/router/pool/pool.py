@@ -10,6 +10,7 @@ from ..sizing import VISION
 from ..store.backendlog import CacheWatch, read_config, read_vision
 from ..store.events import EventLog
 from ..store.files import adopt_files, opening_key, shelf_of, trim_openings
+from ..transport import Gone
 from ..backend.link import Link
 from .turn import Turn
 from .machine import Flow, History, Machine, per_second
@@ -1213,13 +1214,13 @@ class Pool:
             # Nothing to carry this to, and the instance holding it does
             # not generate. Wait, holding a prefill slot.
             if wanted is not None and not wanted():
-                # None means no backend is held, the same as the give-up
-                # below. The caller reads it that way and releases nothing,
-                # so the slot has to go back here.
-                with self.cv:
-                    source["busy"] -= 1
-                    self.cv.notify_all()
-                return None
+                # Nothing was carried and nothing is parked, so this is the
+                # client leaving mid-turn. The caller's ending already knows
+                # that case: it releases the source and parks what was read.
+                # None is for the give-up below, where the cache is on disk
+                # and the slot is already back.
+                raise Gone("the client stopped waiting for a slot to "
+                           "generate in")
             with self.cv:
                 self.cv.wait(1.0)
             target = self.generator(tokens)

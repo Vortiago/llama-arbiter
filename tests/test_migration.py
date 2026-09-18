@@ -3530,9 +3530,10 @@ class AnInstanceThatDoesNotGenerate(unittest.TestCase):
             asked.append(1)
             gave_up.append(len(asked))
             return len(asked) < 2
-        got = with_link(self.pool, FakeLink(written=200_000_000)).hand_off(
-            "a", self.pre, 1000, wanted=wanted)
-        self.assertIsNone(got, "it generated on an instance set not to")
+        with self.assertRaises(router.Gone,
+                               msg="it generated on an instance set not to"):
+            with_link(self.pool, FakeLink(written=200_000_000)).hand_off(
+                "a", self.pre, 1000, wanted=wanted)
         self.assertTrue(gave_up, "it never waited at all")
 
     def test_it_generates_in_place_only_when_the_carry_never_happened(self):
