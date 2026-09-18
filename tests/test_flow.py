@@ -4,37 +4,39 @@ A turn walks queued -> prefill -> generate-queue -> generate -> done. The
 recorder keeps one live row per conversation and a newest-first log, so an
 animation can replay transitions that happened between two payload pushes.
 """
-import os
 import pathlib
 import sys
 import unittest
-
-# The cache event log is on by default and writes into run/. A test run must
-# not add lines a real run would read as its own, so the log stays off unless
-# the test is about the log, which sets the variables itself. Read at import,
-# so it has to be set before router is imported - and every test module has to
-# set it, because whichever one discovery loads first decides for the process.
-# This file was the one without it, and discovery only covered for it by
-# sorting test_cache_events first. Run any other way - one module, an IDE, a
-# -k filter - and the log came on: about 1,073 fixture rows reached
-# run/cache-events-20260916.jsonl in two bursts, a third of that day's log,
-# and tools/cache-report.py counted them as traffic (903 of them one failing
-# park of a conversation called "a" on a backend called "cpu").
-os.environ.setdefault("CACHE_LOG", "0")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 
 import tempfile
 import router
 
-# The same reasoning as CACHE_LOG above, for what this run writes. STORE is the
-# default a Pool takes when it is handed none, so a case that forgets to give
-# it one reads and writes inside the checkout's own run/slots - where a live
-# router keeps conversation caches worth hundreds of gigabytes, and where a
-# stray pins.json is adopt()'s instruction to delete every copy it does not
-# name. One sandbox for the whole run, under the temporary directory; a case
-# wanting its own builds another Store.
-router.STORE = router.Store(tempfile.mkdtemp(prefix="router-run-"))
+class SANDBOX:
+    """What this test run is wired to.
+
+    A Pool is handed its store, its tuning and its event log, so there is no
+    module state to redirect and nothing to put back. One sandbox serves the
+    whole file, under the temporary directory, and a case wanting its own
+    builds another. Without this a case would reach the checkout's own
+    run/slots, where a live router keeps parked copies worth hundreds of
+    gigabytes and a stray pins.json tells adopt() to delete every copy it does
+    not name.
+    """
+
+    store = router.Store(tempfile.mkdtemp(prefix="router-run-"))
+    tuning = router.Tuning()
+    events = router.EventLog(on=False)
+
+
+def make_pool(backends, **kw):
+    """A Pool wired to the sandbox. A case that wants another store, tuning or
+    event log passes it, and that one wins."""
+    kw.setdefault("store", SANDBOX.store)
+    kw.setdefault("tuning", SANDBOX.tuning)
+    kw.setdefault("events", SANDBOX.events)
+    return router.Pool(backends, **kw)
 
 
 class ATurnWalksItsStages(unittest.TestCase):
@@ -99,9 +101,9 @@ class TwoTurnsOfOneConversation(unittest.TestCase):
 
     def test_the_log_is_bounded(self):
         flow = router.Flow()
-        for i in range(router.TUNING.flow_log + 40):
+        for i in range(SANDBOX.tuning.flow_log + 40):
             flow.note(f"conv-{i}", "queued")
-        self.assertEqual(len(flow.report()["log"]), router.TUNING.flow_log)
+        self.assertEqual(len(flow.report()["log"]), SANDBOX.tuning.flow_log)
 
 
 if __name__ == "__main__":

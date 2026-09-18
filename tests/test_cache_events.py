@@ -6,7 +6,6 @@ that can block a request, no prompt text, and every hook writing what its
 call site actually decided.
 """
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -14,21 +13,35 @@ import time
 import unittest
 from pathlib import Path
 
-os.environ.setdefault("CACHE_LOG", "0")
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 
 import pathlib
 import router
 
-# The same reasoning as CACHE_LOG above, for what this run writes. STORE is the
-# default a Pool takes when it is handed none, so a case that forgets to give
-# it one reads and writes inside the checkout's own run/slots - where a live
-# router keeps conversation caches worth hundreds of gigabytes, and where a
-# stray pins.json is adopt()'s instruction to delete every copy it does not
-# name. One sandbox for the whole run, under the temporary directory; a case
-# wanting its own builds another Store.
-router.STORE = router.Store(tempfile.mkdtemp(prefix="router-run-"))
+class SANDBOX:
+    """What this test run is wired to.
+
+    A Pool is handed its store, its tuning and its event log, so there is no
+    module state to redirect and nothing to put back. One sandbox serves the
+    whole file, under the temporary directory, and a case wanting its own
+    builds another. Without this a case would reach the checkout's own
+    run/slots, where a live router keeps parked copies worth hundreds of
+    gigabytes and a stray pins.json tells adopt() to delete every copy it does
+    not name.
+    """
+
+    store = router.Store(tempfile.mkdtemp(prefix="router-run-"))
+    tuning = router.Tuning()
+    events = router.EventLog(on=False)
+
+
+def make_pool(backends, **kw):
+    """A Pool wired to the sandbox. A case that wants another store, tuning or
+    event log passes it, and that one wins."""
+    kw.setdefault("store", SANDBOX.store)
+    kw.setdefault("tuning", SANDBOX.tuning)
+    kw.setdefault("events", SANDBOX.events)
+    return router.Pool(backends, **kw)
 
 
 def rows_of(directory):
@@ -125,19 +138,19 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         # directory; CacheWatching in test_migration.py removes its own.
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.log = router.EventLog(directory=self.dir, on=True)
-        self.old = router.EVENTS
-        router.EVENTS = self.log
+        self.old = SANDBOX.events
+        SANDBOX.events = self.log
         # Linking and deleting slot files must not touch the real run dir.
-        self.old_store = router.STORE
-        router.STORE = router.Store(self.dir)
-        router.STORE.slots.mkdir(parents=True, exist_ok=True)
-        self.pool = router.Pool([{"name": "cpu", "url": "http://cpu",
+        self.old_store = SANDBOX.store
+        SANDBOX.store = router.Store(self.dir)
+        SANDBOX.store.slots.mkdir(parents=True, exist_ok=True)
+        self.pool = make_pool([{"name": "cpu", "url": "http://cpu",
                                   "pref": 0}],
-                                store=router.STORE, watch=False)
+                                store=SANDBOX.store, watch=False)
 
     def tearDown(self):
-        router.EVENTS = self.old
-        router.STORE = self.old_store
+        SANDBOX.events = self.old
+        SANDBOX.store = self.old_store
 
     def test_an_unshared_deep_cut_is_written_as_a_fork_of_its_holder(self):
         self.pool.openings["k1"] = "base-k1.park"
@@ -169,7 +182,7 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
             if p == "/completion":
                 return {"timings": {"prompt_n": 4200, "cache_n": 0}}
             if "action=save" in p:
-                return {"n_written": router.TUNING.park_floor + 1}
+                return {"n_written": SANDBOX.tuning.park_floor + 1}
             return {"prompt": "x"}
         self.pool._render_block = lambda *a, **k: "rendered"
         # The builder only reads into a slot the poll has found idle twice,
@@ -177,7 +190,7 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.pool.backends[0].update(
             up=True, busy=0, slots=1,
             slots_detail=[{"id": 0, "busy": False}],
-            idle_runs={0: router.TUNING.idle_polls})
+            idle_runs={0: SANDBOX.tuning.idle_polls})
         self.pool.wants["k9"]["at"] = time.time() - 30
         self.pool.build_once(post, remove=lambda name: None)
         self.log.flush()
@@ -190,7 +203,7 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.assertEqual(build["prompt_n"], 4200)
 
     def test_a_dropped_want_says_how_long_it_waited_unbuilt(self):
-        for i in range(router.TUNING.want_keep + 1):
+        for i in range(SANDBOX.tuning.want_keep + 1):
             self.pool.note_want((0, f"k{i}"), "deep-", "", [], [], "/completion")
         self.log.flush()
         dropped = [r for r in rows_of(self.dir)
@@ -212,7 +225,7 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.pool.pins["conv1"] = {"backend": "cpu", "slot": 0,
                                    "inflight": True, "parked": None}
         post = lambda url, p, payload, timeout=None: \
-            {"n_written": router.TUNING.park_floor + 1} if "action=save" in p else {}
+            {"n_written": SANDBOX.tuning.park_floor + 1} if "action=save" in p else {}
         self.assertTrue(self.pool._save_park("conv1", self.pool.backends[0],
                                              0, post, remove=lambda n: None))
         self.pool.pins["conv1"]["slot"] = None

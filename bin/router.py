@@ -24,18 +24,40 @@ from pathlib import Path
 # bound for seconds. A `generate`-only instance is a generator: turns
 # migrate to it, `pref` lowest first. One slot per instance: a slot
 # reading a long prompt blocks every other slot on it.
-BACKENDS = [
+DEFAULT_BACKENDS = [
     {"name": "solo", "url": "http://127.0.0.1:8080", "pref": 0,
      "prefill": True, "generate": True, "node": 0},
 ]
 
-# ROUTER_BACKENDS names a JSON file holding another table: the same fields.
-BACKENDS_FROM = "the built-in default"
-if os.environ.get("ROUTER_BACKENDS"):
-    BACKENDS_FROM = os.environ["ROUTER_BACKENDS"]
-    BACKENDS = json.loads(Path(BACKENDS_FROM).read_text())
-    # Checked at startup, not on the first turn that needs the field.
-    for be in BACKENDS:
+
+def passed_paths(env=None):
+    """The paths a client may reach through the router, for this run.
+
+    PASS_THROUGH adds to the fixed list. The backends run with --agent, which
+    is shell and file access with no key, so a path not named here must never
+    be reachable from the public port.
+    """
+    env = os.environ if env is None else env
+    return PASSED | {p.strip() for p in env.get("PASS_THROUGH", "").split(",")
+                     if p.strip()}
+
+
+def read_backend_table(env=None):
+    """The backends to serve, and where the table came from.
+
+    ROUTER_BACKENDS names a JSON file holding another table: the same fields.
+    A table this cannot serve raises here, at startup, rather than at the
+    first turn that needs the field. This is a function and not work done at
+    import, so that importing this module cannot exit the process that did
+    it.
+    """
+    env = os.environ if env is None else env
+    whence = env.get("ROUTER_BACKENDS")
+    if not whence:
+        return [dict(be) for be in DEFAULT_BACKENDS], "the built-in default"
+
+    table = json.loads(Path(whence).read_text())
+    for be in table:
         short = {"name", "url", "pref", "prefill", "generate", "node"} - set(be)
         if short:
             hint = ("  (`reads: true` is now `prefill` and `generate`; "
@@ -47,14 +69,14 @@ if os.environ.get("ROUTER_BACKENDS"):
             raise SystemExit(f"[router] backend {be['name']} neither prefills "
                              f"nor generates, so nothing can be sent to it")
     for job in ("prefill", "generate"):
-        if not any(be[job] for be in BACKENDS):
-            raise SystemExit(f"[router] no backend in {BACKENDS_FROM} can "
+        if not any(be[job] for be in table):
+            raise SystemExit(f"[router] no backend in {whence} can "
                              f"{job}, so no request could be served")
     # A turn leaves its reader only through the handoff.
-    if os.environ.get("HANDOFF") == "0" and not all(be["generate"]
-                                                    for be in BACKENDS):
+    if env.get("HANDOFF") == "0" and not all(be["generate"] for be in table):
         raise SystemExit("[router] HANDOFF=0 keeps every turn on the backend "
                          "that read it, so every backend has to generate")
+    return table, whence
 
 def prefills(be):
     """May a new conversation have its prompt read on this backend."""
@@ -169,8 +191,6 @@ class Tuning:
             cache_log=env.get("CACHE_LOG", "1") == "1")
 
 
-# What this run was tuned to. A test builds its own and hands it to Pool.
-TUNING = Tuning.from_env()
 
 
 # Endpoints that use a slot.
@@ -189,8 +209,6 @@ PASSED = {
     "/tokenize", "/detokenize", "/apply-template",
     "/v1/messages/count_tokens", "/v1/messages/apply-template",
 }
-PASSED |= {p.strip() for p in os.environ.get("PASS_THROUGH", "").split(",")
-           if p.strip()}
 
 DROP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "te", "trailers",
                 "transfer-encoding", "upgrade", "content-length", "host"}
@@ -304,7 +322,7 @@ def request_cost(body, vision=None, tuning=None):
         text -= len(payload)
         charged += image_tokens(payload, vision)
         count += 1
-    tuning = tuning or TUNING
+    tuning = tuning or Tuning()
     return (int(max(0, text) / tuning.chars_per_tok) + charged
             + tuning.reply_tokens, count, charged)
 
@@ -491,19 +509,8 @@ class Store:
                 continue
         return rows
 
-# Everything a run writes. RUN comes from bin/common.sh. This module builds
-# one store at import, so that it reads the environment once. A test builds
-# its own on a temporary directory and hands it to Pool.
-STORE = Store(os.environ.get("RUN")
-              or Path(__file__).resolve().parent.parent / "run",
-              os.environ.get("BLOCK_DIR"))
 
-# Debugging only, on when CAPTURE names a directory.
-CAPTURE_DIR = Path(os.environ["CAPTURE"]) if os.environ.get("CAPTURE") else None
 
-# One JSON line per cache decision, in a dated file. CACHE_LOG=0 turns it
-# off.
-CACHE_LOG_DIR = Path(os.environ.get("CACHE_LOG_DIR") or STORE.run)
 
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8",  ".json": "application/json",
@@ -697,7 +704,9 @@ class EventLog:
     def __init__(self, directory=None, on=True, name="cache-events",
                  maxsize=10000):
         self.on = on
-        self.directory = Path(directory) if directory else CACHE_LOG_DIR
+        self.directory = Path(directory) if directory else None
+        if on and self.directory is None:
+            raise ValueError("an event log that is on needs a directory")
         self.name = name
         self.maxsize = maxsize
         self.queue = queue.Queue(maxsize=maxsize)
@@ -744,14 +753,16 @@ class EventLog:
         self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         self.handle.flush()
 
-# Tests replace this with an EventLog on a temporary directory.
-EVENTS = EventLog()
 
 # Client configs the dashboard offers, built for the address the reader used.
 CONFIG_FILES = {"opencode": "opencode.json", "claude": "settings.json"}
 
-# Names the machine in an OpenCode config. PROVIDER overrides the hostname.
-PROVIDER = os.environ.get("PROVIDER") or socket.gethostname().split(".")[0] or "llama"
+def default_provider(env=None):
+    """Names the machine in an OpenCode config. PROVIDER overrides the
+    hostname. Read here rather than at import: gethostname is a syscall, and
+    importing this module should do nothing a caller did not ask for."""
+    env = os.environ if env is None else env
+    return env.get("PROVIDER") or socket.gethostname().split(".")[0] or "llama"
 
 HOST_RE = re.compile(r"^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$")
 
@@ -761,25 +772,26 @@ def host_only(host):
     host = (host or "").strip()
     return host if HOST_RE.match(host) else None
 
-def client_config(kind, host, model, n_ctx):
+def client_config(kind, host, model, n_ctx, provider=None):
     """Build a client config for this router, or return None.
 
     The timeouts are measured: cpu0_0 read 114,354 tokens at 17.2 to 20.6
     tokens a second with the other instances busy, so the divisor is 15."""
+    provider = provider or default_provider()
     base = f"http://{host}"
     patience_ms = max(3600000, n_ctx // 15 * 1000)
     if kind == "opencode":
         return {
             "$schema": "https://opencode.ai/config.json",
-            "model": f"{PROVIDER}/{model}",
+            "model": f"{provider}/{model}",
             # Title generation. Unset, it names a model this backend lacks.
-            "small_model": f"{PROVIDER}/{model}",
+            "small_model": f"{provider}/{model}",
             # The model is private to this machine.
             "share": "disabled",
             "provider": {
-                PROVIDER: {
+                provider: {
                     "npm": "@ai-sdk/openai-compatible",
-                    "name": f"Qwen3.8 Flash Next ({PROVIDER})",
+                    "name": f"Qwen3.8 Flash Next ({provider})",
                     "options": {
                         "baseURL": f"{base}/v1",
                         # Names the session in every request.
@@ -1132,7 +1144,7 @@ def prompt_cuts(body, tuning=None):
     cut is at a message boundary, hashed onto the cut before it. Returns the
     cuts deepest last, the messages, the system prompt when the request
     keeps it apart, and the tools it declares."""
-    tuning = tuning or TUNING
+    tuning = tuning or Tuning()
     try:
         fields = json.loads(body)
     except Exception:
@@ -1382,18 +1394,18 @@ def said_in(body):
         return trouble.get("message")
     return trouble
 
-def capture(conv, body, keep=24):
+def capture(directory, conv, body, keep=24):
     """Write one request body down, for comparing two turns offline. Kept
     per conversation, so a busy client cannot crowd out a quiet one."""
-    if CAPTURE_DIR is None:
+    if directory is None:
         return
     try:
-        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True)
         tag = short_key(conv).replace("/", "_")
         # Nanoseconds and fixed width: unique names that sort by time.
         name = f"{time.time_ns()}-{tag}.json"
-        (CAPTURE_DIR / name).write_bytes(body)
-        old = sorted(CAPTURE_DIR.glob(f"*-{tag}.json"))[:-keep]
+        (directory / name).write_bytes(body)
+        old = sorted(directory.glob(f"*-{tag}.json"))[:-keep]
         for spent in old:
             spent.unlink(missing_ok=True)
     except OSError as err:
@@ -1413,7 +1425,7 @@ def how_started(warm, recalled, loaded):
 
 def disk_summary(pins, openings, opening_bytes, wants, tuning=None):
     """What the two slot directories hold against their budgets."""
-    tuning = tuning or TUNING
+    tuning = tuning or Tuning()
     copies = [(conv, p) for conv, p in pins.items() if p.get("parked")]
     kinds = [shelf_of(name) for name in openings.values()]
     return {"copies": {"count": len(copies),
@@ -1694,8 +1706,8 @@ def adopt_files(names, vouched=(), size=None, store=None, tuning=None):
     opening is named after its contents. A conversation's copy is good only
     if the pin file vouches for it. The pin file is asked first, because a
     client can make a key look like an opening."""
-    size = size or (store or STORE).size
-    tuning = tuning or TUNING
+    size = size or store.size
+    tuning = tuning or Tuning()
     openings, bytes_ = OrderedDict(), {}
     parked, spent = [], []
     for name in names:
@@ -1774,12 +1786,19 @@ class Pool:
               "requests_processing", "requests_deferred",
               "n_busy_slots_per_decode", "n_tokens_max")
 
-    def __init__(self, backends, *, store=None, tuning=None, watch=True):
+    def __init__(self, backends, *, store, tuning=None, events=None,
+                 watch=True):
+        """`store` is where this run keeps its copies, `tuning` the numbers it
+        was tuned to, `events` the log of what the cache decided. There is no
+        default store on purpose: a Pool that made its own would make the one
+        the checkout uses, and a test that forgot to pass one would write
+        where a live router keeps its caches."""
         self.cv = threading.Condition()
-        # Where this run keeps its copies, and the numbers it was tuned to.
-        # A test hands in its own.
-        self.store = store or STORE
-        self.tuning = tuning or TUNING
+        self.store = store
+        self.tuning = tuning or Tuning()
+        # Off unless a caller hands in a live one, so that building a Pool
+        # starts no writer thread.
+        self.events = events or EventLog(on=False)
         self.backends = [dict(b, slots=1, n_ctx=0, busy=0, up=False, served=0, model="",
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
                               cache={}, idle_runs={}, draining=False)
@@ -1787,7 +1806,7 @@ class Pool:
         # Each backend reports prompt cache evictions only in its own log.
         self.cache_watch = {be["name"]: CacheWatch(
             self.store.log(be["name"]),
-            sink=lambda kind, value, name=be["name"]: EVENTS.write(
+            sink=lambda kind, value, name=be["name"]: self.events.write(
                 "backend", backend=name, kind=kind, amount=value))
             for be in self.backends}
         self.pins = OrderedDict()
@@ -2627,7 +2646,7 @@ class Pool:
         # this run made. A park is rare: 952 in three days.
         if kept or spent:
             self.save_pins()
-        EVENTS.write("park", conv=short, backend=be["name"], slot=slot,
+        self.events.write("park", conv=short, backend=be["name"], slot=slot,
                      ok=bool(kept), bytes=written if kept else 0,
                      secs=round(time.time() - began, 2))
         if kept:
@@ -2655,7 +2674,7 @@ class Pool:
         except Exception as err:
             print(f"[router] {short_key(conv)} recall failed on {be['name']}: {err}",
                   flush=True)
-            EVENTS.write("recall", conv=short_key(conv), backend=be["name"],
+            self.events.write("recall", conv=short_key(conv), backend=be["name"],
                          slot=target_slot, ok=False, error=str(err)[:120],
                          secs=round(time.time() - began, 2))
             return False
@@ -2667,7 +2686,7 @@ class Pool:
                 record["slot"] = target_slot
             note_bytes = record.get("bytes", 0) if record else 0
             self.note_file("recalled", conv, be, target_slot, note_bytes)
-        EVENTS.write("recall", conv=short_key(conv), backend=be["name"],
+        self.events.write("recall", conv=short_key(conv), backend=be["name"],
                      slot=target_slot, ok=True, bytes=note_bytes,
                      secs=round(time.time() - began, 2))
         print(f"[router] recalled {short_key(conv)} onto {be['name']} slot {target_slot}",
@@ -2751,11 +2770,11 @@ class Pool:
                     self.forked.move_to_end(conv)
                     while len(self.forked) > self.tuning.recent_requests:
                         self.forked.popitem(last=False)
-                    EVENTS.write("fork", conv=short_key(conv),
+                    self.events.write("fork", conv=short_key(conv),
                                  parent=short_key(holder), depth=shared[0],
                                  cuts=len(cuts))
             # The cut keys, so an offline report can match them to copies.
-            EVENTS.write("choice", conv=short_key(conv),
+            self.events.write("choice", conv=short_key(conv),
                          base=short_key(base[1]),
                          stored=stored[0] if stored else None,
                          stored_key=short_key(stored[1]) if stored else None,
@@ -2808,11 +2827,11 @@ class Pool:
             self.wants.move_to_end(cut[1])
             while len(self.wants) > self.tuning.want_keep:
                 old, gone = self.wants.popitem(last=False)
-                EVENTS.write("want", key=short_key(old), shelf=mark_shelf(gone),
+                self.events.write("want", key=short_key(old), shelf=mark_shelf(gone),
                              action="dropped",
                              age=round(time.time() - gone.get("at", 0), 1))
             if fresh:
-                EVENTS.write("want", key=short_key(cut[1]), shelf=mark_shelf(mark),
+                self.events.write("want", key=short_key(cut[1]), shelf=mark_shelf(mark),
                              action="added")
 
     def build_once(self, post, remove=None):
@@ -2846,7 +2865,7 @@ class Pool:
                 # Dropped either way. A failed read fails again.
                 self.wants.pop(key, None)
                 self.cv.notify_all()
-        EVENTS.write("want", key=short_key(key), shelf=mark_shelf(want),
+        self.events.write("want", key=short_key(key), shelf=mark_shelf(want),
                      action="built", backend=be["name"], slot=slot,
                      ok=bool(kept), secs=round(time.time() - began, 1),
                      age=round(began - want.get("at", began), 1))
@@ -2994,7 +3013,7 @@ class Pool:
             self.note_file("moved", conv, target, free, written)
             self.flow.note(conv, "generate", target["name"], free)
             self.cv.notify_all()
-        EVENTS.write("migrate", conv=short_key(conv), src=source["name"],
+        self.events.write("migrate", conv=short_key(conv), src=source["name"],
                      dst=target["name"], bytes=written)
         print(f"[router] {short_key(conv)} read on {source['name']}, "
               f"generates on {target['name']} slot {free}", flush=True)
@@ -3162,7 +3181,7 @@ class Pool:
         except Exception as err:
             print(f"[router] opening {key[:8]} failed to load on "
                   f"{be['name']}: {err}", flush=True)
-            EVENTS.write("load", key=short_key(key), backend=be["name"],
+            self.events.write("load", key=short_key(key), backend=be["name"],
                          slot=slot, ok=False, error=str(err)[:120])
             return False
         # Sized: the dashboard draws each file event over its byte count.
@@ -3176,7 +3195,7 @@ class Pool:
             self.note_file("loaded opening", key, be, slot, read)
             loads = self.loads[key]
         self.save_openings()      # a load earns an opening its place
-        EVENTS.write("load", key=short_key(key), shelf=shelf,
+        self.events.write("load", key=short_key(key), shelf=shelf,
                      backend=be["name"], slot=slot, ok=True,
                      bytes=read, secs=round(time.time() - began, 2),
                      loads=loads)
@@ -3205,7 +3224,7 @@ class Pool:
             print(f"[router] opening {key[:8]} failed to save on "
                   f"{be['name']}: {err}", flush=True)
             remove(name)           # take back the link made before the read
-            EVENTS.write("build", key=short_key(key), shelf=mark_shelf(mark),
+            self.events.write("build", key=short_key(key), shelf=mark_shelf(mark),
                          backend=be["name"], slot=slot, ok=False,
                          error=str(err)[:120],
                          secs=round(time.time() - began, 1))
@@ -3214,7 +3233,7 @@ class Pool:
         written = self.store.size(name) or (answer.get("n_written") or 0)
         if written < self.tuning.park_floor:
             remove(name)           # the slot had already changed hands
-            EVENTS.write("build", key=short_key(key), shelf=mark_shelf(mark),
+            self.events.write("build", key=short_key(key), shelf=mark_shelf(mark),
                          backend=be["name"], slot=slot, ok=False,
                          error="slot changed hands",
                          secs=round(time.time() - began, 1))
@@ -3233,7 +3252,7 @@ class Pool:
             remove(extra)
         self.save_openings()
         timing = read.get("timings") or {}
-        EVENTS.write("build", key=short_key(key), shelf=mark_shelf(mark),
+        self.events.write("build", key=short_key(key), shelf=mark_shelf(mark),
                      backend=be["name"], slot=slot, ok=True,
                      secs=round(time.time() - began, 1),
                      bytes=written,
@@ -3354,7 +3373,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.rstrip("/") == "/router/json":
-            return self._send(200, json.dumps(POOL.status(), indent=2).encode())
+            return self._send(200, json.dumps(self.server.pool.status(), indent=2).encode())
         if self.command == "GET" and self.path.split("?")[0] in ("", "/", "/router"):
             # The backends serve their own web ui at the root. /router needs
             # the trailing slash so relative urls resolve under /router/.
@@ -3369,9 +3388,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if rest == "reset-rates":
                 if self.command != "POST":
                     return self._error(405, "post to reset the rates")
-                POOL.reset_rates(True)
+                self.server.pool.reset_rates(True)
                 return self._send(200, json.dumps(
-                    {"rates_since": POOL.rates_since}).encode())
+                    {"rates_since": self.server.pool.rates_since}).encode())
             if rest.startswith("config/"):
                 return self._config(rest[len("config/"):])
             return self._static(rest or "index.html")
@@ -3384,10 +3403,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.command != "POST":
             return self._error(405, "post to drain or resume a backend")
         if what == "resume":
-            done = POOL.resume(name)
+            done = self.server.pool.resume(name)
             return (self._send(200, json.dumps({"backend": name, "serving": True}).encode())
                     if done else self._error(404, f"no backend called {name}"))
-        report = POOL.drain(name, http_post)
+        report = self.server.pool.drain(name, http_post)
         if report is None:
             return self._error(404, f"no backend called {name}")
         # A drain that gave up, or whose saves failed, left caches only in
@@ -3407,11 +3426,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         host = host_only(self.headers.get("Host"))
         if not host or kind not in CONFIG_FILES:
             return self._error(404, "no such config")
-        with POOL.cv:
-            up = [be for be in POOL.backends if be["up"]]
+        with self.server.pool.cv:
+            up = [be for be in self.server.pool.backends if be["up"]]
             model = next((be["model"] for be in up if be["model"]), "qwen")
             n_ctx = min([be["n_ctx"] for be in up if be["n_ctx"]], default=150000)
-        config = client_config(kind, host, model, n_ctx)
+        config = client_config(kind, host, model, n_ctx,
+                               self.server.provider)
         if config is None:
             return self._error(404, "no such config")
         payload = json.dumps(config, indent=2).encode()
@@ -3481,7 +3501,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         previous = None
         try:
             while True:
-                payload = json.dumps(POOL.status())
+                payload = json.dumps(self.server.pool.status())
                 if payload != previous:
                     self.wfile.write(f"data: {payload}\n\n".encode())
                     self.wfile.flush()
@@ -3493,7 +3513,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _pool_props(self, path):
         """Answer /props and /slots for the whole pool. One backend's answer
         makes the router look like a one-slot server."""
-        live = [be for be in POOL.backends if be["up"]]
+        live = [be for be in self.server.pool.backends if be["up"]]
         if not live:
             return self._error(503, "no backend is up")
 
@@ -3530,10 +3550,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error(400, "Content-Length is negative")
         # Checked before the body is read, or a header alone could ask
         # this process for arbitrary memory.
-        if length > POOL.tuning.max_body:
+        if length > self.server.pool.tuning.max_body:
             self.close_connection = True
             return self._error(413, f"body of {length} bytes; this router "
-                                    f"reads at most {POOL.tuning.max_body}")
+                                    f"reads at most {self.server.pool.tuning.max_body}")
         # Nothing here decodes chunked. Read as an empty body, the unread
         # chunks become the next request line on this connection.
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
@@ -3552,21 +3572,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path in INFERENCE and self.command != "POST":
             return self._error(405, f"post to {path}")
         if path not in INFERENCE:
-            # An allowlist, see PASSED.
-            if path not in PASSED:
+            # An allowlist, see passed_paths.
+            if path not in self.server.passed:
                 return self._error(404, f"this router does not serve {path}")
-            be = next((b for b in POOL.backends if b["up"]), None)
+            be = next((b for b in self.server.pool.backends if b["up"]), None)
             if not be:
                 return self._error(503, "no backend is up")
             return self._forward(be, body)
 
-        vision = POOL.vision()
+        vision = self.server.pool.vision()
         tokens, images, image_charge = request_cost(body, vision)
         # `tokens` carries reply_tokens of room. The dashboard measures a
         # turn against the prompt sent: 1,024 tokens nobody sent is 41
         # seconds of reading nobody did.
-        prompt_tokens = max(0, tokens - POOL.tuning.reply_tokens)
-        largest = POOL.largest()
+        prompt_tokens = max(0, tokens - self.server.pool.tuning.reply_tokens)
+        largest = self.server.pool.largest()
         if largest and tokens > largest:
             return self._error(413, f"needs about {tokens} tokens. "
                                     f"The largest backend holds {largest}.")
@@ -3586,13 +3606,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             conv_source = "none"
         client = client_kind(self.headers)
         # Before anything is changed, so a capture holds what the client sent.
-        capture(conv, body)
+        capture(self.server.capture_dir, conv, body)
         # This model's template refuses a late system message.
         ordered = hoist_system(body)
         if ordered is not body:
             print(f"[router] a late system message became a user message "
                   f"for {path}", flush=True)
-            EVENTS.write("start_over", conv=short_key(conv) if conv else None,
+            self.server.pool.events.write("start_over", conv=short_key(conv) if conv else None,
                          reason="late_system", client=client, path=path)
         body = ordered
         cuts, messages, system, tools = prompt_cuts(body)
@@ -3606,21 +3626,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._open_stream(opening_event(path, body))
             stop_ping = self._ping_until()
 
-        ticket = POOL.begin_wait(conv, tokens, images, image_charge)
+        ticket = self.server.pool.begin_wait(conv, tokens, images, image_charge)
         try:
             # The turn ahead holds the pin, slot and copy this one needs.
-            mine = POOL.claim_turn(conv, ticket, self._still_there)
-            be = POOL.acquire(conv, tokens, self._still_there) if mine else None
+            mine = self.server.pool.claim_turn(conv, ticket, self._still_there)
+            be = self.server.pool.acquire(conv, tokens, self._still_there) if mine else None
         finally:
-            POOL.end_wait(ticket)
+            self.server.pool.end_wait(ticket)
         waited = time.time() - start
         if not be:
             # `done` only if this turn held the conversation: Flow is keyed
             # by conversation, and a turn that gave up in claim_turn deleted
             # the live row of the turn running.
             if mine:
-                POOL.note_stage(conv, "done")
-            POOL.finish_turn(conv, ticket)
+                self.server.pool.note_stage(conv, "done")
+            self.server.pool.finish_turn(conv, ticket)
             if stop_ping:
                 stop_ping()
             if opened:
@@ -3636,36 +3656,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # runs the same ending: claim_turn has no deadline, so a claim left
         # behind stops the conversation for good.
         try:
-            warm = bool(conv) and POOL.holds_slot(conv)
+            warm = bool(conv) and self.server.pool.holds_slot(conv)
             # One slot, decided once, for the read below to extend.
-            slot = POOL.pick_slot(be, conv)
-            POOL.note_stage(conv, "prefill", be["name"], slot)
+            slot = self.server.pool.pick_slot(be, conv)
+            self.server.pool.note_stage(conv, "prefill", be["name"], slot)
             # Nothing reaches the backend until the caches on it are on disk.
-            POOL.ensure_parked(be, conv, http_post)
+            self.server.pool.ensure_parked(be, conv, http_post)
             # A copy with an opening the client no longer sends is no prefix.
-            if POOL.forget_stale_park(conv, cuts):
-                EVENTS.write("start_over", conv=short_key(conv) if conv else None,
+            if self.server.pool.forget_stale_park(conv, cuts):
+                self.server.pool.events.write("start_over", conv=short_key(conv) if conv else None,
                              reason="stale_copy", client=client, path=path)
-            recalled = POOL.recall(conv, be, slot, http_post)
+            recalled = self.server.pool.recall(conv, be, slot, http_post)
             loaded = (not recalled
-                      and POOL.warm_prefix(conv, cuts, messages, system, tools,
+                      and self.server.pool.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, http_post, path))
             if asked is not None:
                 # Watch the client. The timings say what the cache saved.
                 answer = http_post_wanted(be["url"], path, read_only(body, slot),
-                                          POOL.tuning.read_timeout, self._still_there)
+                                          self.server.pool.tuning.read_timeout, self._still_there)
                 timing = (answer or {}).get("timings") or {}
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
                               "read_cache_n": timing.get("cache_n")}
-                POOL.note_slot(conv, slot)
-                serving = POOL.hand_off(conv, be, tokens, http_post,
+                self.server.pool.note_slot(conv, slot)
+                serving = self.server.pool.hand_off(conv, be, tokens, http_post,
                                         wanted=self._still_there)
                 if serving is None:
                     # The cache is parked, and no backend is held.
                     raise Gone("the client stopped waiting for a slot to generate in")
             if serving is be:
                 # Nothing was carried. hand_off already noted a carried turn.
-                POOL.note_stage(conv, "generate", be["name"], slot)
+                self.server.pool.note_stage(conv, "generate", be["name"], slot)
             if stop_ping:
                 stop_ping()                    # waits for a ping in flight
             self._forward(serving, body, conv, opened=opened)
@@ -3687,30 +3707,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             parking = False
             try:
                 if serving is not None:
-                    POOL.note_holds(conv, serving, cuts)
-                    POOL.release(serving, conv)
+                    self.server.pool.note_holds(conv, serving, cuts)
+                    self.server.pool.release(serving, conv)
                 # After the release: these write the copy that is not behind.
                 if left:
-                    POOL.park_partial(conv, be, slot, http_post)
+                    self.server.pool.park_partial(conv, be, slot, http_post)
                 # A backend that does not read cannot serve the next turn, so
                 # leave a copy for one that does, on a worker.
                 if serving is not None:
-                    parking = POOL.park_later(serving, conv, http_post, ticket)
+                    parking = self.server.pool.park_later(serving, conv, http_post, ticket)
             except Exception as err:
                 # A ticket not given back costs the conversation every later
                 # turn: claim_turn has no deadline. The lines below must run.
                 print(f"[router] {short_key(conv)} could not be put away: "
                       f"{err}", flush=True)
             took = time.time() - start
-            POOL.note_stage(conv, "done")
+            self.server.pool.note_stage(conv, "done")
             # The worker ends the turn once the copy has landed.
             if not parking:
-                POOL.finish_turn(conv, ticket)
-            POOL.note_request(conv, be, path, took, waited,
+                self.server.pool.finish_turn(conv, ticket)
+            self.server.pool.note_request(conv, be, path, took, waited,
                               how_started(warm, recalled, loaded), prompt_tokens,
                               images=images, image_tokens_=image_charge,
                               **read_stats)
-            EVENTS.write("request", conv=short_key(conv) if conv else None,
+            self.server.pool.events.write("request", conv=short_key(conv) if conv else None,
                          source=conv_source, client=client, path=path,
                          est_tokens=tokens, n_cuts=len(cuts),
                          backend=be["name"],
@@ -3769,7 +3789,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         beat = ping_for(self.path.split("?")[0])
 
         def run():
-            while not stop.wait(POOL.tuning.ping_every):
+            while not stop.wait(self.server.pool.tuning.ping_every):
                 with self.sending:
                     if stop.is_set():
                         return
@@ -3830,7 +3850,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         request = urllib.request.Request(be["url"] + target, data=data,
                                          headers=headers, method=self.command)
         try:
-            upstream = urllib.request.urlopen(request, timeout=POOL.tuning.forward_timeout)
+            upstream = urllib.request.urlopen(request, timeout=self.server.pool.tuning.forward_timeout)
         except urllib.error.HTTPError as e:
             upstream = e                       # pass the backend error through
         except Exception as e:
@@ -3883,7 +3903,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             def keep_alive():
                 while not done.wait(1.0):
-                    if time.time() - last[0] < POOL.tuning.ping_every:
+                    if time.time() - last[0] < self.server.pool.tuning.ping_every:
                         continue
                     with sending:
                         if done.is_set():
@@ -3927,7 +3947,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     names = {"input_tokens": "input", "output_tokens": "output",
                              "cache_read_input_tokens": "cache_read",
                              "cache_creation_input_tokens": "cache_write"}
-                    EVENTS.write("usage", backend=be["name"],
+                    self.server.pool.events.write("usage", backend=be["name"],
                                  conv=short_key(conv) if conv else None,
                                  path=self.path.split("?")[0],
                                  **{short: splice.reported[full]
@@ -3935,7 +3955,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     if isinstance(splice.reported.get(full), int)})
                 if oai_tee and oai_tee.usage:
                     details = oai_tee.usage.get("prompt_tokens_details") or {}
-                    EVENTS.write("usage", backend=be["name"],
+                    self.server.pool.events.write("usage", backend=be["name"],
                                  conv=short_key(conv) if conv else None,
                                  path=self.path.split("?")[0],
                                  input=oai_tee.usage.get("prompt_tokens"),
@@ -3968,6 +3988,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    # What a Handler reads. __main__ sets these from build(); a test sets the
+    # pool and leaves the rest. They are here rather than in the module so
+    # that two servers in one process cannot share them by accident.
+    pool = None
+    capture_dir = None
+    passed = PASSED
+    provider = None
 
     def server_bind(self):
         # Accept IPv4 on the IPv6 socket. Tailscale gives a machine both,
@@ -4003,6 +4031,23 @@ class Stamped:
     def flush(self):
         self.out.flush()
 
+def build(env=None):
+    """Read the environment once and wire the router from it.
+
+    Importing this module does none of this. It defines names, and nothing
+    else: no thread starts, no directory is read, and a bad backend table
+    fails here rather than at the import of whatever asked for it."""
+    env = os.environ if env is None else env
+    tuning = Tuning.from_env(env)
+    store = Store(env.get("RUN")
+                  or Path(__file__).resolve().parent.parent / "run",
+                  env.get("BLOCK_DIR"))
+    events = EventLog(env.get("CACHE_LOG_DIR") or store.run, on=tuning.cache_log)
+    table, whence = read_backend_table(env)
+    pool = Pool(table, store=store, tuning=tuning, events=events)
+    return pool, whence
+
+
 if __name__ == "__main__":
     sys.stdout = Stamped(sys.stdout)
     sys.stderr = Stamped(sys.stderr)
@@ -4011,7 +4056,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="::")   # "::" means IPv6 and IPv4
     args = parser.parse_args()
     Server.address_family = socket.AF_INET6 if ":" in args.host else socket.AF_INET
-    POOL = Pool(BACKENDS)
+    POOL, BACKENDS_FROM = build()
     POOL.adopt()
 
     stopping = threading.Event()
@@ -4036,12 +4081,14 @@ if __name__ == "__main__":
         print(f"[router] parked {parked} conversation(s), wrote {kept} pin(s)",
               flush=True)
         # sys.exit drops what the daemon writer still holds.
-        EVENTS.flush()
+        POOL.events.flush()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shut_down)
     signal.signal(signal.SIGINT, shut_down)
-    print(f"[router] {len(BACKENDS)} backend(s) from {BACKENDS_FROM}: "
-          f"{', '.join(b['name'] for b in BACKENDS)}", flush=True)
+    print(f"[router] {len(POOL.backends)} backend(s) from {BACKENDS_FROM}: "
+          f"{', '.join(b['name'] for b in POOL.backends)}", flush=True)
     print(f"[router] listening on {args.host}:{args.port}", flush=True)
-    Server((args.host, args.port), Handler).serve_forever()
+    server = Server((args.host, args.port), Handler)
+    server.pool = POOL
+    server.serve_forever()
