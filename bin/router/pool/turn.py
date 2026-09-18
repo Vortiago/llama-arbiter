@@ -18,7 +18,8 @@ import time
 from dataclasses import dataclass
 
 from ..identity import conversation_id, prompt_key, short_key
-from ..protocol.body import prompt_cuts, read_only, wants_stream
+from ..protocol.body import (hoist_system, prompt_cuts, read_only,
+                            wants_stream)
 from ..protocol.sse import opening_event
 from ..sizing import request_cost
 from ..transport import Gone
@@ -101,12 +102,21 @@ class Turn:
             conv_source = "none"
         # Before anything is changed, so a capture holds what the client sent.
         capture(pool.capture_dir, conv, ask.body)
-        cuts, messages, system, tools = prompt_cuts(ask.body)
+        # This model's template refuses a late system message.
+        body = hoist_system(ask.body)
+        if body is not ask.body:
+            print(f"[router] a late system message became a user message "
+                  f"for {ask.path}", flush=True)
+            pool.events.write("start_over",
+                              conv=short_key(conv) if conv else None,
+                              reason="late_system", client=client.kind,
+                              path=ask.path)
+        cuts, messages, system, tools = prompt_cuts(body)
         # The stream and its keep-alive open before the slot is asked for.
         start = time.time()
-        asked = read_only(ask.body)
-        if asked is not None and wants_stream(ask.body):
-            client.open(opening_event(ask.path, ask.body))
+        asked = read_only(body)
+        if asked is not None and wants_stream(body):
+            client.open(opening_event(ask.path, body))
 
         ticket = pool.begin_wait(conv, tokens, images, image_charge)
         try:
@@ -153,7 +163,7 @@ class Turn:
                                            be, slot, ask.path))
             if asked is not None:
                 # Watch the client. The timings say what the cache saved.
-                answer = pool.link.read(be, ask.path, read_only(ask.body, slot),
+                answer = pool.link.read(be, ask.path, read_only(body, slot),
                                         client.alive, pool.tuning.read_timeout)
                 timing = (answer or {}).get("timings") or {}
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
@@ -168,7 +178,7 @@ class Turn:
                 # Nothing was carried. hand_off already noted a carried turn.
                 pool.note_stage(conv, "generate", be["name"], slot)
             client.settle()                    # waits for a ping in flight
-            client.relay(serving, ask.body, conv)
+            client.relay(serving, body, conv)
         except Gone:
             # Nobody to answer. What the read got through is parked below.
             print(f"[router] {short_key(conv)} left while {be['name']} was "
