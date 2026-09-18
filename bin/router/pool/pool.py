@@ -1,6 +1,6 @@
 """The slots, the pins, and everything a turn moves."""
 
-import json, queue, threading, time, urllib.error, urllib.parse, urllib.request
+import queue, threading, time
 from collections import OrderedDict, deque
 from ..backends import by_place, generates, prefills
 from ..identity import copy_is_current, mark_shelf, short_key

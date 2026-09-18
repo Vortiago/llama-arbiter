@@ -16,6 +16,16 @@ _Avoid_: session, chat, thread
 One prompt the client sends, and the reply it gets, inside a conversation.
 _Avoid_: exchange, round, request as a name for the whole turn
 
+**Ask**:
+What one client sent for one turn, as the router reads it: the path, the
+body, and the conversation a header named.
+_Avoid_: request, payload, params
+
+**Client**:
+Whoever asked, behind the one seam a turn writes to. The public port is the
+only real one; a test writes its own and runs a whole turn with no socket.
+_Avoid_: caller, consumer, peer, connection
+
 **Prefill**:
 To read a prompt. The work is compute bound and runs for tens of minutes.
 _Avoid_: ingest, process, evaluate

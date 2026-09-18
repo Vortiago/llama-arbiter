@@ -11,7 +11,6 @@ class Server(http.server.ThreadingHTTPServer):
     # pool and leaves the rest. They are here rather than in the module so
     # that two servers in one process cannot share them by accident.
     pool = None
-    capture_dir = None
     passed = PASSED
     provider = None
 

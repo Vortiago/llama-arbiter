@@ -1,14 +1,13 @@
 """The public port: what it serves and what it refuses."""
 
-import http.client, http.server, json, os, select, socket, threading, time, urllib.error, urllib.parse, urllib.request
+import http.client, http.server, json, os, select, socket, threading, time
 from pathlib import Path
-from ..identity import client_kind, conversation_id, prompt_key, session_key, short_key
-from ..pool.turn import capture, how_started
-from ..protocol.body import hoist_system, prompt_cuts, read_only, request_shape, wants_stream
+from ..identity import client_kind, session_key, short_key
+from ..pool.turn import Ask
+from ..protocol.body import request_shape
 from ..protocol.splice import AnthropicSplice, OaiUsageSplice, wants_usage, with_usage
-from ..protocol.sse import _say, anthropic, opening_event, ping_for, sse_event, wants_ping
-from ..sizing import request_cost
-from ..transport import Gone, said_in
+from ..protocol.sse import _say, anthropic, ping_for, sse_event, wants_ping
+from ..transport import said_in
 from .config import CONFIG_FILES, client_config, host_only
 
 def passed_paths(env=None):
@@ -283,171 +282,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._error(503, "no backend is up")
             return self._forward(be, body)
 
-        vision = self.server.pool.vision()
-        tokens, images, image_charge = request_cost(body, vision)
-        # `tokens` carries reply_tokens of room. The dashboard measures a
-        # turn against the prompt sent: 1,024 tokens nobody sent is 41
-        # seconds of reading nobody did.
-        prompt_tokens = max(0, tokens - self.server.pool.tuning.reply_tokens)
-        largest = self.server.pool.largest()
-        if largest and tokens > largest:
-            return self._error(413, f"needs about {tokens} tokens. "
-                                    f"The largest backend holds {largest}.")
-        if not largest:
-            return self._error(503, "no backend is up yet")
-
-        # The session id beats a guess from the prompt, and covers
-        # /v1/messages, where the system prompt is a separate field.
-        # `conv_source` says how the conversation was recognised. Decided
-        # here: a re-parse of a ctx 150000 turn is megabytes.
-        conv, conv_source = session_key(self.headers), "header"
-        if not conv:
-            conv, conv_source = prompt_key(body), "cache_key"
-        if not conv:
-            conv, conv_source = conversation_id(body), "hash"
-        if not conv:
-            conv_source = "none"
-        client = client_kind(self.headers)
-        # Before anything is changed, so a capture holds what the client sent.
-        capture(self.server.capture_dir, conv, body)
-        # This model's template refuses a late system message.
-        ordered = hoist_system(body)
-        if ordered is not body:
-            print(f"[router] a late system message became a user message "
-                  f"for {path}", flush=True)
-            self.server.pool.events.write("start_over", conv=short_key(conv) if conv else None,
-                         reason="late_system", client=client, path=path)
-        body = ordered
-        cuts, messages, system, tools = prompt_cuts(body)
-        # The stream and its keep-alive open before the slot is asked for.
-        start = time.time()
-        asked = read_only(body)
-        opened = asked is not None and wants_stream(body)
+        # Per request, not per connection: this handler serves every
+        # request on a keep-alive connection.
         self.sending = threading.Lock()        # one writer at a time
-        stop_ping = None
-        if opened:
-            self._open_stream(opening_event(path, body))
-            stop_ping = self._ping_until()
+        self.streaming = False
+        self.stop_ping = None
+        self.kind = client_kind(self.headers)
+        self.server.pool.turn(Ask(path, body, session_key(self.headers)), self)
 
-        ticket = self.server.pool.begin_wait(conv, tokens, images, image_charge)
-        try:
-            # The turn ahead holds the pin, slot and copy this one needs.
-            mine = self.server.pool.claim_turn(conv, ticket, self._still_there)
-            be = self.server.pool.acquire(conv, tokens, self._still_there) if mine else None
-        finally:
-            self.server.pool.end_wait(ticket)
-        waited = time.time() - start
-        if not be:
-            # `done` only if this turn held the conversation: Flow is keyed
-            # by conversation, and a turn that gave up in claim_turn deleted
-            # the live row of the turn running.
-            if mine:
-                self.server.pool.note_stage(conv, "done")
-            self.server.pool.finish_turn(conv, ticket)
-            if stop_ping:
-                stop_ping()
-            if opened:
-                return self._say_and_end("no backend can serve this request")
-            return self._error(503, "no backend can serve this request")
-        # Read here, then generate wherever is free after the read.
-        serving = be
-        left = False                           # the client gave up mid-read
-        read_stats = {}
-        recalled = loaded = warm = False
-        slot = None
-        # The backend and the conversation are held from here. Every way out
-        # runs the same ending: claim_turn has no deadline, so a claim left
-        # behind stops the conversation for good.
-        try:
-            warm = bool(conv) and self.server.pool.holds_slot(conv)
-            # One slot, decided once, for the read below to extend.
-            slot = self.server.pool.pick_slot(be, conv)
-            self.server.pool.note_stage(conv, "prefill", be["name"], slot)
-            # Nothing reaches the backend until the caches on it are on disk.
-            self.server.pool.ensure_parked(be, conv)
-            # A copy with an opening the client no longer sends is no prefix.
-            if self.server.pool.forget_stale_park(conv, cuts):
-                self.server.pool.events.write("start_over", conv=short_key(conv) if conv else None,
-                             reason="stale_copy", client=client, path=path)
-            recalled = self.server.pool.recall(conv, be, slot)
-            loaded = (not recalled
-                      and self.server.pool.warm_prefix(conv, cuts, messages,
-                                                       system, tools, be, slot,
-                                                       path))
-            if asked is not None:
-                # Watch the client. The timings say what the cache saved.
-                answer = self.server.pool.link.read(
-                    be, path, read_only(body, slot),
-                    self._still_there, self.server.pool.tuning.read_timeout)
-                timing = (answer or {}).get("timings") or {}
-                read_stats = {"read_prompt_n": timing.get("prompt_n"),
-                              "read_cache_n": timing.get("cache_n")}
-                self.server.pool.note_slot(conv, slot)
-                serving = self.server.pool.hand_off(
-                    conv, be, tokens, wanted=self._still_there)
-                if serving is None:
-                    # The cache is parked, and no backend is held.
-                    raise Gone("the client stopped waiting for a slot to generate in")
-            if serving is be:
-                # Nothing was carried. hand_off already noted a carried turn.
-                self.server.pool.note_stage(conv, "generate", be["name"], slot)
-            if stop_ping:
-                stop_ping()                    # waits for a ping in flight
-            self._forward(serving, body, conv, opened=opened)
-        except Gone:
-            # Nobody to answer. What the read got through is parked below.
-            print(f"[router] {short_key(conv)} left while {be['name']} was "
-                  f"reading, {time.time() - start:.0f}s in ({self.went})",
-                  flush=True)
-            left = True
-        except Exception as err:
-            if opened:
-                # The reply already started, so say it in the stream.
-                self._say_and_end(f"{be['name']}: {err}")
-            else:
-                self._error(502, f"{be['name']}: {err}")
-        finally:
-            if stop_ping:
-                stop_ping()
-            parking = False
-            try:
-                if serving is not None:
-                    self.server.pool.note_holds(conv, serving, cuts)
-                    self.server.pool.release(serving, conv)
-                # After the release: these write the copy that is not behind.
-                if left:
-                    self.server.pool.park_partial(conv, be, slot)
-                # A backend that does not read cannot serve the next turn, so
-                # leave a copy for one that does, on a worker.
-                if serving is not None:
-                    parking = self.server.pool.park_later(serving, conv, ticket)
-            except Exception as err:
-                # A ticket not given back costs the conversation every later
-                # turn: claim_turn has no deadline. The lines below must run.
-                print(f"[router] {short_key(conv)} could not be put away: "
-                      f"{err}", flush=True)
-            took = time.time() - start
-            self.server.pool.note_stage(conv, "done")
-            # The worker ends the turn once the copy has landed.
-            if not parking:
-                self.server.pool.finish_turn(conv, ticket)
-            self.server.pool.note_request(conv, be, path, took, waited,
-                              how_started(warm, recalled, loaded), prompt_tokens,
-                              images=images, image_tokens_=image_charge,
-                              **read_stats)
-            self.server.pool.events.write("request", conv=short_key(conv) if conv else None,
-                         source=conv_source, client=client, path=path,
-                         est_tokens=tokens, n_cuts=len(cuts),
-                         backend=be["name"],
-                         started=how_started(warm, recalled, loaded),
-                         took=round(took, 3), waited=round(waited, 3),
-                         left=True if left else None,
-                         **read_stats)
-            print(f"[router] {self.command} {path} -> {be['name']} "
-                  f"{took:.1f}s", flush=True)
+    # -- the client a turn answers. See pool/turn.py for what each one owes.
 
     sending = None                             # set per request in _route
+    streaming = False                          # a stream has already begun
+    stop_ping = None                           # how to stop the keep-alive
+    kind = None                                # which client program asked
     went = "closed its end"                    # why the client stopped waiting
+
+    def alive(self):
+        return self._still_there()
+
+    def open(self, opening):
+        """Answer now, before the prompt is read: a read sends nothing for
+        tens of minutes, and a client drops a quiet stream."""
+        self._open_stream(opening)
+        self.streaming = True
+        self.stop_ping = self._ping_until()
+
+    def settle(self):
+        """Stop the keep-alive, waiting for a ping in flight. A turn calls
+        this on every way out, so it has to bear being called twice."""
+        if self.stop_ping:
+            self.stop_ping()
+            self.stop_ping = None
+
+    def relay(self, be, body, conv):
+        self._forward(be, body, conv, opened=self.streaming)
+
+    def fail(self, code, message):
+        """Say the turn cannot be served. Once a stream has begun there is no
+        status line left to send, so the message goes in the stream."""
+        if self.streaming:
+            return self._say_and_end(message)
+        self._error(code, message)
 
     def _still_there(self):
         """False once the client has closed its end. The body is already read,
