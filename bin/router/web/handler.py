@@ -299,11 +299,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     went = "closed its end"                    # why the client stopped waiting
 
     def alive(self):
-        return self._still_there()
+        """False once the client has closed its end. The body is already read,
+        so readable with nothing on it means gone. `self.went` records which
+        case. poll, not select: select refuses a descriptor at or above
+        FD_SETSIZE (1024) and raises ValueError for a live client."""
+        try:
+            watch = select.poll()
+            watch.register(self.connection, select.POLLIN)
+            if not watch.poll(0):
+                return True
+            if self.connection.recv(1, socket.MSG_PEEK):
+                return True
+            self.went = "closed its end"
+        except (OSError, ValueError) as err:
+            # fileno() is -1 on a closed socket, which poll refuses.
+            self.went = f"{type(err).__name__}: {err}"
+        return False
 
     def open(self, opening):
-        """Answer now, before the prompt is read: a read sends nothing for
-        tens of minutes, and a client drops a quiet stream."""
+        """Begin the stream, and fill the silence until the reply starts."""
         self._open_stream(opening)
         self.streaming = True
         self.stop_ping = self._ping_until()
@@ -324,24 +338,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.streaming:
             return self._say_and_end(message)
         self._error(code, message)
-
-    def _still_there(self):
-        """False once the client has closed its end. The body is already read,
-        so readable with nothing on it means gone. `self.went` records which
-        case. poll, not select: select refuses a descriptor at or above
-        FD_SETSIZE (1024) and raises ValueError for a live client."""
-        try:
-            watch = select.poll()
-            watch.register(self.connection, select.POLLIN)
-            if not watch.poll(0):
-                return True
-            if self.connection.recv(1, socket.MSG_PEEK):
-                return True
-            self.went = "closed its end"
-        except (OSError, ValueError) as err:
-            # fileno() is -1 on a closed socket, which poll refuses.
-            self.went = f"{type(err).__name__}: {err}"
-        return False
 
     def _open_stream(self, opening=b""):
         """Answer the client now, before the prompt is read: a read sends

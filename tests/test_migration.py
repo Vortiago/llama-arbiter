@@ -128,11 +128,11 @@ class ARequestCanBeWrittenDown(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
 
     def test_nothing_is_written_when_no_directory_is_named(self):
-        router.capture(None, "conv", b'{"a":1}')
+        router.capture(None, "conv", b'{"a":1}', SANDBOX.tuning.capture_keep)
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_the_body_is_written_when_a_directory_is_named(self):
-        router.capture(self.root, "abc", b'{"a":1}')
+        router.capture(self.root, "abc", b'{"a":1}', SANDBOX.tuning.capture_keep)
         written = list(self.root.glob("*.json"))
         self.assertEqual(len(written), 1)
         self.assertEqual(written[0].read_bytes(), b'{"a":1}')
@@ -140,7 +140,7 @@ class ARequestCanBeWrittenDown(unittest.TestCase):
 
     def test_only_the_newest_of_a_conversation_are_kept(self):
         for n in range(SANDBOX.tuning.capture_keep + 5):
-            router.capture(self.root, "busy", b'{"n":%d}' % n)
+            router.capture(self.root, "busy", b'{"n":%d}' % n, SANDBOX.tuning.capture_keep)
         self.assertEqual(len(list(self.root.glob("*.json"))),
                          SANDBOX.tuning.capture_keep)
 
@@ -149,9 +149,9 @@ class ARequestCanBeWrittenDown(unittest.TestCase):
 
         OpenCode sends a turn an hour and Claude Code sends one a minute. Kept
         as one list, the hourly body was gone both times it was wanted."""
-        router.capture(self.root, "quiet", b'{"quiet":1}')
+        router.capture(self.root, "quiet", b'{"quiet":1}', SANDBOX.tuning.capture_keep)
         for n in range(SANDBOX.tuning.capture_keep + 5):
-            router.capture(self.root, "busy", b'{"n":%d}' % n)
+            router.capture(self.root, "busy", b'{"n":%d}' % n, SANDBOX.tuning.capture_keep)
         self.assertEqual([p.read_bytes() for p in self.root.glob("*-quiet.json")],
                          [b'{"quiet":1}'])
 
@@ -4317,7 +4317,7 @@ class TheBackendsMessageStartIsTakenOut(unittest.TestCase):
 
 
 class AnIdleClientIsStillThere(unittest.TestCase):
-    """_still_there aborts a read when it answers False.
+    """alive aborts a read when it answers False.
 
     A read is the only slow thing on this box, so a false positive would end
     every long one. A live client sends nothing for the whole read, and that
@@ -4335,24 +4335,24 @@ class AnIdleClientIsStillThere(unittest.TestCase):
     def test_a_client_that_sends_nothing_is_still_there(self):
         handler, theirs = self.peer()
         for _ in range(3):
-            self.assertTrue(handler._still_there())
+            self.assertTrue(handler.alive())
 
     def test_a_client_that_closed_its_end_has_gone(self):
         handler, theirs = self.peer()
         theirs.close()
-        self.assertFalse(handler._still_there())
+        self.assertFalse(handler.alive())
 
     def test_a_client_that_said_something_is_still_there(self):
         """A pipelined request arrives on the same socket. It is not a
         departure, and a byte waiting to be read must not read as one."""
         handler, theirs = self.peer()
         theirs.sendall(b"POST /v1/messages HTTP/1.1\r\n")
-        self.assertTrue(handler._still_there())
+        self.assertTrue(handler.alive())
 
     def test_a_socket_that_is_gone_altogether_reads_as_gone(self):
         handler, theirs = self.peer()
         handler.connection.close()
-        self.assertFalse(handler._still_there())
+        self.assertFalse(handler.alive())
 
     def test_a_client_on_a_high_descriptor_is_still_there(self):
         """select cannot be given a descriptor at or above FD_SETSIZE, 1024.
@@ -4371,9 +4371,9 @@ class AnIdleClientIsStillThere(unittest.TestCase):
         handler.connection = socket.socket(fileno=high)
         # detach, or closing this wrapper closes the descriptor addCleanup has
         self.addCleanup(handler.connection.detach)
-        self.assertTrue(handler._still_there())
+        self.assertTrue(handler.alive())
         theirs.sendall(b"POST /v1/messages HTTP/1.1\r\n")
-        self.assertTrue(handler._still_there())
+        self.assertTrue(handler.alive())
 
 
 class AnErrorEndsTheStreamInItsOwnProtocol(unittest.TestCase):

@@ -19,13 +19,13 @@ from dataclasses import dataclass
 
 from ..identity import conversation_id, prompt_key, short_key
 from ..protocol.body import (hoist_system, prompt_cuts, read_only,
-                            wants_stream)
+                             wants_stream)
 from ..protocol.sse import opening_event
 from ..sizing import request_cost
 from ..transport import Gone
 
 
-def capture(directory, conv, body, keep=24):
+def capture(directory, conv, body, keep):
     """Write one request body down, for comparing two turns offline. Kept
     per conversation, so a busy client cannot crowd out a quiet one."""
     if directory is None:
@@ -56,6 +56,22 @@ def how_started(warm, recalled, loaded):
     return "cold"
 
 
+def name_conversation(ask):
+    """Which conversation this turn belongs to, and how the router knew it.
+
+    The conversation the client named beats a guess from the prompt, and
+    covers /v1/messages, where the system prompt is a separate field. Decided
+    once: a re-parse of a ctx 150000 turn is megabytes.
+    """
+    if ask.conv:
+        return ask.conv, "header"
+    named = prompt_key(ask.body)
+    if named:
+        return named, "cache_key"
+    named = conversation_id(ask.body)
+    return named, ("hash" if named else "none")
+
+
 @dataclass(frozen=True)
 class Ask:
     """What one client sent for one turn, as the router reads it.
@@ -77,7 +93,8 @@ class Turn:
 
     def run(self, ask, client):
         pool = self.pool
-        tokens, images, image_charge = request_cost(ask.body, pool.vision())
+        tokens, images, image_charge = request_cost(ask.body, pool.vision(),
+                                                    pool.tuning)
         # `tokens` carries reply_tokens of room. The dashboard measures a
         # turn against the prompt sent: 1,024 tokens nobody sent is 41
         # seconds of reading nobody did.
@@ -89,29 +106,21 @@ class Turn:
         if not largest:
             return client.fail(503, "no backend is up yet")
 
-        # The session id beats a guess from the prompt, and covers
-        # /v1/messages, where the system prompt is a separate field.
-        # `conv_source` says how the conversation was recognised. Decided
-        # here: a re-parse of a ctx 150000 turn is megabytes.
-        conv, conv_source = ask.conv, "header"
-        if not conv:
-            conv, conv_source = prompt_key(ask.body), "cache_key"
-        if not conv:
-            conv, conv_source = conversation_id(ask.body), "hash"
-        if not conv:
-            conv_source = "none"
-        # Before anything is changed, so a capture holds what the client sent.
-        capture(pool.capture_dir, conv, ask.body)
-        # This model's template refuses a late system message.
+        conv, conv_source = name_conversation(ask)
+        # `null` in the log, and not an empty string, for a turn whose
+        # conversation the router could not name.
+        short = short_key(conv) if conv else None
+        capture(pool.capture_dir, conv, ask.body, pool.tuning.capture_keep)
+        # This model's template refuses a late system message. The turn
+        # holds both bodies from here: about 600 KB for a ctx 150000 turn,
+        # against a box that holds the model itself.
         body = hoist_system(ask.body)
         if body is not ask.body:
             print(f"[router] a late system message became a user message "
                   f"for {ask.path}", flush=True)
-            pool.events.write("start_over",
-                              conv=short_key(conv) if conv else None,
-                              reason="late_system", client=client.kind,
-                              path=ask.path)
-        cuts, messages, system, tools = prompt_cuts(body)
+            pool.events.write("start_over", conv=short, reason="late_system",
+                              client=client.kind, path=ask.path)
+        cuts, messages, system, tools = prompt_cuts(body, pool.tuning)
         # The stream and its keep-alive open before the slot is asked for.
         start = time.time()
         asked = read_only(body)
@@ -153,17 +162,17 @@ class Turn:
             pool.ensure_parked(be, conv)
             # A copy with an opening the client no longer sends is no prefix.
             if pool.forget_stale_park(conv, cuts):
-                pool.events.write("start_over",
-                                  conv=short_key(conv) if conv else None,
-                                  reason="stale_copy", client=client.kind,
-                                  path=ask.path)
+                pool.events.write("start_over", conv=short, reason="stale_copy",
+                                  client=client.kind, path=ask.path)
             recalled = pool.recall(conv, be, slot)
             loaded = (not recalled
                       and pool.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, ask.path))
             if asked is not None:
-                # Watch the client. The timings say what the cache saved.
-                answer = pool.link.read(be, ask.path, read_only(body, slot),
+                # Watch the client. The timings say what the cache saved. The
+                # read asks for what `asked` already is, in one named slot.
+                answer = pool.link.read(be, ask.path,
+                                        dict(asked, id_slot=slot),
                                         client.alive, pool.tuning.read_timeout)
                 timing = (answer or {}).get("timings") or {}
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
@@ -207,22 +216,20 @@ class Turn:
                 print(f"[router] {short_key(conv)} could not be put away: "
                       f"{err}", flush=True)
             took = time.time() - start
+            started = how_started(warm, recalled, loaded)
             pool.note_stage(conv, "done")
             # The worker ends the turn once the copy has landed.
             if not parking:
                 pool.finish_turn(conv, ticket)
-            pool.note_request(conv, be, ask.path, took, waited,
-                              how_started(warm, recalled, loaded), prompt_tokens,
-                              images=images, image_tokens_=image_charge,
-                              **read_stats)
-            pool.events.write("request", conv=short_key(conv) if conv else None,
-                              source=conv_source, client=client.kind,
-                              path=ask.path, est_tokens=tokens,
-                              n_cuts=len(cuts), backend=be["name"],
-                              started=how_started(warm, recalled, loaded),
+            pool.note_request(conv, be, ask.path, took, waited, started,
+                              prompt_tokens, images=images,
+                              image_tokens_=image_charge, **read_stats)
+            pool.events.write("request", conv=short, source=conv_source,
+                              client=client.kind, path=ask.path,
+                              est_tokens=tokens, n_cuts=len(cuts),
+                              backend=be["name"], started=started,
                               took=round(took, 3), waited=round(waited, 3),
-                              left=True if left else None,
-                              **read_stats)
+                              left=left or None, **read_stats)
             # Only POST reaches a turn: the handler refuses every other method
             # on an inference path.
             print(f"[router] POST {ask.path} -> {be['name']} "

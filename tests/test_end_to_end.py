@@ -1220,7 +1220,7 @@ class AnAnthropicStreamIsAMessageFromTheStart(EndToEnd):
 class AnIdleClientIsNotAGoneOne(EndToEnd):
     """A live client that sends nothing must never be judged to have left.
 
-    _still_there aborts the read when it answers False, and a read is the
+    alive aborts the read when it answers False, and a read is the
     only thing this box does slowly. A false positive here would kill every
     long read on it, so idleness has to be proven harmless rather than
     assumed to be."""
