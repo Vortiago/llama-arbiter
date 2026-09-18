@@ -1213,6 +1213,12 @@ class Pool:
             # Nothing to carry this to, and the instance holding it does
             # not generate. Wait, holding a prefill slot.
             if wanted is not None and not wanted():
+                # None means no backend is held, the same as the give-up
+                # below. The caller reads it that way and releases nothing,
+                # so the slot has to go back here.
+                with self.cv:
+                    source["busy"] -= 1
+                    self.cv.notify_all()
                 return None
             with self.cv:
                 self.cv.wait(1.0)

@@ -346,5 +346,37 @@ class ATurnWithNowhereToGenerateStopsAfterTheRead(unittest.TestCase):
         self.assertNotIn("c1", pool.turns)
 
 
+class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
+    """A slot the pool never gets back is worse than a slow turn: acquire
+    counts it busy for the life of the process, so the backend serves one
+    fewer conversation until somebody restarts it.
+
+    hand_off gives up in two places. The later one releases the prefiller
+    before it waits for a generator, and its caller reads None as `nothing is
+    held`. The earlier one gives up before any of that, so it has to release
+    the prefiller too.
+    """
+
+    def test_giving_up_before_the_handoff_gives_the_slot_back(self):
+        pool = one_backend()
+        pool.backends[0]["generate"] = False
+        pool.acquire("c1", 10)             # the prefiller is held from here
+        self.assertEqual(pool.backends[0]["busy"], 1)
+
+        self.assertIsNone(pool.hand_off("c1", pool.backends[0], 10,
+                                        wanted=lambda: False))
+
+        self.assertEqual(pool.backends[0]["busy"], 0)
+
+    def test_a_turn_that_loses_its_client_before_the_handoff_holds_nothing(self):
+        pool = one_backend()
+        pool.backends[0]["generate"] = False
+
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient(alive=False))
+
+        self.assertEqual(pool.backends[0]["busy"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
