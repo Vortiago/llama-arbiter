@@ -38,10 +38,10 @@ def capture(directory, conv, body, keep):
         # Nanoseconds and fixed width: unique names that sort by time.
         name = f"{time.time_ns()}-{tag}.json"
         (directory / name).write_bytes(body)
-        # `[:-0]` is `[:0]`, which would keep every file rather than none.
-        old = (sorted(directory.glob(f"*-{tag}.json"))[:-keep] if keep > 0
-               else sorted(directory.glob(f"*-{tag}.json")))
-        for spent in old:
+        kept = sorted(directory.glob(f"*-{tag}.json"))
+        # max, because a negative bound counts from the end: [:-11] of 13
+        # files deletes two that were inside the keep.
+        for spent in kept[:max(0, len(kept) - keep)]:
             spent.unlink(missing_ok=True)
     except OSError as err:
         print(f"[router] could not write the capture: {err}", flush=True)
@@ -172,9 +172,14 @@ class Turn:
             loaded = (not recalled
                       and pool.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, ask.path))
+            # warm_prefix was the last reader of these three, and each holds
+            # a parsed copy of the prompt: about three times the bytes it
+            # came from. The read below runs for tens of minutes.
+            messages = system = tools = None
             if asked is not None:
-                # Watch the client. The timings say what the cache saved. The
-                # read asks for what `asked` already is, in one named slot.
+                # Watch the client. The timings say what the cache saved.
+                # `asked` is reused rather than read again: a second parse of
+                # this body is megabytes.
                 answer = pool.link.read(be, ask.path,
                                         dict(asked, id_slot=slot),
                                         client.alive, pool.tuning.read_timeout)
@@ -185,8 +190,7 @@ class Turn:
                 serving = pool.hand_off(conv, be, tokens, wanted=client.alive)
                 if serving is None:
                     # The cache is parked, and no backend is held.
-                    raise Gone("the client stopped waiting for a slot to "
-                               "generate in")
+                    raise Gone("after its prompt was parked")
             if serving is be:
                 # Nothing was carried. hand_off already noted a carried turn.
                 pool.note_stage(conv, "generate", be["name"], slot)

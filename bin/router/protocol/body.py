@@ -196,7 +196,7 @@ def template_route(path):
             else "/apply-template")
 
 
-def read_only(body, slot=None):
+def read_only(body):
     """The same request, asking for zero tokens. The read happens on a
     prefiller. The router chooses where to generate after the read."""
     try:
@@ -219,6 +219,4 @@ def read_only(body, slot=None):
     # (server_chat_convert_responses_to_chatcmpl).
     if "max_output_tokens" in fields:
         fields["max_output_tokens"] = 0
-    if slot is not None:
-        fields["id_slot"] = slot      # say which slot
     return fields

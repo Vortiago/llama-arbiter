@@ -83,6 +83,10 @@ class TurnLink:
         """Just the operation names, in order."""
         return [call[0] for call in self.calls]
 
+    def asked(self):
+        """What the one read pass was sent."""
+        return next(call[2] for call in self.calls if call[0] == "read")
+
     def save(self, be, slot, name, timeout=None):
         self.calls.append(("save", be["name"], name))
         return {"n_written": self.written}
@@ -92,7 +96,7 @@ class TurnLink:
         return {"id_slot": slot, "n_restored": 3}
 
     def read(self, be, path, payload, alive, timeout):
-        self.calls.append(("read", be["name"]))
+        self.calls.append(("read", be["name"], payload))
         if isinstance(self.reading, BaseException):
             raise self.reading
         # llama-server reports what it read and what the cache saved it.
@@ -245,6 +249,7 @@ class ATurnWritesDownWhatTheClientSent(unittest.TestCase):
         pool.turn(router.Ask("/v1/chat/completions", body, "c1"), FakeClient())
 
         self.assertEqual([p.read_bytes() for p in room.glob("*.json")], [body])
+
 
 class ATurnHoistsALateSystemMessage(unittest.TestCase):
     """The template refuses a system message that is not at the front. Claude
@@ -444,6 +449,30 @@ class AStreamSaysNothingAfterItsLastWord(unittest.TestCase):
         self.assertEqual([code for code, _ in client.failed], [502])
         self.assertLess(client.did.index("settle"), client.did.index("fail"),
                         "the keep-alive was still running when the stream ended")
+
+
+class TheReadNamesTheSlotTheTurnPicked(unittest.TestCase):
+    """A reply names the slot it used only on some paths, so the router says
+    which slot to read into rather than asking afterwards."""
+
+    def test_the_read_carries_the_slot(self):
+        pool = one_backend()
+
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient())
+
+        self.assertEqual(pool.link.asked()["id_slot"], 0)
+
+    def test_the_read_asks_for_no_tokens(self):
+        """A generated token lands in the slot, and a restored slot has no
+        checkpoint to rewind to, so the next turn would read it all again."""
+        pool = one_backend()
+
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient())
+
+        self.assertEqual(pool.link.asked()["max_tokens"], 0)
+        self.assertIs(pool.link.asked()["stream"], False)
 
 
 if __name__ == "__main__":

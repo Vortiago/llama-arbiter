@@ -15,9 +15,12 @@ from ..backend.link import Link
 from .turn import Turn
 from .machine import Flow, History, Machine, per_second
 
-def disk_summary(pins, openings, opening_bytes, wants, tuning=None):
-    """What the two slot directories hold against their budgets."""
-    tuning = tuning or Tuning()
+def disk_summary(pins, openings, opening_bytes, wants, tuning):
+    """What the two slot directories hold against their budgets.
+
+    `tuning` has no default. Two of the three budgets below are the
+    operator's to set, so a caller that dropped it drew one number
+    while the sweeps enforced another."""
     copies = [(conv, p) for conv, p in pins.items() if p.get("parked")]
     kinds = [shelf_of(name) for name in openings.values()]
     return {"copies": {"count": len(copies),
@@ -1222,13 +1225,11 @@ class Pool:
             # Nothing to carry this to, and the instance holding it does
             # not generate. Wait, holding a prefill slot.
             if wanted is not None and not wanted():
-                # Nothing was carried and nothing is parked, so this is the
-                # client leaving mid-turn. The caller's ending already knows
-                # that case: it releases the source and parks what was read.
-                # None is for the give-up below, where the cache is on disk
-                # and the slot is already back.
-                raise Gone("the client stopped waiting for a slot to "
-                           "generate in")
+                # Giving up here is the client leaving mid-turn, which
+                # the caller's ending already knows how to finish. Giving up
+                # below is not: past the save the cache is safe on disk, and
+                # only the reply is lost.
+                raise Gone("while it waited for a slot to generate in")
             with self.cv:
                 self.cv.wait(1.0)
             target = self.generator(tokens)

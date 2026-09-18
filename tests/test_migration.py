@@ -126,32 +126,32 @@ class ARequestCanBeWrittenDown(unittest.TestCase):
     def setUp(self):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="capture-"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.keep = SANDBOX.tuning.capture_keep
 
     def test_nothing_is_written_when_no_directory_is_named(self):
-        router.capture(None, "conv", b'{"a":1}', SANDBOX.tuning.capture_keep)
+        router.capture(None, "conv", b'{"a":1}', self.keep)
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_the_body_is_written_when_a_directory_is_named(self):
-        router.capture(self.root, "abc", b'{"a":1}', SANDBOX.tuning.capture_keep)
+        router.capture(self.root, "abc", b'{"a":1}', self.keep)
         written = list(self.root.glob("*.json"))
         self.assertEqual(len(written), 1)
         self.assertEqual(written[0].read_bytes(), b'{"a":1}')
         self.assertIn("abc", written[0].name)
 
     def test_only_the_newest_of_a_conversation_are_kept(self):
-        for n in range(SANDBOX.tuning.capture_keep + 5):
-            router.capture(self.root, "busy", b'{"n":%d}' % n, SANDBOX.tuning.capture_keep)
-        self.assertEqual(len(list(self.root.glob("*.json"))),
-                         SANDBOX.tuning.capture_keep)
+        for n in range(self.keep + 5):
+            router.capture(self.root, "busy", b'{"n":%d}' % n, self.keep)
+        self.assertEqual(len(list(self.root.glob("*.json"))), self.keep)
 
     def test_a_busy_conversation_does_not_push_out_a_quiet_one(self):
         """The quiet client is the one being looked for.
 
         OpenCode sends a turn an hour and Claude Code sends one a minute. Kept
         as one list, the hourly body was gone both times it was wanted."""
-        router.capture(self.root, "quiet", b'{"quiet":1}', SANDBOX.tuning.capture_keep)
-        for n in range(SANDBOX.tuning.capture_keep + 5):
-            router.capture(self.root, "busy", b'{"n":%d}' % n, SANDBOX.tuning.capture_keep)
+        router.capture(self.root, "quiet", b'{"quiet":1}', self.keep)
+        for n in range(self.keep + 5):
+            router.capture(self.root, "busy", b'{"n":%d}' % n, self.keep)
         self.assertEqual([p.read_bytes() for p in self.root.glob("*-quiet.json")],
                          [b'{"quiet":1}'])
 
@@ -2419,18 +2419,21 @@ class ComeBackAfterRestart(unittest.TestCase):
 
     def test_a_vouched_copy_is_kept(self):
         _, _, parked, spent = router.adopt_files(
-            ["a.park"], vouched={"a.park"}, store=SANDBOX.store)
+            ["a.park"], vouched={"a.park"}, store=SANDBOX.store,
+            tuning=SANDBOX.tuning)
         self.assertEqual(parked, ["a.park"])
         self.assertEqual(spent, [])
 
     def test_a_copy_nothing_vouches_for_is_dropped(self):
         _, _, parked, spent = router.adopt_files(["a.park"],
-                                                 store=SANDBOX.store)
+                                                 store=SANDBOX.store,
+                                                 tuning=SANDBOX.tuning)
         self.assertEqual((parked, spent), ([], ["a.park"]))
 
     def test_a_vouched_copy_that_is_gone_cannot_be_kept(self):
         _, _, parked, spent = router.adopt_files(
-            [], vouched={"a.park"}, store=SANDBOX.store)
+            [], vouched={"a.park"}, store=SANDBOX.store,
+            tuning=SANDBOX.tuning)
         self.assertEqual(parked, [])
 
     def test_the_pool_takes_back_its_pins(self):
@@ -4110,12 +4113,9 @@ class WhichSlotReadIt(unittest.TestCase):
         self.cpu["slots_detail"] = []
         self.assertEqual(self.pool.pick_slot(self.cpu, "a"), 0)
 
-    def test_the_read_pass_carries_the_slot(self):
-        asked = router.read_only(json.dumps(
-            {"messages": [], "max_tokens": 900}).encode(), slot=3)
-        self.assertEqual(asked["id_slot"], 3)
-
-    def test_it_carries_no_slot_when_none_is_given(self):
+    def test_the_read_pass_names_no_slot_of_its_own(self):
+        """Which slot to read into is the turn's to decide, and it adds the
+        field itself. See TheReadNamesTheSlotTheTurnPicked."""
         asked = router.read_only(json.dumps(
             {"messages": [], "max_tokens": 900}).encode())
         self.assertNotIn("id_slot", asked)
@@ -4646,6 +4646,7 @@ class HowFarInASlotHolds(unittest.TestCase):
         pool.note_slot("conv1", 0)
         pool.note_holds("conv1", cpu, [(-1, "sys")])
         self.assertEqual(pool.status()["slots_hold"][0]["through"], -1)
+
 
 class TheDiskReportDrawsTheBudgetTheSweepsEnforce(unittest.TestCase):
     """PARK_BUDGET_GB and BLOCK_BUDGET_GB are the operator's to set, and the

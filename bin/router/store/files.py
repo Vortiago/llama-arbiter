@@ -163,13 +163,12 @@ def shelf_of(name):
     return "base" if name.startswith("base-") else "deep"
 
 
-def adopt_files(names, vouched=(), size=None, store=None, tuning=None):
+def adopt_files(names, vouched=(), size=None, store=None, *, tuning):
     """Sort the files the last run left behind, oldest first. A saved
     opening is named after its contents. A conversation's copy is good only
     if the pin file vouches for it. The pin file is asked first, because a
     client can make a key look like an opening."""
     size = size or store.size
-    tuning = tuning or Tuning()
     openings, bytes_ = OrderedDict(), {}
     parked, spent = [], []
     for name in names:
@@ -187,7 +186,7 @@ def adopt_files(names, vouched=(), size=None, store=None, tuning=None):
     return openings, bytes_, parked, spent
 
 
-def trim_openings(openings, bytes_, keep=(), budget=None):
+def trim_openings(openings, bytes_, keep=(), *, budget):
     """Drop openings until they fit the block budget, least useful first: deeper
     cuts before system prompts, then least recently used. One is always
     kept. `keep` names openings being built, which are not on disk yet.

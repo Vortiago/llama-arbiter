@@ -270,6 +270,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.sending = threading.Lock()        # one writer at a time
         self.streaming = False
         self.stop_ping = None
+        self.went = "closed its end"
         self.kind = client_kind(self.headers)
 
         if self.command == "GET" and path in ("/props", "/slots"):
@@ -391,6 +392,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Put an error into a stream that has already started, and close it.
         An anthropic stream ends in its error event. Under `sending`: the
         keep-alive thread may still be running."""
+        # Before the lock, not inside it: settle() joins the keep-alive
+        # thread, and that thread takes `sending` to write. Stopping it here
+        # rather than in each caller is what makes "nothing follows the
+        # terminator" a property of this method.
+        self.settle()
         print(f"[router] {message}", flush=True)
         if anthropic(self.path.split("?")[0]):
             event = sse_event("error", {"type": "error",
