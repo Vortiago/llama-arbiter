@@ -16,7 +16,7 @@ alive() { [[ -f $RUN/$1.pid ]] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
 ours() {
   local cmd
   cmd=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
-  [[ $cmd == *llama-server* || $cmd == *router.py* || $cmd == *qwen-mtp* ]]
+  [[ $cmd == *llama-server* || $cmd == *-m\ router* || $cmd == *qwen-mtp* ]]
 }
 
 # Who holds a port, from the kernel rather than a file.
@@ -38,7 +38,9 @@ wait_for() { # wait_for <port> <name> <seconds> [path]
 # config.local.sh, which exports ROUTER_BACKENDS.
 start_router() {
   keep_log router
-  nohup python3 "$ROOT/bin/router.py" --host "${ROUTER_HOST:-::}" \
+  # -m router, not a file: bin/router is a package now. PYTHONPATH names the
+  # directory it sits in.
+  PYTHONPATH="$ROOT/bin" nohup python3 -m router --host "${ROUTER_HOST:-::}" \
         --port "$ROUTER_PORT" > "$RUN/router.log" 2>&1 &
   echo $! > "$RUN/router.pid"
   wait_for "$ROUTER_PORT" router 60 /router/json

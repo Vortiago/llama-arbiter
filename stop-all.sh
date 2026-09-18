@@ -22,7 +22,7 @@ done
 ours() {
   local cmd
   cmd=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
-  [[ $cmd == *llama-server* || $cmd == *router.py* || $cmd == *qwen-mtp* ]]
+  [[ $cmd == *llama-server* || $cmd == *-m\ router* || $cmd == *qwen-mtp* ]]
 }
 
 # The router stops first, while the backends are still up. It copies every
