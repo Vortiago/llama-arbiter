@@ -18,7 +18,7 @@ _Avoid_: exchange, round, request as a name for the whole turn
 
 **Ask**:
 What one client sent for one turn, as the router reads it: the path, the
-body, and the conversation a header named.
+body, and the conversation a header named, when it did.
 _Avoid_: request, payload, params
 
 **Client**:

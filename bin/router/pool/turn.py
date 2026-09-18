@@ -60,13 +60,13 @@ def how_started(warm, recalled, loaded):
 class Ask:
     """What one client sent for one turn, as the router reads it.
 
-    `session` is the conversation a header named, which beats any guess from
-    the prompt. The rest of what a turn needs it reads out of the body.
+    `conv` is the conversation a header named, which beats any guess from the
+    prompt. The rest of what a turn needs it reads out of the body.
     """
 
     path: str
     body: bytes
-    session: str | None = None
+    conv: str | None = None
 
 
 class Turn:
@@ -93,7 +93,7 @@ class Turn:
         # /v1/messages, where the system prompt is a separate field.
         # `conv_source` says how the conversation was recognised. Decided
         # here: a re-parse of a ctx 150000 turn is megabytes.
-        conv, conv_source = ask.session, "header"
+        conv, conv_source = ask.conv, "header"
         if not conv:
             conv, conv_source = prompt_key(ask.body), "cache_key"
         if not conv:
