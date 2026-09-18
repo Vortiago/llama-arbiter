@@ -3,8 +3,7 @@
 import http.client, http.server, json, os, select, socket, threading, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 from ..identity import client_kind, conversation_id, prompt_key, session_key, short_key
-from ..pool.pool import capture
-from ..pool.turn import how_started
+from ..pool.turn import capture, how_started
 from ..protocol.body import hoist_system, prompt_cuts, read_only, request_shape, wants_stream
 from ..protocol.splice import AnthropicSplice, OaiUsageSplice, wants_usage, with_usage
 from ..protocol.sse import _say, anthropic, opening_event, ping_for, sse_event, wants_ping

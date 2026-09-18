@@ -24,6 +24,24 @@ from ..sizing import request_cost
 from ..transport import Gone
 
 
+def capture(directory, conv, body, keep=24):
+    """Write one request body down, for comparing two turns offline. Kept
+    per conversation, so a busy client cannot crowd out a quiet one."""
+    if directory is None:
+        return
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        tag = short_key(conv).replace("/", "_")
+        # Nanoseconds and fixed width: unique names that sort by time.
+        name = f"{time.time_ns()}-{tag}.json"
+        (directory / name).write_bytes(body)
+        old = sorted(directory.glob(f"*-{tag}.json"))[:-keep]
+        for spent in old:
+            spent.unlink(missing_ok=True)
+    except OSError as err:
+        print(f"[router] could not write the capture: {err}", flush=True)
+
+
 def how_started(warm, recalled, loaded):
     """Name what a request extended instead of reading. `warm`: its own
     cache was in a slot. `recalled`: its own copy came back from disk.
@@ -81,6 +99,8 @@ class Turn:
             conv, conv_source = conversation_id(ask.body), "hash"
         if not conv:
             conv_source = "none"
+        # Before anything is changed, so a capture holds what the client sent.
+        capture(pool.capture_dir, conv, ask.body)
         cuts, messages, system, tools = prompt_cuts(ask.body)
         # The stream and its keep-alive open before the slot is asked for.
         start = time.time()

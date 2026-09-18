@@ -195,5 +195,26 @@ class ATurnRunsToTheEndAndPutsEverythingBack(unittest.TestCase):
         self.assertEqual(pool.recent_requests[0]["started"], "cold")
 
 
+class ATurnWritesDownWhatTheClientSent(unittest.TestCase):
+    """A capture is for comparing two turns offline. It is written before
+    anything is changed, so it holds what the client sent rather than what
+    the router made of it."""
+
+    def test_the_body_reaches_the_capture_directory(self):
+        room = Path(tempfile.mkdtemp(prefix="router-capture-"))
+        pool = one_backend(capture_dir=room)
+        body = prompt(10)
+
+        pool.turn(router.Ask("/v1/chat/completions", body, "c1"), FakeClient())
+
+        self.assertEqual([p.read_bytes() for p in room.glob("*.json")], [body])
+
+    def test_a_run_with_no_capture_directory_writes_nothing(self):
+        pool = one_backend()
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient())
+        self.assertIsNone(pool.capture_dir)
+
+
 if __name__ == "__main__":
     unittest.main()

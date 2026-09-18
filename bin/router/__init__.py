@@ -33,8 +33,8 @@ from .pool.machine import (GPU_CMD, RATE_FLOOR, Flow, History, Machine,
                            cpu_times, gpu_query, node_busy, node_meminfo,
                            parse_cpulist, per_second, read_nodes,
                            resident_bytes)
-from .pool.pool import Pool, capture, disk_summary
-from .pool.turn import Ask, Turn, how_started
+from .pool.pool import Pool, disk_summary
+from .pool.turn import Ask, Turn, capture, how_started
 from .protocol.body import (IGNORED_KEYS, SYSTEM_ROLES, closes, common_prefix,
                             deepest_shared, hoist_system, leading_system,
                             message_shape, prompt_cuts, read_only,

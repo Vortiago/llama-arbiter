@@ -14,24 +14,6 @@ from ..backend.link import Link
 from .turn import Turn
 from .machine import Flow, History, Machine, per_second
 
-def capture(directory, conv, body, keep=24):
-    """Write one request body down, for comparing two turns offline. Kept
-    per conversation, so a busy client cannot crowd out a quiet one."""
-    if directory is None:
-        return
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        tag = short_key(conv).replace("/", "_")
-        # Nanoseconds and fixed width: unique names that sort by time.
-        name = f"{time.time_ns()}-{tag}.json"
-        (directory / name).write_bytes(body)
-        old = sorted(directory.glob(f"*-{tag}.json"))[:-keep]
-        for spent in old:
-            spent.unlink(missing_ok=True)
-    except OSError as err:
-        print(f"[router] could not write the capture: {err}", flush=True)
-
-
 def disk_summary(pins, openings, opening_bytes, wants, tuning=None):
     """What the two slot directories hold against their budgets."""
     tuning = tuning or Tuning()
@@ -60,7 +42,7 @@ class Pool:
               "n_busy_slots_per_decode", "n_tokens_max")
 
     def __init__(self, backends, *, store, tuning=None, events=None,
-                 link=None, watch=True):
+                 link=None, capture_dir=None, watch=True):
         """`store` is where this run keeps its copies, `tuning` the numbers it
         was tuned to, `events` the log of what the cache decided. There is no
         default store on purpose: a Pool that made its own would make the one
@@ -68,6 +50,9 @@ class Pool:
         where a live router keeps its caches."""
         self.cv = threading.Condition()
         self.store = store
+        # Where a turn writes down what the client sent, or None. Nothing
+        # sets it yet: captures are for comparing two turns by hand.
+        self.capture_dir = capture_dir
         self.tuning = tuning or Tuning()
         # Off unless a caller hands in a live one, so that building a Pool
         # starts no writer thread.
