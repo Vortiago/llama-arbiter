@@ -16,6 +16,7 @@ import select, shutil
 import signal, socket
 import subprocess, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
+from dataclasses import dataclass
 from collections import OrderedDict, deque
 from pathlib import Path
 
@@ -63,67 +64,114 @@ def generates(be):
     """May a reply be generated on this backend."""
     return be.get("generate", True)
 
-MAX_PINS      = 512    # conversations to remember
-FORWARD_TIMEOUT = 7200.0  # longest a backend may take to answer a request
-READ_TIMEOUT    = 7200.0  # a read runs 30 to 40 minutes
-PIN_PATIENCE  = 20.0   # seconds a conversation waits for the backend
-                       # that holds its cache before taking a free one
-POLL          = 2.0    # seconds between backend checks
-RATE_WINDOW   = 10.0   # seconds a per-slot rate is measured over
-PING_EVERY       = 15.0   # seconds of quiet before a ping. Clients
-                          # drop a stream after 300 s of silence.
-POST_TIMEOUT     = 300.0  # a save waits for the slot to finish its turn
-DRAIN_DEADLINE   = 1800.0 # seconds a drain waits for running work
-PARK_ALL_TIMEOUT = 75.0   # longest one save may take at shutdown.
-                          # Measured: median 11 s, p90 19 s, 77 of 952
-                          # saves over 20 s.
-PARK_ALL_BUDGET  = 80.0   # wall-clock cap over all shutdown saves.
-                          # stop-all.sh gives the router 90 s.
-PARK_FLOOR       = 64 * 1024 * 1024   # a real state file is about 112 MiB.
-                          # A smaller file means the slot changed hands.
-# Disk for the conversation copies, in bytes. A copy is about 115 MiB plus
-# 36.6 KiB a token: 0.2 to 5.4 GiB at ctx 150000. Size it to the disk RUN
-# is on. Too low displaces a copy still in use, which costs a full re-read.
-PARK_BUDGET = int(float(os.environ.get("PARK_BUDGET_GB") or 256) * 1024 ** 3)
-# A restored slot needs its context checkpoints in the state file, which
-# needs patches/slot-state-carries-checkpoints.patch. Without the patch a
-# move is followed by a full re-read: set HANDOFF=0.
-HANDOFF_ON = os.environ.get("HANDOFF", "1") == "1"
-PREFIX_MIN_CHARS = 8000   # about 2000 tokens. A shorter cut is not
-                          # worth a file.
-BUILD_PATIENCE   = 1800.0 # longest a request waits for another to save the
-                          # opening they share
-SYSTEM_MIN_CHARS = 2000   # the only cut two sessions share. Claude Code
-                          # sends 6,100 characters: a minute to read, a
-                          # fifth of a second to load from disk.
-# Disk for the saved openings, in bytes. One block is 0.6 to 3.7 GB. Least
-# recently used goes first. Size it to the disk the blocks are on.
-BLOCK_BUDGET = int(float(os.environ.get("BLOCK_BUDGET_GB") or 64) * 1024 ** 3)
-# Deeper openings: a cut where two conversations diverge. Off by default:
-# over two days of real traffic it was built 0 times and loaded 0 times.
-# The detection still runs, and the `choice` event records how deep a fork
-# could have started. tools/cache-report.py reads it.
-DEEP_OPENINGS = os.environ.get("DEEP_OPENINGS", "0") == "1"
-WANT_KEEP        = 8      # openings noted as missing but not built yet
-IDLE_POLLS       = 2      # polls a slot must look idle before the builder
-                          # reads into it. One poll can be two seconds old.
-BUILD_POLL       = 10.0   # seconds between builder passes
-STALL_RATE = 0.5          # tokens/s. Under this a generating slot is
-                          # stalled behind another slot's read. Measured
-                          # 0.02 to 0.06 against 6.3 solo.
-HISTORY_STEP = 10.0       # seconds per history bucket
-HISTORY_KEEP = 60         # buckets kept: ten minutes
-GPU_POLL = 10.0           # seconds between nvidia-smi runs. Each costs 50
-                          # to 100 ms, so it runs as a child.
-RECENT_REQUESTS = 20      # requests the dashboard lists
-RECENT_FILES = 24         # slot files the dashboard lists. A turn
-                          # boundary can write three in one status push.
-FLOW_LOG = 150            # stage transitions the flow dashboard replays
-MOUNT_POLL = 30.0         # seconds between disk usage checks
-CHARS_PER_TOK = 4.0
-REPLY_TOKENS  = 1024   # room to reserve for the reply
-MAX_BODY = 256 * 1024 * 1024   # largest request body read into memory.
-                       # A turn at ctx 150000 is a few megabytes.
+@dataclass(frozen=True)
+class Tuning:
+    """The numbers this router was tuned to, and where each one came from.
+
+    docs/LAYOUT.md says which of these are properties of llama.cpp, which are
+    properties of Linux, and which belong to one machine. A caller that wants
+    another set builds another Tuning; nothing reads these from the module.
+    """
+
+    # -- pins and slots
+    max_pins: int = 512               # conversations to remember
+    pin_patience: float = 20.0        # seconds a conversation waits for the
+                                      # backend that holds its cache before
+                                      # taking a free one
+    poll: float = 2.0                 # seconds between backend checks
+    rate_window: float = 10.0         # seconds a per-slot rate is measured over
+    stall_rate: float = 0.5           # tokens/s. Under this a generating slot
+                                      # is stalled behind another slot's read.
+                                      # Measured 0.02 to 0.06 against 6.3 solo.
+
+    # -- what a turn may take
+    forward_timeout: float = 7200.0   # longest a backend may take to answer
+    read_timeout: float = 7200.0      # a read runs 30 to 40 minutes
+    ping_every: float = 15.0          # seconds of quiet before a ping. Clients
+                                      # drop a stream after 300 s of silence.
+    post_timeout: float = 300.0       # a save waits for the slot to finish
+    max_body: int = 256 * 1024 * 1024  # largest request body read into memory.
+                                      # A turn at ctx 150000 is a few megabytes.
+    chars_per_tok: float = 4.0
+    reply_tokens: int = 1024          # room to reserve for the reply
+
+    # -- stopping and draining
+    drain_deadline: float = 1800.0    # seconds a drain waits for running work
+    park_all_timeout: float = 75.0    # longest one save may take at shutdown.
+                                      # Measured: median 11 s, p90 19 s, 77 of
+                                      # 952 saves over 20 s.
+    park_all_budget: float = 80.0     # wall-clock cap over all shutdown saves.
+                                      # stop-all.sh gives the router 90 s.
+
+    # -- the disk
+    park_floor: int = 64 * 1024 * 1024  # a real state file is about 112 MiB.
+                                      # A smaller file means the slot changed
+                                      # hands.
+    # Disk for the conversation copies, in bytes. A copy is about 115 MiB plus
+    # 36.6 KiB a token: 0.2 to 5.4 GiB at ctx 150000. Size it to the disk RUN
+    # is on. Too low displaces a copy still in use, which costs a full re-read.
+    park_budget: int = 256 * 1024 ** 3
+    # Disk for the saved openings, in bytes. One block is 0.6 to 3.7 GB. Least
+    # recently used goes first. Size it to the disk the blocks are on.
+    block_budget: int = 64 * 1024 ** 3
+    mount_poll: float = 30.0          # seconds between disk usage checks
+
+    # -- openings
+    prefix_min_chars: int = 8000      # about 2000 tokens. A shorter cut is not
+                                      # worth a file.
+    system_min_chars: int = 2000      # the only cut two sessions share. Claude
+                                      # Code sends 6,100 characters: a minute
+                                      # to read, a fifth of a second to load.
+    build_patience: float = 1800.0    # longest a request waits for another to
+                                      # save the opening they share
+    build_poll: float = 10.0          # seconds between builder passes
+    idle_polls: int = 2               # polls a slot must look idle before the
+                                      # builder reads into it. One poll can be
+                                      # two seconds old.
+    want_keep: int = 8                # openings noted as missing, not built yet
+    # Deeper openings: a cut where two conversations diverge. Off by default:
+    # over two days of real traffic it was built 0 times and loaded 0 times.
+    # The detection still runs, and the `choice` event records how deep a fork
+    # could have started. tools/cache-report.py reads it.
+    deep_openings: bool = False
+
+    # -- moving a turn
+    # A restored slot needs its context checkpoints in the state file, which
+    # needs patches/slot-state-carries-checkpoints.patch. Without the patch a
+    # move is followed by a full re-read: turn this off.
+    handoff: bool = True
+
+    # -- what the dashboard is shown
+    history_step: float = 10.0        # seconds per history bucket
+    history_keep: int = 60            # buckets kept: ten minutes
+    gpu_poll: float = 10.0            # seconds between nvidia-smi runs. Each
+                                      # costs 50 to 100 ms, so it runs as a
+                                      # child.
+    recent_requests: int = 20         # requests the dashboard lists
+    recent_files: int = 24            # slot files the dashboard lists. A turn
+                                      # boundary can write three in one push.
+    flow_log: int = 150               # stage transitions the flow view replays
+    capture_keep: int = 24            # bodies kept per conversation
+
+    # -- telemetry
+    cache_log: bool = True            # one JSON line per cache decision
+
+    @classmethod
+    def from_env(cls, env=None):
+        """The five settings a machine overrides. Everything else is measured,
+        and changing it means changing this file."""
+        env = os.environ if env is None else env
+        return cls(
+            park_budget=int(float(env.get("PARK_BUDGET_GB") or 256) * 1024 ** 3),
+            block_budget=int(float(env.get("BLOCK_BUDGET_GB") or 64) * 1024 ** 3),
+            handoff=env.get("HANDOFF", "1") == "1",
+            deep_openings=env.get("DEEP_OPENINGS", "0") == "1",
+            cache_log=env.get("CACHE_LOG", "1") == "1")
+
+
+# What this run was tuned to. A test builds its own and hands it to Pool.
+TUNING = Tuning.from_env()
+
 
 # Endpoints that use a slot.
 INFERENCE = {
@@ -246,7 +294,7 @@ def images_in(body):
     except Exception:
         return []
 
-def request_cost(body, vision=None):
+def request_cost(body, vision=None, tuning=None):
     """(tokens this request needs, pictures it carries, what they cost).
 
     Base64 is hundreds of times longer than what the vision encoder charges.
@@ -256,11 +304,13 @@ def request_cost(body, vision=None):
         text -= len(payload)
         charged += image_tokens(payload, vision)
         count += 1
-    return int(max(0, text) / CHARS_PER_TOK) + charged + REPLY_TOKENS, count, charged
+    tuning = tuning or TUNING
+    return (int(max(0, text) / tuning.chars_per_tok) + charged
+            + tuning.reply_tokens, count, charged)
 
-def token_estimate(body, vision=None):
+def token_estimate(body, vision=None, tuning=None):
     """Tokens this request needs. The first of request_cost's three."""
-    return request_cost(body, vision)[0]
+    return request_cost(body, vision, tuning)[0]
 
 def conversation_id(body):
     """Identify a conversation by its opening: the system messages and the
@@ -313,8 +363,8 @@ class Store:
         # must name the same directory.
         self.slots = self.run / "slots"
         # Openings go on the faster disk where there are two, under
-        # BLOCK_BUDGET. Parked copies stay under the run directory, under
-        # PARK_BUDGET.
+        # block_budget. Parked copies stay under the run directory, under
+        # park_budget.
         self.blocks = Path(block_dir) if block_dir else self.run / "blocks"
 
     def __repr__(self):
@@ -450,11 +500,9 @@ STORE = Store(os.environ.get("RUN")
 
 # Debugging only, on when CAPTURE names a directory.
 CAPTURE_DIR = Path(os.environ["CAPTURE"]) if os.environ.get("CAPTURE") else None
-CAPTURE_KEEP = 24
 
 # One JSON line per cache decision, in a dated file. CACHE_LOG=0 turns it
 # off.
-CACHE_LOG_ON = os.environ.get("CACHE_LOG", "1") == "1"
 CACHE_LOG_DIR = Path(os.environ.get("CACHE_LOG_DIR") or STORE.run)
 
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -646,7 +694,7 @@ class EventLog:
     """Append cache events to a dated JSONL file. Telemetry, not data: a
     thread writes, and a full queue drops the newest event."""
 
-    def __init__(self, directory=None, on=CACHE_LOG_ON, name="cache-events",
+    def __init__(self, directory=None, on=True, name="cache-events",
                  maxsize=10000):
         self.on = on
         self.directory = Path(directory) if directory else CACHE_LOG_DIR
@@ -1079,11 +1127,12 @@ def closes(message):
                 and any(isinstance(part, dict) and part.get("type") == "tool_use"
                         for part in content))
 
-def prompt_cuts(body, least=PREFIX_MIN_CHARS):
+def prompt_cuts(body, tuning=None):
     """Every point in this request that another request could share. Each
     cut is at a message boundary, hashed onto the cut before it. Returns the
     cuts deepest last, the messages, the system prompt when the request
     keeps it apart, and the tools it declares."""
+    tuning = tuning or TUNING
     try:
         fields = json.loads(body)
     except Exception:
@@ -1110,7 +1159,7 @@ def prompt_cuts(body, least=PREFIX_MIN_CHARS):
         running.update(b"tools\x00" + written.encode("utf-8", "replace"))
         size += len(system) + len(written)
         # Tools alone are not a prompt: the template refuses an empty one.
-        if system and size >= SYSTEM_MIN_CHARS:
+        if system and size >= tuning.system_min_chars:
             cuts.append((-1, running.hexdigest()[:16]))   # before any message
     # An openai body carries its system prompt as its first message.
     lead = leading_system(messages)
@@ -1122,7 +1171,7 @@ def prompt_cuts(body, least=PREFIX_MIN_CHARS):
         running.update(f"{message.get('role')}\x00".encode())
         running.update(message_shape(message))
         size += len(text_of(message.get("content")))
-        bar = SYSTEM_MIN_CHARS if index < lead else least
+        bar = tuning.system_min_chars if index < lead else tuning.prefix_min_chars
         if size >= bar and closes(message):
             cuts.append((index, running.hexdigest()[:16]))
     return cuts, messages, system, tools
@@ -1249,7 +1298,7 @@ def read_only(body, slot=None):
         fields["id_slot"] = slot      # say which slot
     return fields
 
-def http_post(url, path, payload, timeout=POST_TIMEOUT):
+def http_post(url, path, payload, timeout=300.0):
     """POST json and read the reply. Used for the slot save and restore."""
     request = urllib.request.Request(
         url + path, data=json.dumps(payload).encode(),
@@ -1333,7 +1382,7 @@ def said_in(body):
         return trouble.get("message")
     return trouble
 
-def capture(conv, body):
+def capture(conv, body, keep=24):
     """Write one request body down, for comparing two turns offline. Kept
     per conversation, so a busy client cannot crowd out a quiet one."""
     if CAPTURE_DIR is None:
@@ -1344,7 +1393,7 @@ def capture(conv, body):
         # Nanoseconds and fixed width: unique names that sort by time.
         name = f"{time.time_ns()}-{tag}.json"
         (CAPTURE_DIR / name).write_bytes(body)
-        old = sorted(CAPTURE_DIR.glob(f"*-{tag}.json"))[:-CAPTURE_KEEP]
+        old = sorted(CAPTURE_DIR.glob(f"*-{tag}.json"))[:-keep]
         for spent in old:
             spent.unlink(missing_ok=True)
     except OSError as err:
@@ -1362,28 +1411,30 @@ def how_started(warm, recalled, loaded):
         return "warm slot"
     return "cold"
 
-def disk_summary(pins, openings, opening_bytes, wants):
+def disk_summary(pins, openings, opening_bytes, wants, tuning=None):
     """What the two slot directories hold against their budgets."""
+    tuning = tuning or TUNING
     copies = [(conv, p) for conv, p in pins.items() if p.get("parked")]
     kinds = [shelf_of(name) for name in openings.values()]
     return {"copies": {"count": len(copies),
                        "bytes": sum(p.get("bytes") or 0 for _, p in copies),
-                       "budget": PARK_BUDGET},
+                       "budget": tuning.park_budget},
             # One budget over both shelves.
             "openings": {"count": len(openings),
                          "bytes": sum(opening_bytes.values()),
-                         "budget": BLOCK_BUDGET},
+                         "budget": tuning.block_budget},
             "bases": {"count": kinds.count("base")},
             "deeps": {"count": kinds.count("deep")},
-            "wants": {"count": len(wants), "keep": WANT_KEEP}}
+            "wants": {"count": len(wants), "keep": tuning.want_keep}}
 
 class History:
     """Slot-seconds by phase, per history bucket. Between two polls a slot
     stays in the phase the earlier poll reported. A bucket edge inside the
     gap splits it."""
 
-    def __init__(self, keep=HISTORY_KEEP, step=HISTORY_STEP):
+    def __init__(self, keep=60, step=10.0, stall_rate=0.5):
         self.keep, self.step = keep, step
+        self.stall_rate = stall_rate
         self.at = None
         self.since = None
         self.rows = {}        # backend name -> {"done": [...], "cur": {...}}
@@ -1409,7 +1460,7 @@ class History:
                 elif phase == "generating":
                     # No rate yet is not a stall.
                     cur["gen" if tg_rate is None
-                        else ("stalled" if tg_rate < STALL_RATE else "gen")] += dt
+                        else ("stalled" if tg_rate < self.stall_rate else "gen")] += dt
 
     def _roll(self):
         for row in self.rows.values():
@@ -1543,8 +1594,10 @@ class Machine:
     costs 50 to 100 ms, so it runs as a child and is collected on a later
     pass. A missing command turns the gpu row off."""
 
-    def __init__(self, nodes=None, stat=Path("/proc/stat"), gpu_cmd=GPU_CMD):
+    def __init__(self, nodes=None, stat=Path("/proc/stat"), gpu_cmd=GPU_CMD,
+                 gpu_poll=10.0):
         self.nodes = read_nodes() if nodes is None else nodes
+        self.gpu_poll = gpu_poll
         self.stat = stat
         self.gpu_cmd = list(gpu_cmd)
         self.prev = None          # the last /proc/stat sample
@@ -1578,7 +1631,7 @@ class Machine:
         proc = self.gpu_proc
         if proc is not None:
             if proc.poll() is None:
-                if now - (self.gpu_at or now) > 3 * GPU_POLL:
+                if now - (self.gpu_at or now) > 3 * self.gpu_poll:
                     proc.kill()            # wedged. Try again next time.
                     self.gpu_proc = None
                 return
@@ -1588,7 +1641,7 @@ class Machine:
             self.gpu = gpu_query(out) if proc.returncode == 0 else None
             self.gpu_proc = None
             return
-        if self.gpu_at is not None and now - self.gpu_at < GPU_POLL:
+        if self.gpu_at is not None and now - self.gpu_at < self.gpu_poll:
             return
         self.gpu_at = now
         try:
@@ -1636,12 +1689,13 @@ def shelf_of(name):
     """Which shelf a saved opening's file name puts it on."""
     return "base" if name.startswith("base-") else "deep"
 
-def adopt_files(names, vouched=(), size=None, store=None):
+def adopt_files(names, vouched=(), size=None, store=None, tuning=None):
     """Sort the files the last run left behind, oldest first. A saved
     opening is named after its contents. A conversation's copy is good only
     if the pin file vouches for it. The pin file is asked first, because a
     client can make a key look like an opening."""
     size = size or (store or STORE).size
+    tuning = tuning or TUNING
     openings, bytes_ = OrderedDict(), {}
     parked, spent = [], []
     for name in names:
@@ -1649,24 +1703,24 @@ def adopt_files(names, vouched=(), size=None, store=None):
             parked.append(name)
             continue
         key = opening_key(name)
-        if key and (DEEP_OPENINGS or shelf_of(name) == "base"):
+        if key and (tuning.deep_openings or shelf_of(name) == "base"):
             openings[key] = name
             bytes_[key] = size(name)
         else:
             spent.append(name)      # unvouched copy, or a deep opening
-                                    # with DEEP_OPENINGS off
-    spent += trim_openings(openings, bytes_)
+                                    # with deep_openings off
+    spent += trim_openings(openings, bytes_, budget=tuning.block_budget)
     return openings, bytes_, parked, spent
 
-def trim_openings(openings, bytes_, keep=()):
-    """Drop openings until they fit BLOCK_BUDGET, least useful first: deeper
+def trim_openings(openings, bytes_, keep=(), budget=None):
+    """Drop openings until they fit the block budget, least useful first: deeper
     cuts before system prompts, then least recently used. One is always
     kept. `keep` names openings being built, which are not on disk yet.
     Returns the file names dropped."""
     order = sorted(openings, key=lambda k: shelf_of(openings[k]) == "base")
     dropped = []
     for key in order:
-        if sum(bytes_.values()) <= BLOCK_BUDGET or len(openings) <= 1:
+        if sum(bytes_.values()) <= budget or len(openings) <= 1:
             break
         if key in keep:
             continue
@@ -1680,9 +1734,9 @@ class Flow:
     live row, so the animation can replay a stage it never saw. Held under
     Pool.cv."""
 
-    def __init__(self):
+    def __init__(self, flow_log=150):
         self.live = {}                        # conv -> current stage and where
-        self.log = deque(maxlen=FLOW_LOG)     # newest first, for the animation
+        self.log = deque(maxlen=flow_log)     # newest first, for the animation
 
     def note(self, conv, stage, backend=None, slot=None):
         """Move a turn to its next stage. Held under the lock."""
@@ -1720,10 +1774,12 @@ class Pool:
               "requests_processing", "requests_deferred",
               "n_busy_slots_per_decode", "n_tokens_max")
 
-    def __init__(self, backends, *, store=None, watch=True):
+    def __init__(self, backends, *, store=None, tuning=None, watch=True):
         self.cv = threading.Condition()
-        # Where this run keeps its copies. A test hands in its own.
+        # Where this run keeps its copies, and the numbers it was tuned to.
+        # A test hands in its own.
         self.store = store or STORE
+        self.tuning = tuning or TUNING
         self.backends = [dict(b, slots=1, n_ctx=0, busy=0, up=False, served=0, model="",
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
                               cache={}, idle_runs={}, draining=False)
@@ -1763,15 +1819,16 @@ class Pool:
         # Turns read and parked, waiting for a generator slot.
         self.to_generate = 0
         self.wait_seq = 0
-        self.flow = Flow()
+        self.flow = Flow(self.tuning.flow_log)
         # The last few slot files written or read.
-        self.recent = deque(maxlen=RECENT_FILES)
+        self.recent = deque(maxlen=self.tuning.recent_files)
         # The last few requests, with what each one started from.
-        self.recent_requests = deque(maxlen=RECENT_REQUESTS)
-        self.history = History()
-        self.machine = Machine()
+        self.recent_requests = deque(maxlen=self.tuning.recent_requests)
+        self.history = History(self.tuning.history_keep, self.tuning.history_step,
+                               self.tuning.stall_rate)
+        self.machine = Machine(gpu_poll=self.tuning.gpu_poll)
         self.loads = {}           # opening key -> times a request loaded it
-        self.mounts = []          # disk usage, refreshed every MOUNT_POLL
+        self.mounts = []          # disk usage, refreshed every mount_poll
         self.mounts_at = 0.0
         # The park worker starts on the first park, so tests start no thread.
         self.park_jobs = queue.Queue()
@@ -1799,7 +1856,8 @@ class Pool:
         by_file = {row["file"]: row for row in kept
                    if isinstance(row, dict) and row.get("file") and row.get("conv")}
         openings, sizes, parked, spent = adopt_files(names, set(by_file),
-                                                    store=self.store)
+                                                    store=self.store,
+                                                    tuning=self.tuning)
         with self.cv:
             self.openings, self.opening_bytes = openings, sizes
             for name in parked:
@@ -1905,7 +1963,7 @@ class Pool:
                 wants = "big"
             else:
                 wants = "prefill"
-            # `tokens` includes REPLY_TOKENS, as begin_wait was handed it. The
+            # `tokens` includes reply_tokens, as begin_wait was handed it. The
             # fix is for the ticket to carry prompt and room as two numbers.
             rows.append({"conv": short_key(w["conv"]), "since": w["since"],
                          "waited": round(now - w["since"], 1),
@@ -1933,8 +1991,8 @@ class Pool:
 
     def _read_mounts(self, now):
         """Free space on the disks the slot files land on, refreshed every
-        MOUNT_POLL."""
-        if now - self.mounts_at < MOUNT_POLL:
+        mount_poll."""
+        if now - self.mounts_at < self.tuning.mount_poll:
             return self.mounts
         rows = self.store.disks()
         self.mounts, self.mounts_at = rows, now
@@ -2080,7 +2138,7 @@ class Pool:
             decoded = token.get("n_decoded", 0)
             processed = slot.get("n_prompt_tokens_processed", 0)
 
-            # Measured over RATE_WINDOW, not between polls: a slot at 0.03
+            # Measured over rate_window, not between polls: a slot at 0.03
             # tokens/s does not move in two seconds.
             was = previous.get(sid) or {"task": None, "decoded": 0, "processed": 0,
                                         "done_d": 0.0, "done_p": 0.0, "since": now,
@@ -2100,7 +2158,7 @@ class Pool:
 
             gap = now - was["since"]
             measured = was["measured"]
-            if gap >= RATE_WINDOW:
+            if gap >= self.tuning.rate_window:
                 pp_rate, tg_rate = done_p / gap, done_d / gap
                 done_d = done_p = 0.0
                 since = now
@@ -2203,7 +2261,7 @@ class Pool:
             with self.cv:
                 self.history.push(self.backends, now)
                 self.history.push_load(self.machine.gauges())
-            time.sleep(POLL)
+            time.sleep(self.tuning.poll)
 
     def _read_cache(self, be):
         """Total the prompt cache events this backend has logged."""
@@ -2269,9 +2327,10 @@ class Pool:
         return (be["up"] and not be.get("draining")
                 and be["busy"] < be["slots"] and tokens <= be["n_ctx"])
 
-    def drain(self, name, post, deadline=DRAIN_DEADLINE):
+    def drain(self, name, post, deadline=None):
         """Take a backend out of service so it can be restarted. Requests wait
         in acquire rather than fail. The caches in its slots are copied out."""
+        deadline = self.tuning.drain_deadline if deadline is None else deadline
         be = next((b for b in self.backends if b["name"] == name), None)
         if be is None:
             return None
@@ -2322,8 +2381,8 @@ class Pool:
 
         A busy box is a queue, not a refusal, so the wait has no deadline. It
         ends when a slot frees, when no backend can serve the request, or when
-        `wanted` says the client left. A pin holds for PIN_PATIENCE."""
-        patience = time.time() + PIN_PATIENCE
+        `wanted` says the client left. A pin holds for pin_patience."""
+        patience = time.time() + self.tuning.pin_patience
         spill = False              # set once the pin is given up on
 
         while True:
@@ -2384,7 +2443,7 @@ class Pool:
                 inflight=True,
                 turns=record.get("turns", 0) + 1)
             self.pins.move_to_end(conv)
-            while len(self.pins) > MAX_PINS:
+            while len(self.pins) > self.tuning.max_pins:
                 _, dropped = self.pins.popitem(last=False)
                 if dropped.get("parked"):
                     self.store.drop(dropped["parked"])   # its copy is orphaned
@@ -2432,7 +2491,7 @@ class Pool:
         """Read one wanted opening while a backend is idle, off the request
         path."""
         while True:
-            time.sleep(BUILD_POLL)
+            time.sleep(self.tuning.build_poll)
             try:
                 self.build_once(http_post)
             except Exception as err:
@@ -2441,13 +2500,13 @@ class Pool:
     def _idle_slot(self, be):
         """A slot the builder may read into, or None. Stricter than
         _free_slot: the backend is up, the router's own count leaves room,
-        and the poll has found the slot idle IDLE_POLLS times."""
+        and the poll has found the slot idle idle_polls times."""
         # A draining backend is about to be stopped.
         if not be["up"] or be.get("draining") or be["busy"] >= be["slots"]:
             return None
         runs = be.get("idle_runs") or {}
         for slot in be.get("slots_detail") or []:
-            if not slot["busy"] and runs.get(slot["id"], 0) >= IDLE_POLLS:
+            if not slot["busy"] and runs.get(slot["id"], 0) >= self.tuning.idle_polls:
                 return slot["id"]
         return None
 
@@ -2498,7 +2557,7 @@ class Pool:
         lost = False
         refused = False
         began = time.time()
-        # Which turn this save belongs to. A save can take POST_TIMEOUT, and
+        # Which turn this save belongs to. A save can take post_timeout, and
         # the conversation's next turn can start inside that window. Clearing
         # `inflight` for the wrong turn un-reserves a slot being read.
         with self.cv:
@@ -2513,7 +2572,7 @@ class Pool:
             # file came back as 49 MB. Its figure is the fallback for a
             # stub. tests/live/test_llama_beliefs.py asserts the two agree.
             written = self.store.size(name) or (answer.get("n_written") or 0)
-            kept = written >= PARK_FLOOR
+            kept = written >= self.tuning.park_floor
             if not kept:
                 lost = True
                 print(f"[router] {short} was gone from {be['name']} slot {slot}, "
@@ -2543,7 +2602,7 @@ class Pool:
                     record["bytes"] = 0
                 # A refused call keeps the copy it had: the file is still on
                 # disk and still a prefix. Clearing it orphaned the file, off
-                # the budget sweep and off MAX_PINS eviction.
+                # the budget sweep and off the max_pins eviction.
                 if lost and mine:
                     # The slot holds someone else.
                     record["slot"] = None
@@ -2557,7 +2616,7 @@ class Pool:
             for age, name_held in enumerate(reversed(held)):
                 older = self.pins[name_held]
                 total += older.get("bytes") or 0
-                if age and total > PARK_BUDGET:
+                if age and total > self.tuning.park_budget:
                     spent.append(older["parked"])
                     older["parked"] = None
             self.cv.notify_all()
@@ -2650,7 +2709,7 @@ class Pool:
             # Deeper only past what is saved, where a slot holds it.
             seen = set().union(*self.holds.values()) if self.holds else set()
             shared = deepest_shared(cuts, seen)
-            if (DEEP_OPENINGS and shared and shared[1] != base[1]
+            if (self.tuning.deep_openings and shared and shared[1] != base[1]
                     and shared[1] not in saved
                     and (stored is None or shared[0] > stored[0])):
                 self.note_want(shared, "deep-", system, tools,
@@ -2675,7 +2734,7 @@ class Pool:
                                   "held": len(set().union(*self.holds.values())
                                              if self.holds else set())}
             self.choices.move_to_end(conv)
-            while len(self.choices) > RECENT_REQUESTS:
+            while len(self.choices) > self.tuning.recent_requests:
                 self.choices.popitem(last=False)
 
             # A request sharing more than the base opening has branched off
@@ -2690,7 +2749,7 @@ class Pool:
                     # Assigning an existing key does not move it. Without
                     # this the dedupe above wrote the same fork twice.
                     self.forked.move_to_end(conv)
-                    while len(self.forked) > RECENT_REQUESTS:
+                    while len(self.forked) > self.tuning.recent_requests:
                         self.forked.popitem(last=False)
                     EVENTS.write("fork", conv=short_key(conv),
                                  parent=short_key(holder), depth=shared[0],
@@ -2729,7 +2788,7 @@ class Pool:
         """Wait for another request to save the opening, then load it.
         Measured: five sessions starting together read 92,000 tokens where
         24,000 would do, and the last finished after seventeen minutes."""
-        deadline = time.time() + BUILD_PATIENCE
+        deadline = time.time() + self.tuning.build_patience
         with self.cv:
             while key in self.building and time.time() < deadline:
                 self.cv.wait(1.0)
@@ -2747,7 +2806,7 @@ class Pool:
                                   "tools": tools, "head": list(head),
                                   "path": path, "at": time.time()}
             self.wants.move_to_end(cut[1])
-            while len(self.wants) > WANT_KEEP:
+            while len(self.wants) > self.tuning.want_keep:
                 old, gone = self.wants.popitem(last=False)
                 EVENTS.write("want", key=short_key(old), shelf=mark_shelf(gone),
                              action="dropped",
@@ -2774,7 +2833,7 @@ class Pool:
 
         # The builder is the second way into a slot. Reading an opening over
         # a finished conversation's only cache lost that cache while the pin
-        # still said the slot was held. IDLE_POLLS makes that rarer only.
+        # still said the slot was held. idle_polls makes that rarer only.
         self.ensure_parked(be, None, post, remove)
         began = time.time()
         try:
@@ -2793,11 +2852,12 @@ class Pool:
                      age=round(began - want.get("at", began), 1))
         return key if kept else None
 
-    def park_all(self, post, timeout=POST_TIMEOUT, only=None, budget=None):
+    def park_all(self, post, timeout=None, only=None, budget=None):
         """Copy live caches to disk, so a stop does not throw them away. `only`
         names one backend, for a drain. A conversation mid-turn is skipped:
         its slot is busy. Each conversation is tried once, or a refused save
         loops forever. A full disk at SIGTERM spun here."""
+        timeout = self.tuning.post_timeout if timeout is None else timeout
         parked = 0
         # `budget` is a wall clock across every backend: the signal handler
         # gets 90 s from stop-all.sh. A drain passes none.
@@ -2867,7 +2927,7 @@ class Pool:
         failure leaves it parked, not lost. Returns the backend to generate
         on: `source` when nothing was carried, None when nobody waits."""
         remove = remove or self.store.drop
-        if not HANDOFF_ON:
+        if not self.tuning.handoff:
             return self._stay(source, "the handoff is turned off")
         target = self.generator(tokens)
         while target is None and not generates(source):
@@ -3137,7 +3197,8 @@ class Pool:
             # The zero-token reply's timings: tokens processed and cached.
             read = post(be["url"], "/completion",
                         {"prompt": block, "n_predict": 0, "cache_prompt": True,
-                         "id_slot": slot}, timeout=READ_TIMEOUT) or {}
+                         "id_slot": slot},
+                        timeout=self.tuning.read_timeout) or {}
             answer = post(be["url"], f"/slots/{slot}?action=save",
                           {"filename": name}) or {}
         except Exception as err:
@@ -3151,7 +3212,7 @@ class Pool:
             return False
         # From the disk, as _save_park: unpatched backends under-report.
         written = self.store.size(name) or (answer.get("n_written") or 0)
-        if written < PARK_FLOOR:
+        if written < self.tuning.park_floor:
             remove(name)           # the slot had already changed hands
             EVENTS.write("build", key=short_key(key), shelf=mark_shelf(mark),
                          backend=be["name"], slot=slot, ok=False,
@@ -3166,7 +3227,8 @@ class Pool:
             self.note_file("kept opening", key, be, slot, written)
             # `building` has no file to count yet.
             dropped = trim_openings(self.openings, self.opening_bytes,
-                                    keep=set(self.building))
+                                    keep=set(self.building),
+                                    budget=self.tuning.block_budget)
         for extra in dropped:
             remove(extra)
         self.save_openings()
@@ -3240,7 +3302,7 @@ class Pool:
                                   for key, want in self.wants.items()]}
             # `slot` is set only while the slot still holds the cache, or
             # three copies naming one single-slot backend look like three
-            # caches in one slot. `parked_at` is the PARK_BUDGET sweep order.
+            # caches in one slot. `parked_at` is the park_budget sweep order.
             copies = [{"name": p["parked"], "kind": "copy", "conv": short_key(conv),
                        "bytes": p.get("bytes") or 0, "backend": p["backend"],
                        "slot": p.get("slot"), "parked_at": p.get("parked_at")}
@@ -3468,10 +3530,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._error(400, "Content-Length is negative")
         # Checked before the body is read, or a header alone could ask
         # this process for arbitrary memory.
-        if length > MAX_BODY:
+        if length > POOL.tuning.max_body:
             self.close_connection = True
             return self._error(413, f"body of {length} bytes; this router "
-                                    f"reads at most {MAX_BODY}")
+                                    f"reads at most {POOL.tuning.max_body}")
         # Nothing here decodes chunked. Read as an empty body, the unread
         # chunks become the next request line on this connection.
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
@@ -3500,10 +3562,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         vision = POOL.vision()
         tokens, images, image_charge = request_cost(body, vision)
-        # `tokens` carries REPLY_TOKENS of room. The dashboard measures a
+        # `tokens` carries reply_tokens of room. The dashboard measures a
         # turn against the prompt sent: 1,024 tokens nobody sent is 41
         # seconds of reading nobody did.
-        prompt_tokens = max(0, tokens - REPLY_TOKENS)
+        prompt_tokens = max(0, tokens - POOL.tuning.reply_tokens)
         largest = POOL.largest()
         if largest and tokens > largest:
             return self._error(413, f"needs about {tokens} tokens. "
@@ -3591,7 +3653,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if asked is not None:
                 # Watch the client. The timings say what the cache saved.
                 answer = http_post_wanted(be["url"], path, read_only(body, slot),
-                                          READ_TIMEOUT, self._still_there)
+                                          POOL.tuning.read_timeout, self._still_there)
                 timing = (answer or {}).get("timings") or {}
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
                               "read_cache_n": timing.get("cache_n")}
@@ -3707,7 +3769,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         beat = ping_for(self.path.split("?")[0])
 
         def run():
-            while not stop.wait(PING_EVERY):
+            while not stop.wait(POOL.tuning.ping_every):
                 with self.sending:
                     if stop.is_set():
                         return
@@ -3768,7 +3830,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         request = urllib.request.Request(be["url"] + target, data=data,
                                          headers=headers, method=self.command)
         try:
-            upstream = urllib.request.urlopen(request, timeout=FORWARD_TIMEOUT)
+            upstream = urllib.request.urlopen(request, timeout=POOL.tuning.forward_timeout)
         except urllib.error.HTTPError as e:
             upstream = e                       # pass the backend error through
         except Exception as e:
@@ -3821,7 +3883,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             def keep_alive():
                 while not done.wait(1.0):
-                    if time.time() - last[0] < PING_EVERY:
+                    if time.time() - last[0] < POOL.tuning.ping_every:
                         continue
                     with sending:
                         if done.is_set():
@@ -3964,11 +4026,11 @@ if __name__ == "__main__":
         # The worker's copy first. park_all skips a record being copied, and
         # sys.exit kills the daemon worker mid-copy.
         began = time.time()
-        if not POOL.drain_parks(PARK_ALL_TIMEOUT):
+        if not POOL.drain_parks(POOL.tuning.park_all_timeout):
             print("[router] a copy on the worker did not land in time",
                   flush=True)
-        parked = POOL.park_all(http_post, timeout=PARK_ALL_TIMEOUT,
-                               budget=max(1.0, PARK_ALL_BUDGET
+        parked = POOL.park_all(http_post, timeout=POOL.tuning.park_all_timeout,
+                               budget=max(1.0, POOL.tuning.park_all_budget
                                           - (time.time() - began)))
         kept = POOL.save_pins()
         print(f"[router] parked {parked} conversation(s), wrote {kept} pin(s)",

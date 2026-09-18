@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pathlib
+from dataclasses import replace
 import router
 
 # The same reasoning as CACHE_LOG above, for what this run writes. STORE is the
@@ -127,22 +128,19 @@ class EndToEnd(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="router-e2e-"))
         (self.root / "slots").mkdir()
         self.kept = {name: getattr(router, name) for name in
-                     ("STORE", "POLL", "BUILD_POLL", "PIN_PATIENCE",
-                      "PARK_ALL_TIMEOUT", "HANDOFF_ON", "PING_EVERY")}
-        # These tests are about the move, so they turn it on whatever the
-        # shipped default is.
-        router.HANDOFF_ON = True
+                     ("STORE", "TUNING")}
         self.had_pool = getattr(router, "POOL", None)
         # No <name>.log is written here on purpose. CacheWatch has to survive
         # a backend whose log it cannot find.
         router.STORE = router.Store(self.root)
         # The stub answers at once, so polling fast is free. Every loop has to
         # come round quickly, because that is also how the cleanup stops it.
-        router.POLL = 0.05
-        router.BUILD_POLL = 0.05
-        router.PIN_PATIENCE = 0.3       # a pin worth 20 seconds in production
-                                        # is worth a fraction of one here.
-        router.PARK_ALL_TIMEOUT = 5.0
+        # A pin worth 20 seconds in production is worth a fraction of one
+        # here. handoff is on whatever the shipped default is, because these
+        # tests are about the move.
+        router.TUNING = replace(router.TUNING, poll=0.05, build_poll=0.05,
+                                pin_patience=0.3, park_all_timeout=5.0,
+                                handoff=True)
 
         self.stubs = []
         self.pools = []
@@ -252,7 +250,7 @@ class EndToEnd(unittest.TestCase):
             thread.join(PATIENCE)
         # A loop only meets its bomb when it comes round, so shorten the wait
         # whatever the test had set it to.
-        router.POLL = router.BUILD_POLL = 0.02
+        router.TUNING = replace(router.TUNING, poll=0.02, build_poll=0.02)
         for pool in self.pools:
             pool.build_once = Bomb()
             pool.cv = Bomb()
@@ -948,7 +946,7 @@ class AFullBoxMakesTheClientWait(EndToEnd):
 
     def setUp(self):
         super().setUp()
-        router.PING_EVERY = 0.05
+        router.TUNING = replace(router.TUNING, ping_every=0.05)
         self.only = self.pool([self.stub("cpu", 0, busy_ms=READ_MS)])
         self.url = self.serve(self.only)
 
@@ -1097,9 +1095,9 @@ class TheClientIsNeverLeftInSilence(EndToEnd):
     def test_bytes_arrive_while_the_prompt_is_still_being_read(self):
         """The reply starts before the reading does, and is kept alive through
         it with the keep-alive that client's protocol defines."""
-        was = router.PING_EVERY
-        router.PING_EVERY = 0.2
-        self.addCleanup(lambda: setattr(router, "PING_EVERY", was))
+        was = router.TUNING
+        router.TUNING = replace(was, ping_every=0.2)
+        self.addCleanup(lambda: setattr(router, "TUNING", was))
 
         pool = self.pool([self.stub("cpu", 1)])
         url = self.serve(pool)
@@ -1138,9 +1136,9 @@ class AnAnthropicStreamIsAMessageFromTheStart(EndToEnd):
 
     def setUp(self):
         super().setUp()
-        was = router.PING_EVERY
-        router.PING_EVERY = 0.2
-        self.addCleanup(lambda: setattr(router, "PING_EVERY", was))
+        was = router.TUNING
+        router.TUNING = replace(was, ping_every=0.2)
+        self.addCleanup(lambda: setattr(router, "TUNING", was))
         self.only = self.pool([self.stub("cpu", 0)])
         self.url = self.serve(self.only)
 

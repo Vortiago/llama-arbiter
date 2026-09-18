@@ -27,6 +27,8 @@ os.environ.setdefault("CACHE_LOG", "0")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 
+import dataclasses
+from dataclasses import replace
 import router
 
 # The same reasoning as CACHE_LOG above, for what this run writes.
@@ -130,10 +132,10 @@ class ARequestCanBeWrittenDown(unittest.TestCase):
 
     def test_only_the_newest_of_a_conversation_are_kept(self):
         router.CAPTURE_DIR = self.root
-        for n in range(router.CAPTURE_KEEP + 5):
+        for n in range(router.TUNING.capture_keep + 5):
             router.capture("busy", b'{"n":%d}' % n)
         self.assertEqual(len(list(self.root.glob("*.json"))),
-                         router.CAPTURE_KEEP)
+                         router.TUNING.capture_keep)
 
     def test_a_busy_conversation_does_not_push_out_a_quiet_one(self):
         """The quiet client is the one being looked for.
@@ -142,7 +144,7 @@ class ARequestCanBeWrittenDown(unittest.TestCase):
         as one list, the hourly body was gone both times it was wanted."""
         router.CAPTURE_DIR = self.root
         router.capture("quiet", b'{"quiet":1}')
-        for n in range(router.CAPTURE_KEEP + 5):
+        for n in range(router.TUNING.capture_keep + 5):
             router.capture("busy", b'{"n":%d}' % n)
         self.assertEqual([p.read_bytes() for p in self.root.glob("*-quiet.json")],
                          [b'{"quiet":1}'])
@@ -233,9 +235,9 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
     def setUp(self):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="stampede-"))
         self.kept = {n: getattr(router, n) for n in
-                     ("STORE", "BUILD_PATIENCE")}
+                     ("STORE", "TUNING")}
         router.STORE = router.Store(self.root)
-        router.BUILD_PATIENCE = 5.0
+        router.TUNING = replace(router.TUNING, build_patience=5.0)
         self.addCleanup(lambda: [setattr(router, n, v)
                                  for n, v in self.kept.items()])
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
@@ -307,7 +309,7 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
         self.assertFalse(self.warm("first", opening, "one", post))
         began = time.time()
         self.assertFalse(self.warm("second", opening, "two", post))
-        self.assertLess(time.time() - began, router.BUILD_PATIENCE,
+        self.assertLess(time.time() - began, router.TUNING.build_patience,
                         "the second one waited for a build that had failed")
 
 
@@ -444,7 +446,7 @@ class ACutHasToBeSomewhereATemplateCanStop(unittest.TestCase):
     saves, and the whole conversation reads from cold instead. The tool result
     that answers it is the next cut, and that one renders."""
 
-    LONG = "T" * router.PREFIX_MIN_CHARS
+    LONG = "T" * router.TUNING.prefix_min_chars
 
     def cuts(self, messages):
         return router.prompt_cuts(json.dumps({"messages": messages}).encode())[0]
@@ -574,7 +576,7 @@ class WhatAnImageCosts(unittest.TestCase):
         picture. The largest backend holds 150,016, so counting the base64
         refused a screenshot that fits with room to spare."""
         body = openai_body(png(1280, 800, weigh=500000))
-        self.assertGreater(len(body) / router.CHARS_PER_TOK, 150016)
+        self.assertGreater(len(body) / router.TUNING.chars_per_tok, 150016)
         self.assertLess(router.token_estimate(body), 150016)
 
     def test_each_picture_is_counted_once(self):
@@ -591,18 +593,18 @@ class WhatAnImageCosts(unittest.TestCase):
                                          "media_type": "image/png",
                                          "data": base64.b64encode(
                                              png(240, 120)).decode()}}]}]}).encode()
-        self.assertEqual(router.token_estimate(body) - router.REPLY_TOKENS - 32,
+        self.assertEqual(router.token_estimate(body) - router.TUNING.reply_tokens - 32,
                          int((len(body) - len(base64.b64encode(png(240, 120))))
-                             / router.CHARS_PER_TOK))
+                             / router.TUNING.chars_per_tok))
 
     def test_a_request_with_no_picture_is_still_its_length(self):
         body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
         self.assertEqual(router.token_estimate(body),
-                         int(len(body) / router.CHARS_PER_TOK) + router.REPLY_TOKENS)
+                         int(len(body) / router.TUNING.chars_per_tok) + router.TUNING.reply_tokens)
 
     def test_a_body_that_is_not_json_is_still_its_length(self):
         self.assertEqual(router.token_estimate(b"<not json>"),
-                         int(10 / router.CHARS_PER_TOK) + router.REPLY_TOKENS)
+                         int(10 / router.TUNING.chars_per_tok) + router.TUNING.reply_tokens)
 
 
 class TheVisionGeometryComesFromTheBackend(unittest.TestCase):
@@ -1164,14 +1166,16 @@ class PinIsAbsolute(unittest.TestCase):
     def test_gives_up_on_the_pin_and_takes_a_free_backend(self):
         """A pin is worth a short wait, not an idle machine. After that the
         request goes wherever there is room."""
-        original = router.PIN_PATIENCE
-        router.PIN_PATIENCE = 1.0
+        original = router.TUNING
+        # The pool took its tuning when it was built, so hand it the new one
+        # as well. That is the dependency being explicit rather than global.
+        router.TUNING = self.pool.tuning = replace(original, pin_patience=1.0)
         try:
             got, thread = self.take()
             thread.join(5)
             self.assertEqual(got["be"]["name"], "cpu")
         finally:
-            router.PIN_PATIENCE = original
+            router.TUNING = self.pool.tuning = original
 
     def test_spills_when_the_pinned_backend_is_down(self):
         self.gpu["up"] = False
@@ -1207,6 +1211,30 @@ class TheSuiteCannotTouchARunningRouter(unittest.TestCase):
         for path in (router.STORE.slots / "pins.json",
                      router.STORE.slots / "openings.json"):
             self.assertTrue(str(path).startswith(tempfile.gettempdir()), path)
+
+    def test_the_tuned_numbers_are_not_module_globals(self):
+        """The same reasoning as the directories, for the numbers.
+
+        A test lowered POLL or PIN_PATIENCE by assignment, which reached the
+        readers only while they shared this module. Three of them could not
+        be reached at all, because they were default arguments that Python
+        binds once at import: tests/live/test_router_live.py had to size a
+        9,000 character system prompt around PREFIX_MIN_CHARS rather than
+        lower it. A Tuning is passed in, and a frozen one cannot be edited by
+        halves."""
+        for name in ("POLL", "PIN_PATIENCE", "PARK_BUDGET", "BLOCK_BUDGET",
+                     "HANDOFF_ON", "DEEP_OPENINGS", "PREFIX_MIN_CHARS",
+                     "PING_EVERY", "MAX_BODY", "REPLY_TOKENS", "PARK_FLOOR"):
+            self.assertFalse(
+                hasattr(router, name),
+                f"router.{name} is a module global again. A test can assign "
+                f"it, and a reader that does not share this module will not "
+                f"see the assignment.")
+
+    def test_a_tuning_cannot_be_edited_by_halves(self):
+        """Frozen on purpose. A half-changed Tuning is the global it replaced."""
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            router.TUNING.poll = 0.01
 
     def test_the_directories_are_not_module_globals(self):
         """Store owns the directories, where no test can redirect them.
@@ -1387,7 +1415,7 @@ class ParkBeforeAdmitting(SlotDirCase):
         The conversation parked here was pinned first, so by pin order it is
         the oldest and the budget drops it the moment it lands."""
         removed = []
-        half = router.PARK_BUDGET // 2
+        half = router.TUNING.park_budget // 2
         self.pool.pins["early"] = pin("cpu", slot=0, last=1.0, inflight=True)
         self.hold("later", half, last=2.0)
         self.pool._save_park("early", self.cpu, 0, self.saver(written=half + 1),
@@ -1401,7 +1429,7 @@ class ParkBeforeAdmitting(SlotDirCase):
         cpu1_0 wrote the same 9.45 GiB copy 1,456 times over four and a half
         hours because the budget cleared the mark that says it is on disk."""
         self.pool.pins["stuck"] = pin("cpu", slot=0, last=1.0)
-        self.hold("big", router.PARK_BUDGET, last=2.0)
+        self.hold("big", router.TUNING.park_budget, last=2.0)
         post = self.saver(written=200_000_000)
         self.pool.ensure_parked(self.cpu, "new", post)
         written = [payload["filename"] for _, path, payload in post.calls
@@ -1412,7 +1440,7 @@ class ParkBeforeAdmitting(SlotDirCase):
     def test_keeps_the_copies_that_fit_the_budget(self):
         """Copies run oldest first. The oldest go when the budget is spent."""
         removed = []
-        half = router.PARK_BUDGET // 2
+        half = router.TUNING.park_budget // 2
         self.hold("old", half, last=1.0)
         self.hold("mid", half, last=2.0)
         self.pool.pins["new"] = pin("cpu", slot=0, last=99.0, inflight=True)
@@ -1426,7 +1454,7 @@ class ParkBeforeAdmitting(SlotDirCase):
         removed = []
         self.pool.pins["new"] = pin("cpu", slot=0, last=99.0, inflight=True)
         self.pool._save_park("new", self.cpu, 0,
-                             self.saver(written=router.PARK_BUDGET * 2),
+                             self.saver(written=router.TUNING.park_budget * 2),
                              remove=removed.append)
         self.assertEqual(removed, [])
         self.assertEqual(self.pool.pins["new"]["parked"], "new.park")
@@ -1639,9 +1667,10 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
 
     def deep_on(self):
         """Deeper openings as they are with DEEP_OPENINGS=1."""
-        was = router.DEEP_OPENINGS
-        router.DEEP_OPENINGS = True
-        self.addCleanup(setattr, router, "DEEP_OPENINGS", was)
+        was = router.TUNING
+        router.TUNING = replace(was, deep_openings=True)
+        self.pool.tuning = router.TUNING
+        self.addCleanup(setattr, router, "TUNING", was)
 
     def test_notes_the_deeper_cut_a_slot_already_holds(self):
         self.deep_on()
@@ -1666,7 +1695,7 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
         """Off, because the shelf was built 0 times and loaded 0 times in 51
         hours of real traffic. The cut is still found - it is what the choice
         event measures the fork question with - but nothing reads it."""
-        self.assertFalse(router.DEEP_OPENINGS)
+        self.assertFalse(router.TUNING.deep_openings)
         self.pool.openings["k1"] = "base-k1.park"
         self.pool.holds[("cpu", 0)] = {"k1", "k2"}
         self.warm(self.talker(), cuts=self.CUTS)
@@ -1734,7 +1763,7 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
 
         Measured here: a system prompt block runs 0.58 to 3.68 GB, so the
         budget has to hold several of the big ones."""
-        self.assertGreaterEqual(router.BLOCK_BUDGET, 4 * 4 * 1024 ** 3)
+        self.assertGreaterEqual(router.TUNING.block_budget, 4 * 4 * 1024 ** 3)
 
     def test_an_opening_in_use_is_not_the_next_one_dropped(self):
         """Loading an opening moves it to the end of the shelf, so the budget
@@ -1762,18 +1791,18 @@ class WantedOpenings(unittest.TestCase):
                             "/v1/chat/completions")
 
     def test_keeps_only_a_handful(self):
-        for index in range(router.WANT_KEEP + 2):
+        for index in range(router.TUNING.want_keep + 2):
             self.note(f"k{index}")
-        self.assertEqual(len(self.pool.wants), router.WANT_KEEP)
+        self.assertEqual(len(self.pool.wants), router.TUNING.want_keep)
 
     def test_the_newest_wins(self):
-        for index in range(router.WANT_KEEP + 1):
+        for index in range(router.TUNING.want_keep + 1):
             self.note(f"k{index}")
         self.assertNotIn("k0", self.pool.wants)
-        self.assertIn(f"k{router.WANT_KEEP}", self.pool.wants)
+        self.assertIn(f"k{router.TUNING.want_keep}", self.pool.wants)
 
     def test_asking_again_moves_it_back_to_the_front(self):
-        for index in range(router.WANT_KEEP):
+        for index in range(router.TUNING.want_keep):
             self.note(f"k{index}")
         self.note("k0")
         self.note("new")
@@ -1894,9 +1923,10 @@ class BuildOpenings(PrefixCase, unittest.TestCase):
         self.assertEqual(self.removed, ["base-k1.park"])
 
     def budget(self, bytes_):
-        was = router.BLOCK_BUDGET
-        router.BLOCK_BUDGET = bytes_
-        self.addCleanup(setattr, router, "BLOCK_BUDGET", was)
+        was = router.TUNING
+        router.TUNING = replace(was, block_budget=bytes_)
+        self.pool.tuning = router.TUNING
+        self.addCleanup(setattr, router, "TUNING", was)
 
     def shelve(self, key, name, bytes_=700_000_000):
         self.pool.openings[key] = name
@@ -2034,9 +2064,9 @@ class AdoptFiles(unittest.TestCase):
         self.assertEqual(spent, [])
 
     def test_keeps_an_opening_cut_deeper_only_when_they_are_on(self):
-        was = router.DEEP_OPENINGS
-        router.DEEP_OPENINGS = True
-        self.addCleanup(setattr, router, "DEEP_OPENINGS", was)
+        was = router.TUNING
+        router.TUNING = replace(was, deep_openings=True)
+        self.addCleanup(setattr, router, "TUNING", was)
         openings, _, _, spent = self.sized(["deep-k2.park"])
         self.assertEqual(openings, OrderedDict(k2="deep-k2.park"))
         self.assertEqual(spent, [])
@@ -2044,7 +2074,7 @@ class AdoptFiles(unittest.TestCase):
     def test_a_deeper_opening_is_given_back_to_the_disk_when_they_are_off(self):
         """Nothing builds them any more, so keeping them is 8 GB of a 92% full
         nvme held by four files that have never been loaded once."""
-        self.assertFalse(router.DEEP_OPENINGS)
+        self.assertFalse(router.TUNING.deep_openings)
         openings, _, _, spent = self.sized(["base-k1.park", "deep-k2.park"])
         self.assertEqual(openings, OrderedDict(k1="base-k1.park"))
         self.assertEqual(spent, ["deep-k2.park"])
@@ -2062,9 +2092,10 @@ class AdoptFiles(unittest.TestCase):
         """The budget outlives the run that wrote the files, so a restart
         under a smaller one drops what no longer fits - deeper cuts first."""
         names = ["base-b0.park", "deep-d0.park", "base-b1.park"]
-        was = router.BLOCK_BUDGET
-        router.BLOCK_BUDGET = 1_500_000_000     # room for two of the three
-        self.addCleanup(setattr, router, "BLOCK_BUDGET", was)
+        was = router.TUNING
+        # room for two of the three
+        router.TUNING = replace(was, block_budget=1_500_000_000)
+        self.addCleanup(setattr, router, "TUNING", was)
         openings, sizes, _, spent = self.sized(names)
         self.assertEqual(spent, ["deep-d0.park"])
         self.assertEqual(list(openings), ["b0", "b1"])
@@ -2617,7 +2648,7 @@ class ASlotRateIsNullUntilOneIsMeasured(unittest.TestCase):
 
     def test_a_rate_appears_once_the_window_has_resolved(self):
         self.pool._read_slots(self.be, self.slots(10))
-        self.be["slot_prev"][0]["since"] -= router.RATE_WINDOW + 1
+        self.be["slot_prev"][0]["since"] -= router.TUNING.rate_window + 1
         self.pool._read_slots(self.be, self.slots(30))
         self.assertIsNotNone(self.be["slots_detail"][0]["tg_rate"])
 
@@ -2690,14 +2721,14 @@ class DiskSummary(unittest.TestCase):
         pins["c"]["bytes"] = 250
         openings = {"x": "base-x.park", "y": "deep-y.park"}
         got = router.disk_summary(pins, openings, {"x": 10, "y": 20}, {"w": {}})
-        self.assertEqual(got["copies"], {"count": 2, "bytes": 350, "budget": router.PARK_BUDGET})
+        self.assertEqual(got["copies"], {"count": 2, "bytes": 350, "budget": router.TUNING.park_budget})
         # One budget, and the two kinds counted under it rather than each
         # against a cap of its own.
         self.assertEqual(got["openings"],
-                         {"count": 2, "bytes": 30, "budget": router.BLOCK_BUDGET})
+                         {"count": 2, "bytes": 30, "budget": router.TUNING.block_budget})
         self.assertEqual(got["bases"], {"count": 1})
         self.assertEqual(got["deeps"], {"count": 1})
-        self.assertEqual(got["wants"], {"count": 1, "keep": router.WANT_KEEP})
+        self.assertEqual(got["wants"], {"count": 1, "keep": router.TUNING.want_keep})
 
 
 class WhoIsWaiting(unittest.TestCase):
@@ -2934,11 +2965,11 @@ class RecentRequests(unittest.TestCase):
     def test_the_newest_comes_first_and_the_list_is_bounded(self):
         pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}], watch=False)
         be = pool.backends[0]
-        for i in range(router.RECENT_REQUESTS + 5):
+        for i in range(router.TUNING.recent_requests + 5):
             pool.note_request(f"conv{i:04d}xx", be, "/v1/messages", 12.34, 1.0, "cold", 100)
         rows = pool.status()["recent_requests"]
-        self.assertEqual(len(rows), router.RECENT_REQUESTS)
-        self.assertEqual(rows[0]["conv"], f"conv{router.RECENT_REQUESTS + 4:04d}"[:8])
+        self.assertEqual(len(rows), router.TUNING.recent_requests)
+        self.assertEqual(rows[0]["conv"], f"conv{router.TUNING.recent_requests + 4:04d}"[:8])
         self.assertEqual(rows[0]["started"], "cold")
         self.assertEqual(rows[0]["took"], 12.3)
 
@@ -3005,7 +3036,7 @@ class ACopyIsNoUseWhenTheOpeningChanges(unittest.TestCase):
 
         def post(url, path, payload, timeout=None):
             posted.append(path)
-            return {"n_written": router.PARK_FLOOR + 1}
+            return {"n_written": router.TUNING.park_floor + 1}
 
         self.drop("tools-v2")
         loaded = self.pool.warm_prefix("a", self.cuts("tools-v2"), [], "sys", [],
@@ -3212,7 +3243,7 @@ class ACopyIsMeasuredOnTheDisk(unittest.TestCase):
         self.pool.pins["a"] = pin("cpu", slot=0)
 
     def test_the_size_on_disk_wins_over_what_the_backend_reported(self):
-        real = router.PARK_FLOOR + 10_000_000
+        real = router.TUNING.park_floor + 10_000_000
         (router.STORE.slots / "a.park").write_bytes(b"\0" * real)
         # The backend undercounts by more than half, as an unpatched one does.
         self.pool._save_park("a", self.cpu, 0, FakePost(written=real // 3))
@@ -3662,9 +3693,10 @@ class HandOff(unittest.TestCase):
         self.removed = []
         # This class is about the move, so it turns it on whatever the shipped
         # default is. TheHandoffCanBeTurnedOff covers the default.
-        self.was_on = router.HANDOFF_ON
-        router.HANDOFF_ON = True
-        self.addCleanup(lambda: setattr(router, "HANDOFF_ON", self.was_on))
+        self.was_on = router.TUNING
+        router.TUNING = replace(self.was_on, handoff=True)
+        self.pool.tuning = router.TUNING
+        self.addCleanup(lambda: setattr(router, "TUNING", self.was_on))
 
     def mover(self, written=200_000_000, fail_on=None):
         return FakePost(written=written, fail_on=fail_on)
@@ -3899,7 +3931,7 @@ class ReadingIsAllowedToTakeAsLongAsTheRequest(unittest.TestCase):
     exactly the long conversations it exists for."""
 
     def test_a_read_may_run_as_long_as_the_whole_request(self):
-        self.assertGreaterEqual(router.READ_TIMEOUT, router.FORWARD_TIMEOUT)
+        self.assertGreaterEqual(router.TUNING.read_timeout, router.TUNING.forward_timeout)
 
     def test_a_queued_request_is_never_given_up_on(self):
         """A busy box makes a client wait, it does not refuse it. The wait ends
@@ -4016,19 +4048,19 @@ class TheHandoffCanBeTurnedOff(unittest.TestCase):
             be.update(up=True, slots=1, n_ctx=150000,
                       slots_detail=[{"id": 0, "busy": False, "phase": "idle"}])
         self.pool.pins["a"] = pin("cpu1_0", slot=0, inflight=True)
-        self.was = router.HANDOFF_ON
+        self.was = router.TUNING
 
     def tearDown(self):
-        router.HANDOFF_ON = self.was
+        router.TUNING = self.was
 
     def test_it_stays_put_when_the_move_is_off(self):
-        router.HANDOFF_ON = False
+        self.pool.tuning = replace(router.TUNING, handoff=False)
         post = FakePost()
         self.assertIs(self.pool.hand_off("a", self.cpu, 1000, post), self.cpu)
         self.assertEqual(post.calls, [], "it moved anyway")
 
     def test_it_moves_when_the_move_is_on(self):
-        router.HANDOFF_ON = True
+        self.pool.tuning = replace(router.TUNING, handoff=True)
 
         post = FakePost(written=200_000_000)
         self.assertIs(self.pool.hand_off("a", self.cpu, 1000, post), self.gpu)

@@ -28,6 +28,7 @@ os.environ.setdefault("CACHE_LOG", "0")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "bin"))
 import router                                                    # noqa: E402
+from dataclasses import replace                                   # noqa: E402
 
 POOL_LOOPS = ("_watch", "_builder")
 
@@ -74,11 +75,10 @@ class LiveRouter(LiveCase):
     started, on ports from 18080 up.
     """
 
-    # Long enough that prompt_cuts names a cut in it. PREFIX_MIN_CHARS cannot
-    # be lowered from a test: prompt_cuts takes it as a default argument, which
-    # Python binds once at import, so patching the module attribute afterwards
-    # changes nothing. The system prompt is sized for the real constant
-    # instead, and the context is sized for the system prompt.
+    # Long enough that prompt_cuts names a cut in it. prefix_min_chars is a
+    # field of the tuning now, so a test could lower it instead; this suite
+    # keeps the shipped figure, because the size of a real system prompt is
+    # part of what it measures. The context is sized for the system prompt.
     SYSTEM_CHARS = 9000
     CTX = 8192
 
@@ -91,11 +91,9 @@ class LiveRouter(LiveCase):
     def setUp(self):
         super().setUp()
         self.kept = {name: getattr(router, name) for name in
-                     ("STORE", "POLL", "BUILD_POLL", "PIN_PATIENCE",
-                      "PARK_ALL_TIMEOUT", "PARK_FLOOR", "IDLE_POLLS",
-                      "HANDOFF_ON")}
+                     ("STORE", "TUNING")}
         self.had_pool = getattr(router, "POOL", None)
-        router.HANDOFF_ON = self.HANDOFF
+
         # One store over this test's whole run directory. The backends share
         # its slot directory, because a backend takes only a bare filename
         # under its own --slot-save-path. Every backend also writes
@@ -104,16 +102,15 @@ class LiveRouter(LiveCase):
         # slot and log paths the same way from the same root.
         router.STORE = router.Store(self.root)
         router.STORE.slots.mkdir(parents=True, exist_ok=True)
-        router.POLL = 0.2
-        router.BUILD_POLL = 0.3
-        router.IDLE_POLLS = 1
-        router.PIN_PATIENCE = 1.0       # worth 20 seconds in production
-        router.PARK_ALL_TIMEOUT = 30.0
+        # pin_patience is worth 20 seconds in production.
+        router.TUNING = replace(router.TUNING, handoff=self.HANDOFF,
+                                poll=0.2, build_poll=0.3, idle_polls=1,
+                                pin_patience=1.0, park_all_timeout=30.0)
         # "A real state is at least this big". The figure in the router is for
         # the production model's fixed recurrent state; the test model's
         # states are smaller. An empty save is still under a kilobyte, so this
         # tells a real copy from an empty one just as well.
-        router.PARK_FLOOR = 32 * 1024
+        router.TUNING = replace(router.TUNING, park_floor=32 * 1024)
         self.pools = []
         self.http = []
         self.helpers = []
@@ -214,7 +211,7 @@ class LiveRouter(LiveCase):
             server.shutdown()
             server.server_close()
             thread.join(PATIENCE)
-        router.POLL = router.BUILD_POLL = 0.02
+        router.TUNING = replace(router.TUNING, poll=0.02, build_poll=0.02)
         for pool in self.pools:
             pool.build_once = Bomb()
             pool.cv = Bomb()
@@ -352,7 +349,7 @@ class SavedOpeningsAreLoaded(LiveRouter):
         name = next(iter(self.pool_.openings.values()))
         kept = router.STORE.slots / name
         self.assertTrue(kept.exists())
-        self.assertGreater(kept.stat().st_size, router.PARK_FLOOR)
+        self.assertGreater(kept.stat().st_size, router.TUNING.park_floor)
 
     def test_a_second_session_starts_from_it_instead_of_reading_it(self):
         self.first_session()
@@ -433,7 +430,7 @@ class ParkedCachesComeBack(LiveRouter):
                         "the cache was never copied out")
         copy = router.STORE.slots / self.pool_.pins["mine"]["parked"]
         self.assertTrue(copy.exists())
-        self.assertGreater(copy.stat().st_size, router.PARK_FLOOR)
+        self.assertGreater(copy.stat().st_size, router.TUNING.park_floor)
 
     def test_the_next_turn_restores_it_on_the_backend_that_serves_it(self):
         first, home, away, box = self.displace()

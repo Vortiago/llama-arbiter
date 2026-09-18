@@ -169,7 +169,7 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
             if p == "/completion":
                 return {"timings": {"prompt_n": 4200, "cache_n": 0}}
             if "action=save" in p:
-                return {"n_written": router.PARK_FLOOR + 1}
+                return {"n_written": router.TUNING.park_floor + 1}
             return {"prompt": "x"}
         self.pool._render_block = lambda *a, **k: "rendered"
         # The builder only reads into a slot the poll has found idle twice,
@@ -177,7 +177,7 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.pool.backends[0].update(
             up=True, busy=0, slots=1,
             slots_detail=[{"id": 0, "busy": False}],
-            idle_runs={0: router.IDLE_POLLS})
+            idle_runs={0: router.TUNING.idle_polls})
         self.pool.wants["k9"]["at"] = time.time() - 30
         self.pool.build_once(post, remove=lambda name: None)
         self.log.flush()
@@ -190,7 +190,7 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.assertEqual(build["prompt_n"], 4200)
 
     def test_a_dropped_want_says_how_long_it_waited_unbuilt(self):
-        for i in range(router.WANT_KEEP + 1):
+        for i in range(router.TUNING.want_keep + 1):
             self.pool.note_want((0, f"k{i}"), "deep-", "", [], [], "/completion")
         self.log.flush()
         dropped = [r for r in rows_of(self.dir)
@@ -212,7 +212,7 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.pool.pins["conv1"] = {"backend": "cpu", "slot": 0,
                                    "inflight": True, "parked": None}
         post = lambda url, p, payload, timeout=None: \
-            {"n_written": router.PARK_FLOOR + 1} if "action=save" in p else {}
+            {"n_written": router.TUNING.park_floor + 1} if "action=save" in p else {}
         self.assertTrue(self.pool._save_park("conv1", self.pool.backends[0],
                                              0, post, remove=lambda n: None))
         self.pool.pins["conv1"]["slot"] = None

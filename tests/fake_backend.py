@@ -192,7 +192,7 @@ class FakeBackend:
         # A real state carries the recurrent state whatever the length, so the
         # default is above the floor the router treats as a real cache. A test
         # that wants the "nothing to park" path sets it below.
-        self.save_bytes = (router.PARK_FLOOR + 4096 if save_bytes is None
+        self.save_bytes = (router.TUNING.park_floor + 4096 if save_bytes is None
                            else save_bytes)
         self.queue_wait = queue_wait      # longest wait for a slot to free
         self.gate_wait = gate_wait        # longest wait for a held turn

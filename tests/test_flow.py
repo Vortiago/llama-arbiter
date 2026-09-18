@@ -99,9 +99,9 @@ class TwoTurnsOfOneConversation(unittest.TestCase):
 
     def test_the_log_is_bounded(self):
         flow = router.Flow()
-        for i in range(router.FLOW_LOG + 40):
+        for i in range(router.TUNING.flow_log + 40):
             flow.note(f"conv-{i}", "queued")
-        self.assertEqual(len(flow.report()["log"]), router.FLOW_LOG)
+        self.assertEqual(len(flow.report()["log"]), router.TUNING.flow_log)
 
 
 if __name__ == "__main__":
