@@ -32,19 +32,6 @@ def capture(directory, conv, body, keep=24):
         print(f"[router] could not write the capture: {err}", flush=True)
 
 
-def how_started(warm, recalled, loaded):
-    """Name what a request extended instead of reading. `warm`: its own
-    cache was in a slot. `recalled`: its own copy came back from disk.
-    `loaded`: a saved opening was put in the slot."""
-    if recalled:
-        return "recalled"
-    if loaded:
-        return "saved prompt"
-    if warm:
-        return "warm slot"
-    return "cold"
-
-
 def disk_summary(pins, openings, opening_bytes, wants, tuning=None):
     """What the two slot directories hold against their budgets."""
     tuning = tuning or Tuning()
