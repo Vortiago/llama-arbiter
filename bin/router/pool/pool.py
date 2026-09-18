@@ -1394,6 +1394,10 @@ class Pool:
                 return False               # already on disk for this turn.
                                            # A save from a slot it has left
                                            # would delete the copy.
+            if record["inflight"]:
+                return False               # ensure_parked is writing it now,
+                                           # and two saves of one conversation
+                                           # write the same file at once.
             record["inflight"] = True      # hold it still while it copies
         return self._save_park(conv, be, slot, remove)
 

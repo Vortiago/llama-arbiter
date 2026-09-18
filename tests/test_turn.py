@@ -378,5 +378,26 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
         self.assertEqual(pool.backends[0]["busy"], 0)
 
 
+class ACacheIsWrittenToDiskOnce(unittest.TestCase):
+    """Two saves of one conversation at once write the same file name from the
+    same slot. ensure_parked already refuses a record a save is running on;
+    park_partial has to refuse it too.
+
+    Releasing the prefill slot before the partial copy is parked is what makes
+    the two meet: the turn that takes the slot next parks this cache on its
+    way in, while the turn that left is still on its way out.
+    """
+
+    def test_a_copy_already_being_written_is_not_written_twice(self):
+        pool = one_backend()
+        pool.pins["c1"] = parked_copy()
+        pool.pins["c1"]["slot"] = 0
+        pool.pins["c1"]["parked_turn"] = 0     # the copy is of an older turn
+        pool.pins["c1"]["inflight"] = True     # a save is running on it now
+
+        self.assertFalse(pool.park_partial("c1", pool.backends[0], 0))
+        self.assertEqual(pool.link.ops(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
