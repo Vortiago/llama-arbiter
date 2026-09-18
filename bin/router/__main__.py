@@ -7,7 +7,6 @@ from .pool.pool import Pool
 from .settings import Tuning
 from .store.events import EventLog
 from .store.files import Store
-from .transport import http_post
 from .web.handler import Handler
 from .web.server import Server, Stamped
 
@@ -55,7 +54,7 @@ if __name__ == "__main__":
         if not POOL.drain_parks(POOL.tuning.park_all_timeout):
             print("[router] a copy on the worker did not land in time",
                   flush=True)
-        parked = POOL.park_all(http_post, timeout=POOL.tuning.park_all_timeout,
+        parked = POOL.park_all(timeout=POOL.tuning.park_all_timeout,
                                budget=max(1.0, POOL.tuning.park_all_budget
                                           - (time.time() - began)))
         kept = POOL.save_pins()

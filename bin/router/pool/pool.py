@@ -10,7 +10,7 @@ from ..sizing import VISION
 from ..store.backendlog import CacheWatch, read_config, read_vision
 from ..store.events import EventLog
 from ..store.files import adopt_files, opening_key, shelf_of, trim_openings
-from ..transport import http_post
+from ..backend.link import Link
 from .machine import Flow, History, Machine, per_second
 
 def capture(directory, conv, body, keep=24):
@@ -72,7 +72,7 @@ class Pool:
               "n_busy_slots_per_decode", "n_tokens_max")
 
     def __init__(self, backends, *, store, tuning=None, events=None,
-                 watch=True):
+                 link=None, watch=True):
         """`store` is where this run keeps its copies, `tuning` the numbers it
         was tuned to, `events` the log of what the cache decided. There is no
         default store on purpose: a Pool that made its own would make the one
@@ -84,6 +84,9 @@ class Pool:
         # Off unless a caller hands in a live one, so that building a Pool
         # starts no writer thread.
         self.events = events or EventLog(on=False)
+        # Every call to a backend goes through here. A test hands in a Link
+        # that answers without a socket.
+        self.link = link or Link()
         self.backends = [dict(b, slots=1, n_ctx=0, busy=0, up=False, served=0, model="",
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
                               cache={}, idle_runs={}, draining=False)
@@ -370,10 +373,8 @@ class Pool:
 
     def _read_metrics(self, be):
         """Read the counters llama-server keeps, for the dashboard."""
-        try:
-            with urllib.request.urlopen(be["url"] + "/metrics", timeout=3) as r:
-                text = r.read().decode()
-        except Exception:
+        text = self.link.metrics(be)
+        if text is None:
             return
         value = {}
         for line in text.splitlines():
@@ -422,10 +423,8 @@ class Pool:
         """Per-slot state, so a 3-slot backend is not a single average. `raw`
         is what /slots answered, for tests."""
         if raw is None:
-            try:
-                with urllib.request.urlopen(be["url"] + "/slots", timeout=3) as r:
-                    raw = json.load(r)
-            except Exception:
+            raw = self.link.slots(be)
+            if raw is None:
                 return
         # /slots reports counters, not rates.
         now = time.time()
@@ -522,8 +521,11 @@ class Pool:
         while True:
             for be in self.backends:
                 try:
-                    with urllib.request.urlopen(be["url"] + "/props", timeout=3) as r:
-                        props = json.load(r)
+                    props = self.link.props(be)
+                    if props is None:
+                        # Down, or too slow to answer. Same verdict either way,
+                        # and the except below is where that verdict is made.
+                        raise OSError("no answer from /props")
                     be["slots"] = int(props.get("total_slots") or 1)
                     be["n_ctx"] = int(props["default_generation_settings"]["n_ctx"])
                     be["model"] = props.get("model_alias") or ""
@@ -631,7 +633,7 @@ class Pool:
         return (be["up"] and not be.get("draining")
                 and be["busy"] < be["slots"] and tokens <= be["n_ctx"])
 
-    def drain(self, name, post, deadline=None):
+    def drain(self, name, deadline=None):
         """Take a backend out of service so it can be restarted. Requests wait
         in acquire rather than fail. The caches in its slots are copied out."""
         deadline = self.tuning.drain_deadline if deadline is None else deadline
@@ -651,7 +653,7 @@ class Pool:
                     break
                 self.cv.wait(0.2)
 
-        parked = self.park_all(post, only=name) if quiet else 0
+        parked = self.park_all(only=name) if quiet else 0
         # A save that timed out or was refused leaves a cache only in a slot.
         # The caller must know, or restart-backend.sh kills it anyway.
         with self.cv:
@@ -797,7 +799,7 @@ class Pool:
         while True:
             time.sleep(self.tuning.build_poll)
             try:
-                self.build_once(http_post)
+                self.build_once()
             except Exception as err:
                 print(f"[router] opening pass failed: {err}", flush=True)
 
@@ -824,7 +826,7 @@ class Pool:
                 return slot["id"]
         return None
 
-    def ensure_parked(self, be, skip_conv, post, remove=None):
+    def ensure_parked(self, be, skip_conv, remove=None):
         """Copy every cache on this backend to disk before a request lands. A
         save reads a slot, so it only works while the cache is still in one.
         Each conversation is tried once, or a save that does not stick loops
@@ -847,9 +849,9 @@ class Pool:
                 slot = record["slot"]
                 tried.add(conv)
 
-            self._save_park(conv, be, slot, post, remove)
+            self._save_park(conv, be, slot, remove)
 
-    def _save_park(self, conv, be, slot, post, remove=None):
+    def _save_park(self, conv, be, slot, remove=None, timeout=None):
         """Write one cache to disk. Mark the pin only if it holds one."""
         remove = remove or self.store.drop
         name = conv + ".park"
@@ -868,8 +870,7 @@ class Pool:
             record = self.pins.get(conv)
             turn = record.get("turns") if record else None
         try:
-            answer = post(be["url"], f"/slots/{slot}?action=save",
-                          {"filename": name}) or {}
+            answer = self.link.save(be, slot, name, timeout) or {}
             # Ask the disk. Without
             # patches/slot-state-carries-checkpoints.patch the backend
             # reports the state without the checkpoint trailer: a 107 MB
@@ -938,7 +939,7 @@ class Pool:
             print(f"[router] parked {short} from {be['name']} slot {slot}", flush=True)
         return kept
 
-    def recall(self, conv, be, slot, post):
+    def recall(self, conv, be, slot):
         """Put a parked cache back on the backend about to serve it. Returns
         True when the cache is now on that backend."""
         with self.cv:
@@ -954,8 +955,7 @@ class Pool:
 
         began = time.time()
         try:
-            post(be["url"], f"/slots/{target_slot}?action=restore",
-                 {"filename": name})
+            self.link.restore(be, target_slot, name)
         except Exception as err:
             print(f"[router] {short_key(conv)} recall failed on {be['name']}: {err}",
                   flush=True)
@@ -979,7 +979,7 @@ class Pool:
         return True
 
     def warm_prefix(self, conv, cuts, messages, system, tools, be, slot,
-                    post, path):
+                    path):
         """Load the opening this request shares into a slot on this backend.
         Only an opening the router already has: that is a file read. An
         opening the router lacks is written down for the builder. Returns
@@ -1076,19 +1076,19 @@ class Pool:
                 return False
 
         if plan[0] == "load":
-            return self._load_prefix(plan[1], plan[2], be, plan[3], post)
+            return self._load_prefix(plan[1], plan[2], be, plan[3])
         if plan[0] == "wait":
-            return self._wait_for_opening(plan[1], be, slot, post)
+            return self._wait_for_opening(plan[1], be, slot)
         try:
             return self._read_prefix(base, messages, system, tools, be,
-                                     plan[3], post, self.store.drop, "base-",
+                                     plan[3], self.store.drop, "base-",
                                      path)
         finally:
             with self.cv:
                 self.building.pop(plan[1], None)
                 self.cv.notify_all()
 
-    def _wait_for_opening(self, key, be, slot, post):
+    def _wait_for_opening(self, key, be, slot):
         """Wait for another request to save the opening, then load it.
         Measured: five sessions starting together read 92,000 tokens where
         24,000 would do, and the last finished after seventeen minutes."""
@@ -1099,7 +1099,7 @@ class Pool:
             name = self.openings.get(key)
             if not name:
                 return False        # it failed or timed out, so read it here
-        return self._load_prefix(key, name, be, slot, post)
+        return self._load_prefix(key, name, be, slot)
 
     def note_want(self, cut, mark, system, tools, head, path):
         """Write down an opening worth having, with what it takes to read it.
@@ -1119,7 +1119,7 @@ class Pool:
                 self.events.write("want", key=short_key(cut[1]), shelf=mark_shelf(mark),
                              action="added")
 
-    def build_once(self, post, remove=None):
+    def build_once(self, remove=None):
         """Read one wanted opening into an idle slot. Return its key, or None.
         The slot is held for the read."""
         remove = remove or self.store.drop
@@ -1138,11 +1138,11 @@ class Pool:
         # The builder is the second way into a slot. Reading an opening over
         # a finished conversation's only cache lost that cache while the pin
         # still said the slot was held. idle_polls makes that rarer only.
-        self.ensure_parked(be, None, post, remove)
+        self.ensure_parked(be, None, remove)
         began = time.time()
         try:
             kept = self._read_prefix(want["cut"], want["head"], want["system"],
-                                     want.get("tools") or [], be, slot, post,
+                                     want.get("tools") or [], be, slot,
                                      remove, want["mark"], want["path"])
         finally:
             with self.cv:
@@ -1156,7 +1156,7 @@ class Pool:
                      age=round(began - want.get("at", began), 1))
         return key if kept else None
 
-    def park_all(self, post, timeout=None, only=None, budget=None):
+    def park_all(self, timeout=None, only=None, budget=None):
         """Copy live caches to disk, so a stop does not throw them away. `only`
         names one backend, for a drain. A conversation mid-turn is skipped:
         its slot is busy. Each conversation is tried once, or a refused save
@@ -1194,9 +1194,7 @@ class Pool:
                     conv, slot = live[0]
                     self.pins[conv]["inflight"] = True   # hold it still
                     tried.add(conv)
-                if self._save_park(conv, be, slot,
-                                   lambda url, path, payload, secs=each:
-                                   post(url, path, payload, secs)):
+                if self._save_park(conv, be, slot, timeout=each):
                     parked += 1
         return parked
 
@@ -1222,7 +1220,7 @@ class Pool:
         self.store.write_pins(kept)
         return len(kept)
 
-    def hand_off(self, conv, source, tokens, post, remove=None, wanted=None):
+    def hand_off(self, conv, source, tokens, remove=None, wanted=None):
         """Move a conversation to the backend it generates on.
 
         The prefiller is released before the wait to generate. The other
@@ -1250,7 +1248,7 @@ class Pool:
         if slot is None:
             return self._stay(source, "its prompt is in no slot to carry")
 
-        if not self._save_park(conv, source, slot, post, remove):
+        if not self._save_park(conv, source, slot, remove):
             return self._stay(source, "the slot had already changed hands")
         with self.cv:
             name = self.pins[conv]["parked"]
@@ -1278,8 +1276,7 @@ class Pool:
                     self.cv.wait(1.0)
 
         try:
-            post(target["url"], f"/slots/{free}?action=restore",
-                 {"filename": name})
+            self.link.restore(target, free, name)
         except Exception as err:
             print(f"[router] {short_key(conv)} could not be carried to "
                   f"{target['name']}: {err}", flush=True)
@@ -1348,7 +1345,7 @@ class Pool:
             with self.cv:
                 self.to_generate -= 1
 
-    def park_later(self, be, conv, post, ticket, remove=None):
+    def park_later(self, be, conv, ticket, remove=None):
         """Copy a cache out of a backend that cannot read it, on a worker: the
         copy runs to gigabytes and the client already has its reply.
         `inflight` reserves the slot before this returns. The turn ticket
@@ -1368,7 +1365,7 @@ class Pool:
                 self.parker = threading.Thread(target=self._run_parks,
                                                name="park", daemon=True)
                 self.parker.start()
-        self.park_jobs.put((conv, be, slot, post, remove, ticket))
+        self.park_jobs.put((conv, be, slot, remove, ticket))
         return True
 
     def _run_parks(self):
@@ -1376,9 +1373,9 @@ class Pool:
         once only divide the same disk."""
         while True:
             job = self.park_jobs.get()
-            conv, be, slot, post, remove, ticket = job
+            conv, be, slot, remove, ticket = job
             try:
-                self._save_park(conv, be, slot, post, remove)
+                self._save_park(conv, be, slot, remove)
             except Exception as err:
                 print(f"[router] {short_key(conv)} could not be put away: "
                       f"{err}", flush=True)
@@ -1397,7 +1394,7 @@ class Pool:
             time.sleep(0.01)
         return self.park_jobs.unfinished_tasks == 0
 
-    def park_partial(self, conv, be, slot, post, remove=None):
+    def park_partial(self, conv, be, slot, remove=None):
         """Keep what an abandoned read got through, so the retry starts there.
         Thrown away, a prompt too long for the client's patience is never
         read: every attempt gives up in the same place. Measured once at a
@@ -1415,7 +1412,7 @@ class Pool:
                                            # A save from a slot it has left
                                            # would delete the copy.
             record["inflight"] = True      # hold it still while it copies
-        return self._save_park(conv, be, slot, post, remove)
+        return self._save_park(conv, be, slot, remove)
 
     def note_holds(self, conv, be, cuts):
         """Record what a slot holds now, for a later request to start from."""
@@ -1458,11 +1455,11 @@ class Pool:
         remove(name)
         return True
 
-    def _load_prefix(self, key, name, be, slot, post):
+    def _load_prefix(self, key, name, be, slot):
         """Put a saved opening back into a slot."""
         began = time.time()
         try:
-            post(be["url"], f"/slots/{slot}?action=restore", {"filename": name})
+            self.link.restore(be, slot, name)
         except Exception as err:
             print(f"[router] opening {key[:8]} failed to load on "
                   f"{be['name']}: {err}", flush=True)
@@ -1488,7 +1485,7 @@ class Pool:
               f"slot {slot}", flush=True)
         return True
 
-    def _read_prefix(self, cut, messages, system, tools, be, slot, post,
+    def _read_prefix(self, cut, messages, system, tools, be, slot,
                      remove, mark, path):
         """Read one opening into a slot, then keep a copy of the slot."""
         index, key = cut
@@ -1497,14 +1494,11 @@ class Pool:
         self.store.link_block(name)   # so the save lands on the faster disk
         try:
             block = self._render_block(system, tools, messages[:index + 1],
-                                       be, post, path)
+                                       be, self.link, path)
             # The zero-token reply's timings: tokens processed and cached.
-            read = post(be["url"], "/completion",
-                        {"prompt": block, "n_predict": 0, "cache_prompt": True,
-                         "id_slot": slot},
-                        timeout=self.tuning.read_timeout) or {}
-            answer = post(be["url"], f"/slots/{slot}?action=save",
-                          {"filename": name}) or {}
+            read = self.link.prefill(be, block, slot,
+                                     self.tuning.read_timeout) or {}
+            answer = self.link.save(be, slot, name) or {}
         except Exception as err:
             print(f"[router] opening {key[:8]} failed to save on "
                   f"{be['name']}: {err}", flush=True)
@@ -1548,7 +1542,7 @@ class Pool:
         return True
 
     @staticmethod
-    def _render_block(system, tools, head, be, post, path):
+    def _render_block(system, tools, head, be, link, path):
         """One opening, as the backend's own template renders it: what two
         renderings that differ only after the opening share. /apply-template
         refuses anthropic tool_use and tool_result blocks, so an opening from
@@ -1566,10 +1560,11 @@ class Pool:
                 extra["system"] = system
             else:
                 opening = [{"role": "system", "content": system}] + opening
-        full = post(be["url"], route,
-                    dict(extra,
-                         messages=opening + [{"role": "user", "content": "x"}]))
-        alone = post(be["url"], route, dict(extra, messages=opening))
+        full = link.render(be, route,
+                           dict(extra,
+                                messages=opening + [{"role": "user",
+                                                     "content": "x"}]))
+        alone = link.render(be, route, dict(extra, messages=opening))
         return common_prefix(full["prompt"], alone["prompt"])
 
     def status(self):

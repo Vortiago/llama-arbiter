@@ -35,6 +35,26 @@ class SANDBOX:
     events = router.EventLog(on=False)
 
 
+class QuietLink:
+    """A link that answers every operation without a socket. `written` is what
+    a save reports, because the router judges a real copy by that number."""
+
+    def __init__(self, written=0):
+        self.written = written
+
+    def save(self, be, slot, name, timeout=None):
+        return {"n_written": self.written}
+
+    def restore(self, be, slot, name, timeout=None):
+        return {}
+
+    def prefill(self, be, block, slot, timeout=None):
+        return {}
+
+    def render(self, be, route, payload, timeout=None):
+        return {"prompt": ""}
+
+
 def make_pool(backends, **kw):
     """A Pool wired to the sandbox. A case that wants another store, tuning or
     event log passes it, and that one wins."""
@@ -157,10 +177,10 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.pool.holds[("cpu", 0)] = {"k2"}
         self.pool.pins["parent"] = {"backend": "cpu", "slot": 0}
         self.pool._load_prefix = lambda *a, **k: True
+        self.pool.link = QuietLink()
         self.pool.warm_prefix("child", [(0, "k1"), (3, "k2")],
                               [{"role": "user", "content": "x"}], "", [],
-                              self.pool.backends[0], 0,
-                              lambda *a, **k: {}, "/v1/chat/completions")
+                              self.pool.backends[0], 0, "/v1/chat/completions")
         self.log.flush()
         forks = [r for r in rows_of(self.dir) if r["event"] == "fork"]
         self.assertEqual(len(forks), 1)
@@ -178,12 +198,11 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.assertEqual(added["shelf"], "base")
         self.assertEqual(self.pool.wants["k9"]["cut"][1], "k9")
 
-        def post(url, p, payload, timeout=None):
-            if p == "/completion":
+        class Reads(QuietLink):
+            def prefill(inner, be, block, slot, timeout=None):
                 return {"timings": {"prompt_n": 4200, "cache_n": 0}}
-            if "action=save" in p:
-                return {"n_written": SANDBOX.tuning.park_floor + 1}
-            return {"prompt": "x"}
+
+        post = Reads(SANDBOX.tuning.park_floor + 1)
         self.pool._render_block = lambda *a, **k: "rendered"
         # The builder only reads into a slot the poll has found idle twice,
         # so the backend is given a slots_detail that says exactly that.
@@ -192,7 +211,8 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
             slots_detail=[{"id": 0, "busy": False}],
             idle_runs={0: SANDBOX.tuning.idle_polls})
         self.pool.wants["k9"]["at"] = time.time() - 30
-        self.pool.build_once(post, remove=lambda name: None)
+        self.pool.link = post
+        self.pool.build_once(remove=lambda name: None)
         self.log.flush()
         built = [r for r in rows_of(self.dir)
                  if r["event"] == "want" and r["action"] == "built"][-1]
@@ -212,9 +232,9 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
 
     def test_a_load_says_which_shelf_and_how_long_the_read_took(self):
         self.pool.openings["k1"] = "base-k1.park"
-        post = lambda url, p, payload, timeout=None: {"ok": True}
+        self.pool.link = QuietLink()
         self.assertTrue(self.pool._load_prefix("k1", "base-k1.park",
-                                               self.pool.backends[0], 0, post))
+                                               self.pool.backends[0], 0))
         self.log.flush()
         load = [r for r in rows_of(self.dir) if r["event"] == "load"][-1]
         self.assertEqual(load["shelf"], "base")
@@ -224,13 +244,11 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
     def test_a_park_and_a_recall_record_the_copy_moving(self):
         self.pool.pins["conv1"] = {"backend": "cpu", "slot": 0,
                                    "inflight": True, "parked": None}
-        post = lambda url, p, payload, timeout=None: \
-            {"n_written": SANDBOX.tuning.park_floor + 1} if "action=save" in p else {}
+        self.pool.link = QuietLink(SANDBOX.tuning.park_floor + 1)
         self.assertTrue(self.pool._save_park("conv1", self.pool.backends[0],
-                                             0, post, remove=lambda n: None))
+                                             0, remove=lambda n: None))
         self.pool.pins["conv1"]["slot"] = None
-        self.pool.recall("conv1", self.pool.backends[0], 1,
-                         lambda url, p, payload, timeout=None: {})
+        self.pool.recall("conv1", self.pool.backends[0], 1)
         self.log.flush()
         park = [r for r in rows_of(self.dir) if r["event"] == "park"][-1]
         recall = [r for r in rows_of(self.dir) if r["event"] == "recall"][-1]

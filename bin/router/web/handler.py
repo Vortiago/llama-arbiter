@@ -8,7 +8,7 @@ from ..protocol.body import hoist_system, prompt_cuts, read_only, request_shape,
 from ..protocol.splice import AnthropicSplice, OaiUsageSplice, wants_usage, with_usage
 from ..protocol.sse import _say, anthropic, opening_event, ping_for, sse_event, wants_ping
 from ..sizing import request_cost
-from ..transport import Gone, http_post, http_post_wanted, said_in
+from ..transport import Gone, said_in
 from .config import CONFIG_FILES, client_config, host_only
 
 def passed_paths(env=None):
@@ -114,7 +114,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             done = self.server.pool.resume(name)
             return (self._send(200, json.dumps({"backend": name, "serving": True}).encode())
                     if done else self._error(404, f"no backend called {name}"))
-        report = self.server.pool.drain(name, http_post)
+        report = self.server.pool.drain(name)
         if report is None:
             return self._error(404, f"no backend called {name}")
         # A drain that gave up, or whose saves failed, left caches only in
@@ -225,25 +225,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not live:
             return self._error(503, "no backend is up")
 
+        link = self.server.pool.link
         if path == "/slots":
             slots = []
             for be in live:
-                try:
-                    with urllib.request.urlopen(be["url"] + "/slots", timeout=5) as r:
-                        part = json.load(r)
-                except Exception:
-                    continue
+                part = link.slots(be, timeout=5)
                 if isinstance(part, list):
                     for slot in part:
                         slot["backend"] = be["name"]
                         slots.append(slot)
             return self._send(200, json.dumps(slots).encode())
 
-        try:
-            with urllib.request.urlopen(live[0]["url"] + "/props", timeout=5) as r:
-                props = json.load(r)
-        except Exception as e:
-            return self._error(502, str(e))
+        props = link.props(live[0], timeout=5)
+        if props is None:
+            return self._error(502, f"{live[0]['name']} did not answer /props")
         props["total_slots"] = sum(be["slots"] for be in live)
         return self._send(200, json.dumps(props).encode())
 
@@ -369,25 +364,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             slot = self.server.pool.pick_slot(be, conv)
             self.server.pool.note_stage(conv, "prefill", be["name"], slot)
             # Nothing reaches the backend until the caches on it are on disk.
-            self.server.pool.ensure_parked(be, conv, http_post)
+            self.server.pool.ensure_parked(be, conv)
             # A copy with an opening the client no longer sends is no prefix.
             if self.server.pool.forget_stale_park(conv, cuts):
                 self.server.pool.events.write("start_over", conv=short_key(conv) if conv else None,
                              reason="stale_copy", client=client, path=path)
-            recalled = self.server.pool.recall(conv, be, slot, http_post)
+            recalled = self.server.pool.recall(conv, be, slot)
             loaded = (not recalled
-                      and self.server.pool.warm_prefix(conv, cuts, messages, system, tools,
-                                           be, slot, http_post, path))
+                      and self.server.pool.warm_prefix(conv, cuts, messages,
+                                                       system, tools, be, slot,
+                                                       path))
             if asked is not None:
                 # Watch the client. The timings say what the cache saved.
-                answer = http_post_wanted(be["url"], path, read_only(body, slot),
-                                          self.server.pool.tuning.read_timeout, self._still_there)
+                answer = self.server.pool.link.read(
+                    be, path, read_only(body, slot),
+                    self._still_there, self.server.pool.tuning.read_timeout)
                 timing = (answer or {}).get("timings") or {}
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
                               "read_cache_n": timing.get("cache_n")}
                 self.server.pool.note_slot(conv, slot)
-                serving = self.server.pool.hand_off(conv, be, tokens, http_post,
-                                        wanted=self._still_there)
+                serving = self.server.pool.hand_off(
+                    conv, be, tokens, wanted=self._still_there)
                 if serving is None:
                     # The cache is parked, and no backend is held.
                     raise Gone("the client stopped waiting for a slot to generate in")
@@ -419,11 +416,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.server.pool.release(serving, conv)
                 # After the release: these write the copy that is not behind.
                 if left:
-                    self.server.pool.park_partial(conv, be, slot, http_post)
+                    self.server.pool.park_partial(conv, be, slot)
                 # A backend that does not read cannot serve the next turn, so
                 # leave a copy for one that does, on a worker.
                 if serving is not None:
-                    parking = self.server.pool.park_later(serving, conv, http_post, ticket)
+                    parking = self.server.pool.park_later(serving, conv, ticket)
             except Exception as err:
                 # A ticket not given back costs the conversation every later
                 # turn: claim_turn has no deadline. The lines below must run.
@@ -555,12 +552,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 injected = with_usage(body)
                 if injected is not None:
                     data, oai_tee = injected, OaiUsageSplice(strip=True)
-        request = urllib.request.Request(be["url"] + target, data=data,
-                                         headers=headers, method=self.command)
         try:
-            upstream = urllib.request.urlopen(request, timeout=self.server.pool.tuning.forward_timeout)
-        except urllib.error.HTTPError as e:
-            upstream = e                       # pass the backend error through
+            upstream = self.server.pool.link.open(
+                be, target, data, headers, self.command,
+                self.server.pool.tuning.forward_timeout)
         except Exception as e:
             # With `opened` the status line went out long ago. A second HTTP
             # response inside the chunked body poisons the connection.

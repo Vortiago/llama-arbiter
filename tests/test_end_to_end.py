@@ -326,7 +326,7 @@ class RecallFires(EndToEnd):
         # Somebody else takes early's slot, so its cache has to go to disk.
         # The other backend is out of service while that happens, so there is
         # nowhere else the filler could land.
-        pool.drain(other.name, router.http_post, deadline=PATIENCE)
+        pool.drain(other.name, deadline=PATIENCE)
         mine.hold()
         self.start_turn(url, "filler")
         self.assertTrue(wait_for(lambda: self.backend(pool, home)["busy"] == 1),
@@ -394,7 +394,7 @@ class DrainUnderLoad(EndToEnd):
         self.assertTrue(wait_for(lambda: self.backend(pool, "cpu2")["busy"] == 1),
                         "the turn never reached cpu2")
 
-        report = self.background(lambda: pool.drain("cpu2", router.http_post,
+        report = self.background(lambda: pool.drain("cpu2",
                                                     deadline=PATIENCE),
                                  name="drain")
         time.sleep(0.4)
@@ -418,14 +418,14 @@ class DrainUnderLoad(EndToEnd):
     def test_resume_puts_the_backend_back_in_service(self):
         pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 2)])
         url = self.serve(pool)
-        pool.drain("cpu", router.http_post, deadline=PATIENCE)
+        pool.drain("cpu", deadline=PATIENCE)
         self.turn(url, "while-drained")
         self.assertEqual(len(self.cpu2.answers), 1)
 
         # Back in service means work can land there again. Reading takes pref
         # backwards, so cpu2 goes out of service to leave only one answer.
         self.assertTrue(pool.resume("cpu"))
-        pool.drain("cpu2", router.http_post, deadline=PATIENCE)
+        pool.drain("cpu2", deadline=PATIENCE)
         self.turn(url, "after-resume")
         self.assertEqual(len(self.cpu.answers), 1)
 
@@ -449,7 +449,7 @@ class ShutdownRoundTrip(EndToEnd):
         # A file the pin map does not vouch for. Nothing knows whose cache it
         # is, so the next run must throw it away.
         (SANDBOX.store.slots / "orphan.park").write_bytes(b"nobody claims this")
-        self.parked = self.first.park_all(router.http_post)
+        self.parked = self.first.park_all()
         self.kept_pins = self.first.save_pins()
 
     def second_pool(self):

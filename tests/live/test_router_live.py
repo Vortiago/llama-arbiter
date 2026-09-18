@@ -158,7 +158,7 @@ class LiveRouter(LiveCase):
         test with one slot an instance it lands in the middle of whatever is
         being measured. The loop still comes round, so the teardown can still
         stop it."""
-        pool.build_once = lambda post, **kw: None
+        pool.build_once = lambda **kw: None
         return pool
 
     def pool(self, specs):
@@ -553,14 +553,14 @@ class DrainUnderLoad(LiveRouter):
         self.assertTrue(wait_for(lambda: any(b["busy"] for b in self.pool_.backends)),
                         "the turn never took a slot")
         busy = next(b["name"] for b in self.pool_.backends if b["busy"])
-        report = self.pool_.drain(busy, router.http_post, deadline=PATIENCE)
+        report = self.pool_.drain(busy, deadline=PATIENCE)
         self.assertTrue(report["quiet"], "the drain gave up on a running turn")
         self.assertNotIn("error", box, f"the turn failed: {box.get('error')}")
         self.assertIn("reply", box)
         self.pool_.resume(busy)
 
     def test_a_drained_instance_takes_nothing_new(self):
-        self.pool_.drain("cpu1_0", router.http_post, deadline=PATIENCE)
+        self.pool_.drain("cpu1_0", deadline=PATIENCE)
         try:
             before = self.one.mark()
             for n in range(3):
@@ -590,10 +590,10 @@ class DrainUnderLoad(LiveRouter):
                              "/v1/chat/completions")
         self.assertTrue(self.pool_.wants, "nothing was wanted, so nothing is proved")
         for name in ("cpu1_0", "cpu1_1"):
-            self.pool_.drain(name, router.http_post, deadline=PATIENCE)
+            self.pool_.drain(name, deadline=PATIENCE)
         try:
             before = [(s, s.mark()) for s in (self.one, self.two)]
-            built = router.Pool.build_once(self.pool_, router.http_post)
+            built = router.Pool.build_once(self.pool_)
             read = sum(read_tokens(s.since(m)) for s, m in before)
             self.assertIsNone(built, "an opening was read into a drained instance")
             self.assertEqual(read, 0, f"a drained instance read {read} tokens "
@@ -605,7 +605,7 @@ class DrainUnderLoad(LiveRouter):
     def test_a_drain_copies_the_caches_out_before_the_instance_stops(self):
         self.turn(self.url, "living", self.head + [{"role": "user", "content": "Hello."}])
         home = self.pool_.pins["living"]["backend"]
-        report = self.pool_.drain(home, router.http_post, deadline=PATIENCE)
+        report = self.pool_.drain(home, deadline=PATIENCE)
         try:
             self.assertGreaterEqual(report["parked"], 1, "the drain parked nothing")
             copy = self.pool_.pins["living"]["parked"]
