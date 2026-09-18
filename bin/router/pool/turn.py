@@ -11,7 +11,9 @@ whole turn run with no socket.
     open(opening)          start the stream, with its protocol's opening event
     settle()               stop the keep-alive. Twice is safe
     relay(be, body, conv)  send this backend's reply to the client
-    fail(code, message)    say the turn cannot be served
+    fail(code, message)    say the turn cannot be served. Once a stream has
+                           begun there is no status line left, so a client
+                           that opened one may only be able to send `message`
 """
 
 import time
@@ -36,7 +38,9 @@ def capture(directory, conv, body, keep):
         # Nanoseconds and fixed width: unique names that sort by time.
         name = f"{time.time_ns()}-{tag}.json"
         (directory / name).write_bytes(body)
-        old = sorted(directory.glob(f"*-{tag}.json"))[:-keep]
+        # `[:-0]` is `[:0]`, which would keep every file rather than none.
+        old = (sorted(directory.glob(f"*-{tag}.json"))[:-keep] if keep > 0
+               else sorted(directory.glob(f"*-{tag}.json")))
         for spent in old:
             spent.unlink(missing_ok=True)
     except OSError as err:
@@ -188,13 +192,15 @@ class Turn:
                 pool.note_stage(conv, "generate", be["name"], slot)
             client.settle()                    # waits for a ping in flight
             client.relay(serving, body, conv)
-        except Gone:
+        except Gone as gone:
             # Nobody to answer. What the read got through is parked below.
-            print(f"[router] {short_key(conv)} left while {be['name']} was "
-                  f"reading, {time.time() - start:.0f}s in ({client.went})",
-                  flush=True)
+            # `gone` says which wait it gave up on: the read itself, or the
+            # wait for a slot to generate in, which comes after the read.
+            print(f"[router] {short} left {gone}, {time.time() - start:.0f}s "
+                  f"into {be['name']} ({client.went})", flush=True)
             left = True
         except Exception as err:
+            client.settle()                    # before the stream's last word
             client.fail(502, f"{be['name']}: {err}")
         finally:
             client.settle()
@@ -213,8 +219,8 @@ class Turn:
             except Exception as err:
                 # A ticket not given back costs the conversation every later
                 # turn: claim_turn has no deadline. The lines below must run.
-                print(f"[router] {short_key(conv)} could not be put away: "
-                      f"{err}", flush=True)
+                print(f"[router] {short} could not be put away: {err}",
+                      flush=True)
             took = time.time() - start
             started = how_started(warm, recalled, loaded)
             pool.note_stage(conv, "done")

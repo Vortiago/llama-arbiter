@@ -264,6 +264,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "this router does not read chunked requests")
         body = self.rfile.read(length) if length else b""
         path = self.path.split("?")[0].rstrip("/") or "/"
+        # Per request, not per connection: this handler serves every request
+        # on a keep-alive connection, and a stream left open in `streaming`
+        # would tell the next request it had already answered.
+        self.sending = threading.Lock()        # one writer at a time
+        self.streaming = False
+        self.stop_ping = None
+        self.kind = client_kind(self.headers)
 
         if self.command == "GET" and path in ("/props", "/slots"):
             return self._pool_props(path)
@@ -282,12 +289,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._error(503, "no backend is up")
             return self._forward(be, body)
 
-        # Per request, not per connection: this handler serves every
-        # request on a keep-alive connection.
-        self.sending = threading.Lock()        # one writer at a time
-        self.streaming = False
-        self.stop_ping = None
-        self.kind = client_kind(self.headers)
         self.server.pool.turn(Ask(path, body, session_key(self.headers)), self)
 
     # -- the client a turn answers. See pool/turn.py for what each one owes.

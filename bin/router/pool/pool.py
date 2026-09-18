@@ -1204,8 +1204,16 @@ class Pool:
         The prefiller is released before the wait to generate. The other
         order left three prefillers idle for seven minutes on one reply.
         Between the save and the restore the conversation is parked, so a
-        failure leaves it parked, not lost. Returns the backend to generate
-        on: `source` when nothing was carried, None when nobody waits."""
+        failure leaves it parked, not lost.
+
+        Three ways out, and they say different things about who holds
+        `source`:
+          `source`  nothing was carried, and the caller still holds it
+          None      the cache is parked and `source` is already released
+          Gone      the client left before any of that. Nothing is parked,
+                    the caller still holds `source`, and its ending is the
+                    one that releases it and parks what the read got through
+        """
         remove = remove or self.store.drop
         if not self.tuning.handoff:
             return self._stay(source, "the handoff is turned off")
@@ -1595,7 +1603,7 @@ class Pool:
                        "slot": p.get("slot"), "parked_at": p.get("parked_at")}
                       for conv, p in self.pins.items() if p.get("parked")]
             disk = disk_summary(self.pins, self.openings, self.opening_bytes,
-                                self.wants)
+                                self.wants, self.tuning)
             disk["files"] = openings["bases"] + openings["deeps"] + copies
             disk["mounts"] = mounts
             machine = self.machine.report(self.backends)

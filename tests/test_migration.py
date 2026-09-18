@@ -4647,5 +4647,28 @@ class HowFarInASlotHolds(unittest.TestCase):
         pool.note_holds("conv1", cpu, [(-1, "sys")])
         self.assertEqual(pool.status()["slots_hold"][0]["through"], -1)
 
+class TheDiskReportDrawsTheBudgetTheSweepsEnforce(unittest.TestCase):
+    """PARK_BUDGET_GB and BLOCK_BUDGET_GB are the operator's to set, and the
+    sweeps spend against them. A report drawn from the built-in defaults
+    instead shows a bar far over budget while the router evicts nothing."""
+
+    def setUp(self):
+        self.tuning = replace(SANDBOX.tuning,
+                              park_budget=1000 * 1024 ** 3,
+                              block_budget=500 * 1024 ** 3)
+
+    def test_the_copies_budget_is_the_pools_own(self):
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                         tuning=self.tuning, watch=False)
+        self.assertEqual(pool.status()["disk"]["copies"]["budget"],
+                         1000 * 1024 ** 3)
+
+    def test_the_openings_budget_is_the_pools_own(self):
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                         tuning=self.tuning, watch=False)
+        self.assertEqual(pool.status()["disk"]["openings"]["budget"],
+                         500 * 1024 ** 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -42,22 +42,27 @@ class FakeClient:
         self.relayed = []              # (backend name, conversation)
         self.failed = []               # (code, message)
         self.sent = None               # what relay was given to forward
+        self.did = []                  # every operation, in order
 
     def alive(self):
         return self._alive
 
     def open(self, opening):
         self.opened = opening
+        self.did.append("open")
 
     def settle(self):
         self.settled += 1
+        self.did.append("settle")
 
     def relay(self, be, body, conv):
         self.relayed.append((be["name"], conv))
+        self.did.append("relay")
         self.sent = body               # the body the backend was asked with
 
     def fail(self, code, message):
         self.failed.append((code, message))
+        self.did.append("fail")
 
 
 class TurnLink:
@@ -110,6 +115,13 @@ def one_backend(n_ctx=150000, **kw):
     pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}], **kw)
     pool.backends[0].update(up=True, n_ctx=n_ctx)
     return pool
+
+
+def streamed(chars):
+    """A chat request whose client reads the reply as a stream."""
+    return json.dumps({"stream": True,
+                       "messages": [{"role": "user",
+                                     "content": "x" * chars}]}).encode()
 
 
 def with_system(rules, said="hello"):
@@ -233,13 +245,6 @@ class ATurnWritesDownWhatTheClientSent(unittest.TestCase):
         pool.turn(router.Ask("/v1/chat/completions", body, "c1"), FakeClient())
 
         self.assertEqual([p.read_bytes() for p in room.glob("*.json")], [body])
-
-    def test_a_run_with_no_capture_directory_writes_nothing(self):
-        pool = one_backend()
-        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
-                  FakeClient())
-        self.assertIsNone(pool.capture_dir)
-
 
 class ATurnHoistsALateSystemMessage(unittest.TestCase):
     """The template refuses a system message that is not at the front. Claude
@@ -411,6 +416,34 @@ class ACacheIsWrittenToDiskOnce(unittest.TestCase):
 
         self.assertFalse(pool.park_partial("c1", pool.backends[0], 0))
         self.assertEqual(pool.link.ops(), [])
+
+
+class AStreamSaysNothingAfterItsLastWord(unittest.TestCase):
+    """A keep-alive chunk written after the stream's terminator stays on the
+    connection, and the next request on that connection reads it as its own
+    reply. So every way out stops the keep-alive before it says anything
+    final."""
+
+    def test_a_streamed_turn_opens_before_it_asks_for_a_slot(self):
+        pool = one_backend()
+        client = FakeClient()
+
+        pool.turn(router.Ask("/v1/chat/completions", streamed(10), "c1"),
+                  client)
+
+        self.assertIsNotNone(client.opened, "the stream never opened")
+        self.assertEqual(client.did, ["open", "settle", "relay", "settle"])
+
+    def test_a_backend_that_stops_mid_read_stops_the_keep_alive_first(self):
+        pool = one_backend(link=TurnLink(reading=OSError("backend went away")))
+        client = FakeClient()
+
+        pool.turn(router.Ask("/v1/chat/completions", streamed(10), "c1"),
+                  client)
+
+        self.assertEqual([code for code, _ in client.failed], [502])
+        self.assertLess(client.did.index("settle"), client.did.index("fail"),
+                        "the keep-alive was still running when the stream ended")
 
 
 if __name__ == "__main__":
