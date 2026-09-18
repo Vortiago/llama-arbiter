@@ -34,6 +34,7 @@ from .pool.machine import (GPU_CMD, RATE_FLOOR, Flow, History, Machine,
                            parse_cpulist, per_second, read_nodes,
                            resident_bytes)
 from .pool.pool import Pool, capture, disk_summary, how_started
+from .pool.turn import Ask, Turn
 from .protocol.body import (IGNORED_KEYS, SYSTEM_ROLES, closes, common_prefix,
                             deepest_shared, hoist_system, leading_system,
                             message_shape, prompt_cuts, read_only,
@@ -63,6 +64,7 @@ __all__ = [
     "Machine", "OaiUsageSplice", "PASSED", "PING", "Pool", "RATE_FLOOR",
     "SHELF_MARKS", "SYSTEM_ROLES", "Server", "Stamped", "Store", "Tuning",
     "VISION", "WEB", "adopt_files", "anthropic", "by_place", "cache_event",
+    "Ask", "Turn",
     "capture", "client_config", "client_kind", "closes", "common_prefix",
     "conversation_id", "copy_is_current", "cpu_times", "deepest_shared",
     "default_provider", "disk_summary", "file_safe", "generates", "gpu_query",

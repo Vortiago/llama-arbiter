@@ -11,6 +11,7 @@ from ..store.backendlog import CacheWatch, read_config, read_vision
 from ..store.events import EventLog
 from ..store.files import adopt_files, opening_key, shelf_of, trim_openings
 from ..backend.link import Link
+from .turn import Turn
 from .machine import Flow, History, Machine, per_second
 
 def capture(directory, conv, body, keep=24):
@@ -143,6 +144,10 @@ class Pool:
         if watch:
             threading.Thread(target=self._watch, daemon=True).start()
             threading.Thread(target=self._builder, daemon=True).start()
+
+    def turn(self, ask, client):
+        """Run one turn of one conversation. See pool/turn.py."""
+        return Turn(self).run(ask, client)
 
     def adopt(self, names=None, remove=None):
         """Take over what the last run left in the slot directory."""
