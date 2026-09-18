@@ -31,14 +31,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pathlib
 import router
 
-# The same reasoning as CACHE_LOG above, for the slot directory. SLOT_DIR is a
-# module global, so a case that forgets to redirect it reads and writes inside
-# the checkout's own run/slots - where a live router keeps conversation caches
-# worth hundreds of gigabytes, and where a stray pins.json is adopt()'s
-# instruction to delete every copy it does not name. One sandbox for the whole
-# run, under the temporary directory; a case wanting its own still redirects.
-router.SLOT_DIR = pathlib.Path(tempfile.mkdtemp(prefix="router-slots-"))
-router.BLOCK_DIR = router.SLOT_DIR / "blocks"
+# The same reasoning as CACHE_LOG above, for what this run writes. STORE is the
+# default a Pool takes when it is handed none, so a case that forgets to give
+# it one reads and writes inside the checkout's own run/slots - where a live
+# router keeps conversation caches worth hundreds of gigabytes, and where a
+# stray pins.json is adopt()'s instruction to delete every copy it does not
+# name. One sandbox for the whole run, under the temporary directory; a case
+# wanting its own builds another Store.
+router.STORE = router.Store(tempfile.mkdtemp(prefix="router-run-"))
 from fake_backend import FakeBackend
 
 # A system prompt long enough that prompt_cuts names a cut in it. Below
@@ -127,18 +127,15 @@ class EndToEnd(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="router-e2e-"))
         (self.root / "slots").mkdir()
         self.kept = {name: getattr(router, name) for name in
-                     ("SLOT_DIR", "BLOCK_DIR", "RUN_DIR", "POLL",
-                      "BUILD_POLL", "PIN_PATIENCE", "PARK_ALL_TIMEOUT",
-                      "HANDOFF_ON", "PING_EVERY")}
+                     ("STORE", "POLL", "BUILD_POLL", "PIN_PATIENCE",
+                      "PARK_ALL_TIMEOUT", "HANDOFF_ON", "PING_EVERY")}
         # These tests are about the move, so they turn it on whatever the
         # shipped default is.
         router.HANDOFF_ON = True
         self.had_pool = getattr(router, "POOL", None)
-        router.SLOT_DIR = self.root / "slots"
-        router.BLOCK_DIR = self.root / "blocks"
         # No <name>.log is written here on purpose. CacheWatch has to survive
         # a backend whose log it cannot find.
-        router.RUN_DIR = self.root
+        router.STORE = router.Store(self.root)
         # The stub answers at once, so polling fast is free. Every loop has to
         # come round quickly, because that is also how the cleanup stops it.
         router.POLL = 0.05
@@ -359,7 +356,7 @@ class ParkBeforeTheNewcomer(EndToEnd):
         self.assertLess(chats[1], save, "the save came before the first turn")
         self.assertLess(save, chats[2], "the newcomer went in before the save")
         self.assertEqual(pool.pins["resident"]["parked"], "resident.park")
-        self.assertTrue((router.SLOT_DIR / "resident.park").exists())
+        self.assertTrue((router.STORE.slots / "resident.park").exists())
 
     def test_nothing_is_parked_when_the_slot_had_already_changed_hands(self):
         """A short file means the slot holds someone else. It is not a cache."""
@@ -370,7 +367,7 @@ class ParkBeforeTheNewcomer(EndToEnd):
 
         self.assertIsNone(pool.pins["resident"]["parked"])
         self.assertIsNone(pool.pins["resident"]["slot"])
-        self.assertFalse((router.SLOT_DIR / "resident.park").exists())
+        self.assertFalse((router.STORE.slots / "resident.park").exists())
 
 
 class DrainUnderLoad(EndToEnd):
@@ -406,7 +403,7 @@ class DrainUnderLoad(EndToEnd):
         self.assertEqual(report["value"], {"backend": "cpu2", "quiet": True,
                                            "parked": 1, "left": 0})
         self.assertEqual(self.cpu2.saves, ["inflight.park"])
-        self.assertTrue((router.SLOT_DIR / "inflight.park").exists())
+        self.assertTrue((router.STORE.slots / "inflight.park").exists())
 
     def test_resume_puts_the_backend_back_in_service(self):
         pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 2)])
@@ -441,7 +438,7 @@ class ShutdownRoundTrip(EndToEnd):
             "the turn was never finished with")
         # A file the pin map does not vouch for. Nothing knows whose cache it
         # is, so the next run must throw it away.
-        (router.SLOT_DIR / "orphan.park").write_bytes(b"nobody claims this")
+        (router.STORE.slots / "orphan.park").write_bytes(b"nobody claims this")
         self.parked = self.first.park_all(router.http_post)
         self.kept_pins = self.first.save_pins()
 
@@ -454,15 +451,15 @@ class ShutdownRoundTrip(EndToEnd):
 
     def test_the_copies_survive_and_the_pin_map_names_them(self):
         self.assertEqual((self.parked, self.kept_pins), (1, 1))
-        self.assertTrue((router.SLOT_DIR / "survivor.park").exists())
-        kept = json.loads((router.SLOT_DIR / "pins.json").read_text())
+        self.assertTrue((router.STORE.slots / "survivor.park").exists())
+        kept = json.loads((router.STORE.slots / "pins.json").read_text())
         self.assertEqual([row["conv"] for row in kept], ["survivor"])
         self.assertEqual(kept[0]["file"], "survivor.park")
 
     def test_an_unvouched_copy_is_deleted_on_adoption(self):
         self.second_pool()
-        self.assertFalse((router.SLOT_DIR / "orphan.park").exists())
-        self.assertTrue((router.SLOT_DIR / "survivor.park").exists())
+        self.assertFalse((router.STORE.slots / "orphan.park").exists())
+        self.assertTrue((router.STORE.slots / "survivor.park").exists())
 
     def test_a_fresh_pool_restores_the_cache_on_the_next_turn(self):
         pool = self.second_pool()
@@ -499,10 +496,10 @@ class TheFirstSessionSavesTheOpening(EndToEnd):
         # Two renderings, then the read of the opening itself.
         self.assertEqual(self.cpu.templates, 2)
         self.assertIn(name, self.cpu.saves)
-        self.assertTrue((router.SLOT_DIR / name).exists())
+        self.assertTrue((router.STORE.slots / name).exists())
         # A block goes on the faster disk, reached through a link.
-        self.assertTrue((router.SLOT_DIR / name).is_symlink())
-        self.assertTrue((router.BLOCK_DIR / name).exists())
+        self.assertTrue((router.STORE.slots / name).is_symlink())
+        self.assertTrue((router.STORE.blocks / name).exists())
 
     def test_the_next_session_loads_it_rather_than_reading_it(self):
         pool = self.pool([self.stub("cpu", 1, slots=2)])
@@ -542,7 +539,7 @@ class AnOpenCodeSessionHasAnOpeningToo(EndToEnd):
         self.assertTrue(pool.openings, "the opening was not kept")
         name = next(iter(pool.openings.values()))
         self.assertIn(name, self.cpu.saves)
-        self.assertTrue((router.SLOT_DIR / name).exists())
+        self.assertTrue((router.STORE.slots / name).exists())
 
     def test_the_next_session_loads_it(self):
         pool = self.pool([self.stub("cpu", 1, slots=2)])
@@ -685,7 +682,7 @@ class MissingBackendLog(EndToEnd):
 
     def test_a_backend_with_no_log_file_still_reports_its_cache(self):
         pool = self.pool([self.stub("cpu", 1)])
-        self.assertFalse((router.RUN_DIR / "cpu.log").exists())
+        self.assertFalse((router.STORE.run / "cpu.log").exists())
         self.assertTrue(wait_for(lambda: self.backend(pool, "cpu")["cache"]))
         self.assertEqual(self.backend(pool, "cpu")["cache"]["evictions"], 0)
         self.assertEqual(self.backend(pool, "cpu")["up"], True)
@@ -725,7 +722,7 @@ class TheHandoff(EndToEnd):
         save, one restore, and what is left on disk is its park."""
         self.assertEqual(self.cpu.saves, ["talker.park"])
         self.assertEqual(self.gpu.restores, ["talker.park"])
-        self.assertFalse((router.SLOT_DIR / "talker.kv").exists(),
+        self.assertFalse((router.STORE.slots / "talker.kv").exists(),
                          "a carrier file was written after all")
 
     def test_the_gpu_is_given_no_prompt_to_read(self):
@@ -835,7 +832,7 @@ class TheNextTurnComesBack(EndToEnd):
         self.assertTrue(wait_for(lambda: self.gpu.saves == ["talker.park"]),
                         f"the gpu kept the only copy of the cache: {self.gpu.saves}")
         self.assertTrue(pool.pins["talker"].get("parked"))
-        self.assertTrue((router.SLOT_DIR / "talker.park").exists())
+        self.assertTrue((router.STORE.slots / "talker.park").exists())
 
         self.turn(url, "talker")
         self.assertEqual(self.cpu.restores, ["talker.park"])
@@ -869,7 +866,7 @@ class TheCarrierFails(EndToEnd):
         self.assertTrue(wait_for(lambda: [be["busy"] for be in self.duo.backends]
                                  == [0, 0]),
                         "a slot was counted busy after the turn ended")
-        self.assertFalse((router.SLOT_DIR / "stuck.kv").exists(),
+        self.assertFalse((router.STORE.slots / "stuck.kv").exists(),
                          "a carrier file was written after all")
 
     def test_a_failed_save_leaves_it_where_it_was_read(self):

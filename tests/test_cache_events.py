@@ -21,14 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 import pathlib
 import router
 
-# The same reasoning as CACHE_LOG above, for the slot directory. SLOT_DIR is a
-# module global, so a case that forgets to redirect it reads and writes inside
-# the checkout's own run/slots - where a live router keeps conversation caches
-# worth hundreds of gigabytes, and where a stray pins.json is adopt()'s
-# instruction to delete every copy it does not name. One sandbox for the whole
-# run, under the temporary directory; a case wanting its own still redirects.
-router.SLOT_DIR = pathlib.Path(tempfile.mkdtemp(prefix="router-slots-"))
-router.BLOCK_DIR = router.SLOT_DIR / "blocks"
+# The same reasoning as CACHE_LOG above, for what this run writes. STORE is the
+# default a Pool takes when it is handed none, so a case that forgets to give
+# it one reads and writes inside the checkout's own run/slots - where a live
+# router keeps conversation caches worth hundreds of gigabytes, and where a
+# stray pins.json is adopt()'s instruction to delete every copy it does not
+# name. One sandbox for the whole run, under the temporary directory; a case
+# wanting its own builds another Store.
+router.STORE = router.Store(tempfile.mkdtemp(prefix="router-run-"))
 
 
 def rows_of(directory):
@@ -128,16 +128,15 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.old = router.EVENTS
         router.EVENTS = self.log
         # Linking and deleting slot files must not touch the real run dir.
-        self.old_dirs = router.SLOT_DIR, router.BLOCK_DIR
-        router.SLOT_DIR = Path(self.dir) / "slots"
-        router.BLOCK_DIR = Path(self.dir) / "blocks"
-        router.SLOT_DIR.mkdir()
+        self.old_store = router.STORE
+        router.STORE = router.Store(self.dir)
+        router.STORE.slots.mkdir(parents=True, exist_ok=True)
         self.pool = router.Pool([{"name": "cpu", "url": "http://cpu",
                                   "pref": 0}], watch=False)
 
     def tearDown(self):
         router.EVENTS = self.old
-        router.SLOT_DIR, router.BLOCK_DIR = self.old_dirs
+        router.STORE = self.old_store
 
     def test_an_unshared_deep_cut_is_written_as_a_fork_of_its_holder(self):
         self.pool.openings["k1"] = "base-k1.park"

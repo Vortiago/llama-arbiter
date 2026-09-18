@@ -29,14 +29,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 
 import router
 
-# The same reasoning as CACHE_LOG above, for the slot directory. SLOT_DIR is a
-# module global, so a case that forgets to redirect it reads and writes inside
-# the checkout's own run/slots - where a live router keeps conversation caches
-# worth hundreds of gigabytes, and where a stray pins.json is adopt()'s
-# instruction to delete every copy it does not name. One sandbox for the whole
-# run, under the temporary directory; a case wanting its own still redirects.
-router.SLOT_DIR = pathlib.Path(tempfile.mkdtemp(prefix="router-slots-"))
-router.BLOCK_DIR = router.SLOT_DIR / "blocks"
+# The same reasoning as CACHE_LOG above, for what this run writes. STORE is the
+# default a Pool takes when it is handed none, so a case that forgets to give
+# it one reads and writes inside the checkout's own run/slots - where a live
+# router keeps conversation caches worth hundreds of gigabytes, and where a
+# stray pins.json is adopt()'s instruction to delete every copy it does not
+# name. One sandbox for the whole run, under the temporary directory; a case
+# wanting its own builds another Store.
+router.STORE = router.Store(tempfile.mkdtemp(prefix="router-run-"))
 
 
 def backend(name, pref, slots=1, busy=0, n_ctx=150000, up=True):
@@ -233,9 +233,8 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
     def setUp(self):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="stampede-"))
         self.kept = {n: getattr(router, n) for n in
-                     ("SLOT_DIR", "BLOCK_DIR", "BUILD_PATIENCE")}
-        router.SLOT_DIR = self.root
-        router.BLOCK_DIR = self.root / "blocks"
+                     ("STORE", "BUILD_PATIENCE")}
+        router.STORE = router.Store(self.root)
         router.BUILD_PATIENCE = 5.0
         self.addCleanup(lambda: [setattr(router, n, v)
                                  for n, v in self.kept.items()])
@@ -1189,47 +1188,62 @@ class PinIsAbsolute(unittest.TestCase):
 class TheSuiteCannotTouchARunningRouter(unittest.TestCase):
     """The one test that is about the tests.
 
-    SLOT_DIR is a module global. A case that forgets to redirect it writes
-    into the checkout's own run/slots, and two of the files there are
-    instructions: pins.json says which conversation caches to keep, and
-    adopt() deletes every copy it does not name. A fixture pins.json is
-    therefore a delete-everything order, against caches that cost twenty
-    minutes each to rebuild. Guarded at the top of this module, and here so
-    that removing the guard fails rather than goes quiet."""
+    STORE is the store a Pool takes when it is handed none. A case that
+    forgets to give it one writes into the checkout's own run/slots, and two
+    of the files there are instructions: pins.json says which conversation
+    caches to keep, and adopt() deletes every copy it does not name. A
+    fixture pins.json is therefore a delete-everything order, against caches
+    that cost twenty minutes each to rebuild. Guarded at the top of this
+    module, and here so that removing the guard fails rather than goes
+    quiet."""
 
     def test_the_slot_directory_is_not_the_one_a_router_uses(self):
-        checkout = Path(router.__file__).resolve().parent.parent / "run" / "slots"
-        for name in ("SLOT_DIR", "BLOCK_DIR"):
-            self.assertNotEqual(Path(getattr(router, name)).resolve(), checkout,
-                                f"{name} points at a live router's files")
+        checkout = Path(router.__file__).resolve().parent.parent / "run"
+        self.assertNotEqual(router.STORE.run.resolve(), checkout,
+                            "STORE points at a live router's files")
 
     def test_the_files_that_are_instructions_land_in_the_sandbox(self):
-        for path in (router.pins_file(), router.openings_file()):
+        for path in (router.STORE.slots / "pins.json",
+                     router.STORE.slots / "openings.json"):
             self.assertTrue(str(path).startswith(tempfile.gettempdir()), path)
+
+    def test_the_directories_are_not_module_globals(self):
+        """While RUN_DIR, SLOT_DIR and BLOCK_DIR were module globals, a test
+        redirected them by assignment. That works only while every reader
+        lives in this one module: a reader in another module binds the name
+        at import and never sees the redirect, so the suite would have gone
+        on passing while it wrote into the live run/slots. Store owns the
+        directories now, and there is nothing left to redirect."""
+        for name in ("RUN_DIR", "SLOT_DIR", "BLOCK_DIR"):
+            self.assertFalse(
+                hasattr(router, name),
+                f"router.{name} is a module global again. A test can redirect "
+                f"it, and a reader outside this module will not see the "
+                f"redirect - which is how a test comes to write into a live "
+                f"router's slot directory.")
 
 
 class SlotDirCase(unittest.TestCase):
     """A test case whose slot files land in a temporary directory.
 
-    router.SLOT_DIR is a module global, so a class that does not redirect it
-    reads and deletes inside the checkout's own run/slots - where a running
-    router keeps live caches, several of them symlinks into BLOCK_DIR that
-    drop_file follows. A fixture named like a live file would take a real
-    cache with it, and adopt() would read the live pins.json. Redirected in
-    setUp, put back after."""
+    STORE is the store a Pool takes when it is handed none, so a class that
+    leaves it alone reads and deletes inside the checkout's own run/slots -
+    where a running router keeps live caches, several of them symlinks into
+    the block directory that Store.drop follows. A fixture named like a live
+    file would take a real cache with it, and adopt() would read the live
+    pins.json. Replaced in setUp, put back after."""
 
     def setUp(self):
         super().setUp()
         self.slot_root = Path(tempfile.mkdtemp())
-        was = router.SLOT_DIR, router.BLOCK_DIR
-        router.SLOT_DIR = self.slot_root
-        router.BLOCK_DIR = self.slot_root / "blocks"
-        self.addCleanup(lambda: setattr(router, "SLOT_DIR", was[0]))
-        self.addCleanup(lambda: setattr(router, "BLOCK_DIR", was[1]))
+        was = router.STORE
+        router.STORE = router.Store(self.slot_root)
+        router.STORE.slots.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: setattr(router, "STORE", was))
         self.addCleanup(shutil.rmtree, self.slot_root, True)
 
     def slot_dir(self):
-        return self.slot_root
+        return router.STORE.slots
 
 
 class ParkIsReal(SlotDirCase):
@@ -1504,6 +1518,13 @@ class PrefixCase:
     CUTS = [(0, "k1"), (1, "k2"), (2, "k3")]
 
     def setUp(self):
+        # Before the Pool: it takes its store when it is built.
+        root = Path(tempfile.mkdtemp())
+        (root / "slots").mkdir()
+        self.was = router.STORE
+        router.STORE = router.Store(root)
+        self.addCleanup(shutil.rmtree, root)
+        self.addCleanup(self.put_back)
         self.pool = router.Pool(
             [{"name": "cpu", "url": "http://cpu", "pref": 0}], watch=False)
         self.cpu = self.pool.backends[0]
@@ -1514,15 +1535,9 @@ class PrefixCase:
                         idle_runs={0: 0, 1: 9, 2: 9})
         self.pool.pins["new"] = pin("cpu", slot=None, inflight=True)
         self.removed = []
-        root = Path(tempfile.mkdtemp())
-        (root / "slots").mkdir()
-        self.was = router.SLOT_DIR, router.BLOCK_DIR
-        router.SLOT_DIR, router.BLOCK_DIR = root / "slots", root / "blocks"
-        self.addCleanup(shutil.rmtree, root)
-        self.addCleanup(self.put_back)
 
     def put_back(self):
-        router.SLOT_DIR, router.BLOCK_DIR = self.was
+        router.STORE = self.was
 
     def talker(self, written=700_000_000, fail_on=None):
         block = self.BLOCK
@@ -1592,7 +1607,7 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
         so without a write here the count and the order are a week stale."""
         self.pool.openings["k1"] = "base-k1.park"
         self.assertTrue(self.warm(self.talker()))
-        self.assertEqual(router.read_rows(router.openings_file()),
+        self.assertEqual(router.STORE.read_openings(),
                          [{"key": "k1", "file": "base-k1.park", "loads": 1}])
 
     def test_reads_the_system_prompt_nobody_has_and_saves_it(self):
@@ -2071,44 +2086,44 @@ class BlockOnTheFasterDisk(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.slots, self.blocks = self.root / "slots", self.root / "blocks"
         self.slots.mkdir()
-        self.was = router.SLOT_DIR, router.BLOCK_DIR
-        router.SLOT_DIR, router.BLOCK_DIR = self.slots, self.blocks
+        self.was = router.STORE
+        router.STORE = router.Store(self.root)
         self.addCleanup(shutil.rmtree, self.root)
         self.addCleanup(self.put_back)
 
     def put_back(self):
-        router.SLOT_DIR, router.BLOCK_DIR = self.was
+        router.STORE = self.was
 
     def test_the_slot_directory_points_at_the_other_disk(self):
-        router.link_block("base-k1.park")
+        router.STORE.link_block("base-k1.park")
         link = self.slots / "base-k1.park"
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.readlink(), self.blocks / "base-k1.park")
 
     def test_a_write_through_the_link_lands_on_the_other_disk(self):
-        router.link_block("base-k1.park")
+        router.STORE.link_block("base-k1.park")
         (self.slots / "base-k1.park").write_bytes(b"state")
         self.assertEqual((self.blocks / "base-k1.park").read_bytes(), b"state")
 
     def test_linking_twice_is_harmless(self):
-        router.link_block("base-k1.park")
-        router.link_block("base-k1.park")
+        router.STORE.link_block("base-k1.park")
+        router.STORE.link_block("base-k1.park")
         self.assertTrue((self.slots / "base-k1.park").is_symlink())
 
     def test_dropping_a_block_removes_both_ends(self):
-        router.link_block("base-k1.park")
+        router.STORE.link_block("base-k1.park")
         (self.slots / "base-k1.park").write_bytes(b"state")
-        router.drop_file("base-k1.park")
+        router.STORE.drop("base-k1.park")
         self.assertFalse((self.slots / "base-k1.park").is_symlink())
         self.assertFalse((self.blocks / "base-k1.park").exists())
 
     def test_dropping_a_conversation_copy_removes_only_it(self):
         (self.slots / "abc.park").write_bytes(b"state")
-        router.drop_file("abc.park")
+        router.STORE.drop("abc.park")
         self.assertFalse((self.slots / "abc.park").exists())
 
     def test_a_link_with_nothing_behind_it_is_dropped(self):
-        router.link_block("base-k1.park")
+        router.STORE.link_block("base-k1.park")
         pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
                            watch=False)
         pool.adopt()
@@ -2190,20 +2205,21 @@ class ShutDownCleanly(unittest.TestCase):
     conversation reads its whole prompt again when it comes back."""
 
     def setUp(self):
+        # Before the Pool: it takes its store when it is built.
+        self.root = Path(tempfile.mkdtemp())
+        self.was = router.STORE
+        router.STORE = router.Store(self.root)
+        self.addCleanup(shutil.rmtree, self.root)
+        self.addCleanup(self.put_back)
         self.pool = router.Pool(
             [{"name": "gpu", "url": "http://gpu", "pref": 0},
              {"name": "cpu", "url": "http://cpu", "pref": 1}], watch=False)
         self.gpu, self.cpu = self.pool.backends
         self.gpu.update(up=True, slots=1, n_ctx=150000)
         self.cpu.update(up=True, slots=3, n_ctx=150000)
-        self.root = Path(tempfile.mkdtemp())
-        self.was = router.SLOT_DIR
-        router.SLOT_DIR = self.root
-        self.addCleanup(shutil.rmtree, self.root)
-        self.addCleanup(self.put_back)
 
     def put_back(self):
-        router.SLOT_DIR = self.was
+        router.STORE = self.was
 
     def saver(self, written=200_000_000):
         return FakePost(written=written)
@@ -2234,7 +2250,7 @@ class ShutDownCleanly(unittest.TestCase):
         self.pool.holds[("cpu", 1)] = {"k1"}
         self.pool.park_all(self.saver())
         self.pool.save_pins()
-        kept = router.read_rows(router.pins_file())
+        kept = router.STORE.read_pins()
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0]["conv"], "a")
         self.assertEqual(kept[0]["file"], "a.park")
@@ -2243,14 +2259,14 @@ class ShutDownCleanly(unittest.TestCase):
     def test_writes_nothing_for_a_conversation_with_no_copy(self):
         self.pool.pins["a"] = pin("cpu", slot=1, parked=None)
         self.pool.save_pins()
-        self.assertEqual(router.read_rows(router.pins_file()), [])
+        self.assertEqual(router.STORE.read_pins(), [])
 
     def test_reads_nothing_when_there_is_no_pin_file(self):
-        self.assertEqual(router.read_rows(self.root / "gone.json"), [])
+        self.assertEqual(router.Store._rows(self.root / "gone.json"), [])
 
     def test_reads_nothing_from_a_damaged_pin_file(self):
         (self.root / "pins.json").write_bytes(b"not json")
-        self.assertEqual(router.read_rows(router.pins_file()), [])
+        self.assertEqual(router.STORE.read_pins(), [])
 
 
 class ComeBackAfterRestart(unittest.TestCase):
@@ -2274,10 +2290,11 @@ class ComeBackAfterRestart(unittest.TestCase):
     def test_the_pool_takes_back_its_pins(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root)
-        was = router.SLOT_DIR
-        router.SLOT_DIR = root
-        self.addCleanup(lambda: setattr(router, "SLOT_DIR", was))
-        (root / "pins.json").write_text(json.dumps(
+        was = router.STORE
+        router.STORE = router.Store(root)
+        router.STORE.slots.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: setattr(router, "STORE", was))
+        (router.STORE.slots / "pins.json").write_text(json.dumps(
             [{"conv": "a", "file": "a.park", "tokens": 99, "cuts": [[0, "k1"]]}]))
         pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
                            watch=False)
@@ -2319,10 +2336,11 @@ class ComeBackAfterRestart(unittest.TestCase):
         """A pool adopting `names` with `openings` left by the last run."""
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root)
-        was = router.SLOT_DIR
-        router.SLOT_DIR = root
-        self.addCleanup(lambda: setattr(router, "SLOT_DIR", was))
-        (root / "openings.json").write_text(json.dumps(openings))
+        was = router.STORE
+        router.STORE = router.Store(root)
+        router.STORE.slots.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: setattr(router, "STORE", was))
+        (router.STORE.slots / "openings.json").write_text(json.dumps(openings))
         pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
                            watch=False)
         pool.adopt(list(names), remove=lambda name: None)
@@ -2333,17 +2351,18 @@ class ComeBackAfterRestart(unittest.TestCase):
         pool.loads["a"] = 7
         pool.save_openings()
         self.assertEqual(
-            router.read_rows(router.openings_file()),
+            router.STORE.read_openings(),
             [{"key": "a", "file": "base-a.park", "loads": 7}])
 
     def test_a_recovered_pin_names_no_live_backend(self):
         """Its slot is gone, so it must be restored before it is served."""
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root)
-        was = router.SLOT_DIR
-        router.SLOT_DIR = root
-        self.addCleanup(lambda: setattr(router, "SLOT_DIR", was))
-        (root / "pins.json").write_text(json.dumps(
+        was = router.STORE
+        router.STORE = router.Store(root)
+        router.STORE.slots.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: setattr(router, "STORE", was))
+        (router.STORE.slots / "pins.json").write_text(json.dumps(
             [{"conv": "a", "file": "a.park", "tokens": 99, "cuts": []}]))
         pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
                            watch=False)
@@ -2365,10 +2384,10 @@ class DrainABackend(unittest.TestCase):
         self.gpu.update(up=True, slots=1, n_ctx=150000)
         self.cpu.update(up=True, slots=3, n_ctx=150000)
         self.root = Path(tempfile.mkdtemp())
-        self.was = router.SLOT_DIR
-        router.SLOT_DIR = self.root
+        self.was = router.STORE
+        router.STORE = router.Store(self.root)
         self.addCleanup(shutil.rmtree, self.root)
-        self.addCleanup(lambda: setattr(router, "SLOT_DIR", self.was))
+        self.addCleanup(lambda: setattr(router, "STORE", self.was))
 
     def saver(self, written=200_000_000):
         return FakePost(written=written)
@@ -2450,12 +2469,10 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
         # slot directory. Without this it writes into the running router's own.
         root = Path(tempfile.mkdtemp())
         (root / "slots").mkdir()
-        self.was = router.SLOT_DIR, router.BLOCK_DIR
-        router.SLOT_DIR, router.BLOCK_DIR = root / "slots", root / "blocks"
+        self.was = router.STORE
+        router.STORE = router.Store(root)
         self.addCleanup(shutil.rmtree, root)
-        self.addCleanup(
-            lambda: setattr(router, "SLOT_DIR", self.was[0])
-            or setattr(router, "BLOCK_DIR", self.was[1]))
+        self.addCleanup(lambda: setattr(router, "STORE", self.was))
 
     def test_a_new_conversation_is_not_read_on_the_gpu(self):
         self.assertNotEqual(self.pool.acquire("a", 1000)["name"], "gpu")
@@ -3173,22 +3190,22 @@ class ACopyIsMeasuredOnTheDisk(unittest.TestCase):
     tests/live/test_llama_beliefs.py asserts the two agree on a real one."""
 
     def setUp(self):
+        # Before the Pool: it takes its store when it is built.
+        root = Path(tempfile.mkdtemp())
+        (root / "slots").mkdir()
+        self.was = router.STORE
+        router.STORE = router.Store(root)
+        self.addCleanup(shutil.rmtree, root)
+        self.addCleanup(lambda: setattr(router, "STORE", self.was))
         self.pool = router.Pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
                                 watch=False)
         self.cpu = self.pool.backends[0]
         self.cpu.update(up=True, slots=1, n_ctx=150000)
         self.pool.pins["a"] = pin("cpu", slot=0)
-        root = Path(tempfile.mkdtemp())
-        (root / "slots").mkdir()
-        self.was = router.SLOT_DIR, router.BLOCK_DIR
-        router.SLOT_DIR, router.BLOCK_DIR = root / "slots", root / "blocks"
-        self.addCleanup(shutil.rmtree, root)
-        self.addCleanup(lambda: setattr(router, "SLOT_DIR", self.was[0]))
-        self.addCleanup(lambda: setattr(router, "BLOCK_DIR", self.was[1]))
 
     def test_the_size_on_disk_wins_over_what_the_backend_reported(self):
         real = router.PARK_FLOOR + 10_000_000
-        (router.SLOT_DIR / "a.park").write_bytes(b"\0" * real)
+        (router.STORE.slots / "a.park").write_bytes(b"\0" * real)
         # The backend undercounts by more than half, as an unpatched one does.
         self.pool._save_park("a", self.cpu, 0, FakePost(written=real // 3))
         self.assertEqual(self.pool.pins["a"]["bytes"], real,
@@ -4379,7 +4396,7 @@ class WhatEachBackendWasStartedWith(unittest.TestCase):
         reported with the batch size they no longer ran."""
         with tempfile.TemporaryDirectory() as where:
             run = pathlib.Path(where)
-            was, router.RUN_DIR = router.RUN_DIR, run
+            was, router.STORE = router.STORE, router.Store(run)
             try:
                 log = run / "cpu.log"
                 log.write_text(self.HEAD)
@@ -4400,7 +4417,7 @@ class WhatEachBackendWasStartedWith(unittest.TestCase):
                 self.assertGreater(log.stat().st_size, len(self.HEAD))
                 self.assertEqual(pool.read_settings(be)["n_batch"], 512)
             finally:
-                router.RUN_DIR = was
+                router.STORE = was
 
 
 class RatesCanBeReset(unittest.TestCase):

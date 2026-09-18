@@ -2,7 +2,7 @@
 
 It serves every endpoint the router reaches for, and answers honestly: a slot
 says it is processing while it really is, a save really writes a file into
-router.SLOT_DIR, and a restore really reads one back. Idle detection, park and
+router.STORE.slots, and a restore really reads one back. Idle detection, park and
 recall all read this state, so a stub that lied would prove nothing.
 
 The cache model is small but real. A slot holds the text its KV covers, a
@@ -371,13 +371,13 @@ class FakeBackend:
     # ---- the slot file ----------------------------------------------------
 
     def save(self, sid, filename):
-        """Write this slot's cache to a file under router.SLOT_DIR.
+        """Write this slot's cache to a file in the store's slot directory.
 
         The file is sparse: the size the router judges by is real, but the
         zeros behind the header cost no disk."""
         slot = self.wait_idle(sid)
         time.sleep(self.save_s)
-        path = Path(router.SLOT_DIR) / filename
+        path = router.STORE.slots / filename
         header = json.dumps({"held": slot.held,
                              "tokens": tokens_in(slot.held)}).encode() + b"\n"
         with open(path, "wb") as handle:
@@ -392,7 +392,7 @@ class FakeBackend:
 
     def restore(self, sid, filename):
         """Read a file back into this slot."""
-        path = Path(router.SLOT_DIR) / filename
+        path = router.STORE.slots / filename
         if not path.exists():
             raise FileNotFoundError(f"no such state file: {filename}")
         slot = self.wait_idle(sid)

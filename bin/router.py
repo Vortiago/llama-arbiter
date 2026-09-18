@@ -307,13 +307,169 @@ def conversation_id(body):
 
 
 WEB = Path(__file__).with_name("web")          # the dashboard, a static app
-# Everything a run writes. RUN comes from bin/common.sh.
-RUN_DIR  = Path(os.environ.get("RUN")
-                or Path(__file__).resolve().parent.parent / "run")
-SLOT_DIR = RUN_DIR / "slots"
-# Openings go on the faster disk where there are two, under BLOCK_BUDGET.
-# Conversation copies stay under RUN_DIR, under PARK_BUDGET.
-BLOCK_DIR = Path(os.environ.get("BLOCK_DIR") or RUN_DIR / "blocks")
+
+
+class Store:
+    """Everything one run keeps on disk: the conversation copies, the saved
+    openings, the two maps that say what they are, and the backend logs.
+
+    A caller names a file. Where that file lives is this class's business
+    and nothing outside it reads a directory. That is deliberate: these
+    were module globals, and every test redirected them by assignment. That
+    works only while the readers live in the same module, so the first time
+    one moved out the redirect would have kept the suite green while it
+    wrote into the live run/slots -- where a stray pins.json is adopt()'s
+    instruction to delete every conversation copy it does not name.
+    """
+
+    def __init__(self, run_dir, block_dir=None):
+        self.run = Path(run_dir)
+        # A backend writes here under --slot-save-path, so bin/common.sh
+        # must name the same directory.
+        self.slots = self.run / "slots"
+        # Openings go on the faster disk where there are two, under
+        # BLOCK_BUDGET. Conversation copies stay under run, under
+        # PARK_BUDGET.
+        self.blocks = Path(block_dir) if block_dir else self.run / "blocks"
+
+    def __repr__(self):
+        return f"Store({str(self.run)!r}, {str(self.blocks)!r})"
+
+    # -- one file ---------------------------------------------------------
+
+    def size(self, name):
+        """Bytes in one slot file, or 0 when it is gone."""
+        try:
+            return (self.slots / name).stat().st_size
+        except OSError:
+            return 0
+
+    def mtime(self, name):
+        """When one slot file was last written, or 0 when it is gone."""
+        try:
+            return (self.slots / name).stat().st_mtime
+        except OSError:
+            return 0
+
+    def drop(self, name):
+        """Delete a slot file, and whatever it points at. Never raises: it
+        runs before the turn ticket goes back, and claim_turn has no
+        deadline, so a throw here would hold the conversation for the life
+        of the process."""
+        path = self.slots / name
+        try:
+            if path.is_symlink():
+                path.readlink().unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+        except OSError as err:
+            print(f"[router] could not delete {name}: {err}", flush=True)
+
+    def link_block(self, name):
+        """Point the slot directory at a block on the faster disk. A backend
+        takes a bare filename under --slot-save-path and rejects a directory
+        in it, so a link is the only way to put one file elsewhere."""
+        link = self.slots / name
+        try:
+            self.slots.mkdir(parents=True, exist_ok=True)
+            self.blocks.mkdir(parents=True, exist_ok=True)
+        except OSError as err:
+            print(f"[router] {self.blocks} is not usable, keeping blocks with "
+                  f"the rest: {err}", flush=True)
+            return
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        # Absolute: the kernel resolves a relative target against the link's
+        # directory.
+        link.symlink_to(self.blocks.resolve() / name)
+
+    # -- what the last run left -------------------------------------------
+
+    def parked_names(self):
+        """Every copy the last run left, oldest first, dropping the links
+        whose target is already gone."""
+        if not self.slots.is_dir():
+            return []
+        names = []
+        for found in sorted(self.slots.glob("*.park"),
+                            key=lambda f: f.lstat().st_mtime):
+            if found.exists():
+                names.append(found.name)
+            else:
+                found.unlink(missing_ok=True)   # a dangling link
+        return names
+
+    # -- the two maps -----------------------------------------------------
+
+    def read_pins(self):
+        """The pin rows the last run wrote."""
+        return self._rows(self.slots / "pins.json")
+
+    def write_pins(self, rows):
+        return self._write(self.slots / "pins.json", rows)
+
+    def read_openings(self):
+        """What the openings earned last run."""
+        return self._rows(self.slots / "openings.json")
+
+    def write_openings(self, rows):
+        return self._write(self.slots / "openings.json", rows)
+
+    @staticmethod
+    def _rows(path):
+        """The rows the last run wrote, or [] when there are none to trust."""
+        try:
+            kept = json.loads(path.read_bytes())
+        except Exception:
+            return []             # no file, or one we cannot trust
+        return kept if isinstance(kept, list) else []
+
+    @staticmethod
+    def _write(path, rows):
+        """Write beside the file and rename over it, so half of one can never
+        be read back. A half file reads as empty, and adopt then deletes
+        every file it vouched for."""
+        spare = path.with_suffix(".json.new")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            spare.write_text(json.dumps(rows, indent=1))
+            os.replace(spare, path)
+            return True
+        except OSError as err:
+            print(f"[router] could not write {path.name}: {err}", flush=True)
+            spare.unlink(missing_ok=True)
+            return False
+
+    # -- the rest of what a run writes ------------------------------------
+
+    def log(self, name):
+        """A backend's own log. The router reads it for the settings it was
+        started with, and for the cache lines only it reports."""
+        return self.run / f"{name}.log"
+
+    def disks(self):
+        """Free space on the disks the slot files land on. One row a disk:
+        slots and blocks are often the same one."""
+        rows, seen = [], set()
+        for path in (self.slots, self.blocks):
+            try:
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                usage = shutil.disk_usage(resolved)
+                rows.append({"path": str(path), "total": usage.total,
+                             "free": usage.free})
+            except OSError:
+                continue
+        return rows
+
+
+# Everything a run writes. RUN comes from bin/common.sh. One store is built
+# here so that importing this module reads the environment once; a test
+# builds its own on a temporary directory and hands it to Pool.
+STORE = Store(os.environ.get("RUN")
+              or Path(__file__).resolve().parent.parent / "run",
+              os.environ.get("BLOCK_DIR"))
 
 # Debugging only, on when CAPTURE names a directory.
 CAPTURE_DIR = Path(os.environ["CAPTURE"]) if os.environ.get("CAPTURE") else None
@@ -322,7 +478,7 @@ CAPTURE_KEEP = 24
 # One JSON line per cache decision, in a dated file. CACHE_LOG=0 turns it
 # off.
 CACHE_LOG_ON = os.environ.get("CACHE_LOG", "1") == "1"
-CACHE_LOG_DIR = Path(os.environ.get("CACHE_LOG_DIR") or RUN_DIR)
+CACHE_LOG_DIR = Path(os.environ.get("CACHE_LOG_DIR") or STORE.run)
 
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8",  ".json": "application/json",
@@ -1563,86 +1719,6 @@ class Machine:
         return {"nodes": nodes, "gpu": self.gpu if self.gpu_ok else None}
 
 
-def link_block(name):
-    """Point the slot directory at a block on the faster disk. A backend
-    takes a bare filename under --slot-save-path and rejects a directory in
-    it, so a link is the only way to put one file elsewhere."""
-    link = SLOT_DIR / name
-    try:
-        BLOCK_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError as err:
-        print(f"[router] {BLOCK_DIR} is not usable, keeping blocks with the "
-              f"rest: {err}", flush=True)
-        return
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    # Absolute: the kernel resolves a relative target against the link's dir.
-    link.symlink_to(BLOCK_DIR.resolve() / name)
-
-
-def file_size(name):
-    """Bytes in one slot file, or 0 when it is gone."""
-    try:
-        return (SLOT_DIR / name).stat().st_size
-    except OSError:
-        return 0
-
-
-def file_mtime(name):
-    """When one slot file was last written, or 0 when it is gone."""
-    try:
-        return (SLOT_DIR / name).stat().st_mtime
-    except OSError:
-        return 0
-
-
-def drop_file(name):
-    """Delete a slot file, and whatever it points at. Never raises: it runs
-    before the turn ticket goes back, and claim_turn has no deadline, so a
-    throw here would hold the conversation for the life of the process."""
-    path = SLOT_DIR / name
-    try:
-        if path.is_symlink():
-            path.readlink().unlink(missing_ok=True)
-        path.unlink(missing_ok=True)
-    except OSError as err:
-        print(f"[router] could not delete {name}: {err}", flush=True)
-
-
-def pins_file():
-    """Where the pin map is kept between runs."""
-    return SLOT_DIR / "pins.json"
-
-
-def openings_file():
-    """Where what the openings have earned is kept between runs."""
-    return SLOT_DIR / "openings.json"
-
-
-def read_rows(path):
-    """The rows the last run wrote, or [] when there are none to trust."""
-    try:
-        kept = json.loads(path.read_bytes())
-    except Exception:
-        return []                 # no file, or one we cannot trust
-    return kept if isinstance(kept, list) else []
-
-
-def write_rows(path, rows):
-    """Write beside the file and rename over it, so half of one can never
-    be read back. A half file reads as empty, and adopt then deletes every
-    file it vouched for."""
-    spare = path.with_suffix(".json.new")
-    try:
-        spare.write_text(json.dumps(rows, indent=1))
-        os.replace(spare, path)
-        return True
-    except OSError as err:
-        print(f"[router] could not write {path.name}: {err}", flush=True)
-        spare.unlink(missing_ok=True)
-        return False
-
-
 def opening_key(name):
     """The key inside a saved opening's file name, or None if it is not one."""
     for mark in SHELF_MARKS:
@@ -1656,12 +1732,12 @@ def shelf_of(name):
     return "base" if name.startswith("base-") else "deep"
 
 
-def adopt_files(names, vouched=(), size=None):
+def adopt_files(names, vouched=(), size=None, store=None):
     """Sort the files the last run left behind, oldest first. A saved
     opening is named after its contents. A conversation's copy is good only
     if the pin file vouches for it. The pin file is asked first, because a
     client can make a key look like an opening."""
-    size = size or file_size
+    size = size or (store or STORE).size
     openings, bytes_ = OrderedDict(), {}
     parked, spent = [], []
     for name in names:
@@ -1743,15 +1819,17 @@ class Pool:
               "requests_processing", "requests_deferred",
               "n_busy_slots_per_decode", "n_tokens_max")
 
-    def __init__(self, backends, watch=True):
+    def __init__(self, backends, *, store=None, watch=True):
         self.cv = threading.Condition()
+        # Where this run keeps its copies. A test hands in its own.
+        self.store = store or STORE
         self.backends = [dict(b, slots=1, n_ctx=0, busy=0, up=False, served=0, model="",
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
                               cache={}, idle_runs={}, draining=False)
                          for b in backends]
         # Each backend reports prompt cache evictions only in its own log.
         self.cache_watch = {be["name"]: CacheWatch(
-            RUN_DIR / f"{be['name']}.log",
+            self.store.log(be["name"]),
             sink=lambda kind, value, name=be["name"]: EVENTS.write(
                 "backend", backend=name, kind=kind, amount=value))
             for be in self.backends}
@@ -1801,30 +1879,26 @@ class Pool:
             threading.Thread(target=self._watch, daemon=True).start()
             threading.Thread(target=self._builder, daemon=True).start()
 
-    def adopt(self, names=None, remove=drop_file):
+    def adopt(self, names=None, remove=None):
         """Take over what the last run left in the slot directory."""
+        remove = remove or self.store.drop
         if names is None:
-            names = []
-            for found in sorted(SLOT_DIR.glob("*.park"),
-                                key=lambda f: f.lstat().st_mtime):
-                if found.exists():
-                    names.append(found.name)
-                else:
-                    found.unlink(missing_ok=True)   # a dangling link
+            names = self.store.parked_names()
         # The order and load count each opening earned last run. Without it
         # the only order is the file mtime, which link_block sets once. An
         # opening the file does not name sorts at the back, by mtime.
-        remembered = [row for row in read_rows(openings_file())
+        remembered = [row for row in self.store.read_openings()
                       if isinstance(row, dict) and row.get("key")]
         was = {row["key"]: rank for rank, row in enumerate(remembered)}
         self.loads.update({row["key"]: row.get("loads") or 0
                            for row in remembered})
         names.sort(key=lambda n: was.get(opening_key(n), len(was)))
-        kept = read_rows(pins_file())
+        kept = self.store.read_pins()
         # Both fields: a row without a conv raised KeyError at startup.
         by_file = {row["file"]: row for row in kept
                    if isinstance(row, dict) and row.get("file") and row.get("conv")}
-        openings, sizes, parked, spent = adopt_files(names, set(by_file))
+        openings, sizes, parked, spent = adopt_files(names, set(by_file),
+                                                    store=self.store)
         with self.cv:
             self.openings, self.opening_bytes = openings, sizes
             for name in parked:
@@ -1837,7 +1911,7 @@ class Pool:
                     "turns": row.get("turns", 1), "parked": name,
                     "bytes": row.get("bytes", 0),
                     # Without it every copy reads as age zero.
-                    "parked_at": row.get("parked_at") or file_mtime(name)}
+                    "parked_at": row.get("parked_at") or self.store.mtime(name)}
         for name in spent:
             remove(name)
         self.save_openings()      # trimmed, so write it
@@ -1961,19 +2035,7 @@ class Pool:
         MOUNT_POLL."""
         if now - self.mounts_at < MOUNT_POLL:
             return self.mounts
-        rows = []
-        seen = set()
-        for path in (SLOT_DIR, BLOCK_DIR):
-            try:
-                resolved = path.resolve()
-                if resolved in seen:
-                    continue
-                seen.add(resolved)
-                usage = shutil.disk_usage(resolved)
-                rows.append({"path": str(path), "total": usage.total,
-                             "free": usage.free})
-            except OSError:
-                continue
+        rows = self.store.disks()
         self.mounts, self.mounts_at = rows, now
         return rows
 
@@ -2012,7 +2074,7 @@ class Pool:
         """A backend's startup settings, from its log. Read again when the
         inode changes: restart-backend.sh moves the old log aside, and the
         size alone misses a restart whose new log passes the old offset."""
-        path = RUN_DIR / f"{be['name']}.log"
+        path = self.store.log(be["name"])
         try:
             stat = path.stat()
             size, ino = stat.st_size, stat.st_ino
@@ -2424,7 +2486,7 @@ class Pool:
             while len(self.pins) > MAX_PINS:
                 _, dropped = self.pins.popitem(last=False)
                 if dropped.get("parked"):
-                    drop_file(dropped["parked"])   # its copy is now orphaned
+                    self.store.drop(dropped["parked"])   # its copy is orphaned
         return be
 
     def release(self, be, conv=None):
@@ -2498,11 +2560,12 @@ class Pool:
                 return slot["id"]
         return None
 
-    def ensure_parked(self, be, skip_conv, post, remove=drop_file):
+    def ensure_parked(self, be, skip_conv, post, remove=None):
         """Copy every cache on this backend to disk before a request lands. A
         save reads a slot, so it only works while the cache is still in one.
         Each conversation is tried once, or a save that does not stick loops
         forever."""
+        remove = remove or self.store.drop
         tried = set()
         while True:
             with self.cv:
@@ -2522,8 +2585,9 @@ class Pool:
 
             self._save_park(conv, be, slot, post, remove)
 
-    def _save_park(self, conv, be, slot, post, remove=drop_file):
+    def _save_park(self, conv, be, slot, post, remove=None):
         """Write one cache to disk. Mark the pin only if it holds one."""
+        remove = remove or self.store.drop
         name = conv + ".park"
         short = short_key(conv)
         kept = False
@@ -2547,7 +2611,7 @@ class Pool:
             # reports the state without the checkpoint trailer: a 107 MB
             # file came back as 49 MB. Its figure is the fallback for a
             # stub. tests/live/test_llama_beliefs.py asserts the two agree.
-            written = file_size(name) or (answer.get("n_written") or 0)
+            written = self.store.size(name) or (answer.get("n_written") or 0)
             kept = written >= PARK_FLOOR
             if not kept:
                 lost = True
@@ -2753,7 +2817,8 @@ class Pool:
             return self._wait_for_opening(plan[1], be, slot, post)
         try:
             return self._read_prefix(base, messages, system, tools, be,
-                                     plan[3], post, drop_file, "base-", path)
+                                     plan[3], post, self.store.drop, "base-",
+                                     path)
         finally:
             with self.cv:
                 self.building.pop(plan[1], None)
@@ -2790,9 +2855,10 @@ class Pool:
                 EVENTS.write("want", key=short_key(cut[1]), shelf=mark_shelf(mark),
                              action="added")
 
-    def build_once(self, post, remove=drop_file):
+    def build_once(self, post, remove=None):
         """Read one wanted opening into an idle slot. Return its key, or None.
         The slot is held for the read."""
+        remove = remove or self.store.drop
         with self.cv:
             if not self.wants:
                 return None
@@ -2875,7 +2941,7 @@ class Pool:
         with self.cv:
             rows = [{"key": key, "file": name, "loads": self.loads.get(key, 0)}
                     for key, name in self.openings.items()]
-        write_rows(openings_file(), rows)
+        self.store.write_openings(rows)
         return len(rows)
 
     def save_pins(self):
@@ -2888,10 +2954,10 @@ class Pool:
                      # The budget sweep orders by this.
                      "parked_at": record.get("parked_at")}
                     for conv, record in self.pins.items() if record.get("parked")]
-        write_rows(pins_file(), kept)
+        self.store.write_pins(kept)
         return len(kept)
 
-    def hand_off(self, conv, source, tokens, post, remove=drop_file, wanted=None):
+    def hand_off(self, conv, source, tokens, post, remove=None, wanted=None):
         """Move a conversation to the backend it generates on.
 
         The prefiller is released before the wait to generate. The other
@@ -2899,6 +2965,7 @@ class Pool:
         Between the save and the restore the conversation is parked, so a
         failure leaves it parked, not lost. Returns the backend to generate
         on: `source` when nothing was carried, None when nobody waits."""
+        remove = remove or self.store.drop
         if not HANDOFF_ON:
             return self._stay(source, "the handoff is turned off")
         target = self.generator(tokens)
@@ -3016,13 +3083,14 @@ class Pool:
             with self.cv:
                 self.to_generate -= 1
 
-    def park_later(self, be, conv, post, ticket, remove=drop_file):
+    def park_later(self, be, conv, post, ticket, remove=None):
         """Copy a cache out of a backend that cannot read it, on a worker: the
         copy runs to gigabytes and the client already has its reply.
         `inflight` reserves the slot before this returns. The turn ticket
         goes with the job, because the copy overwrites the file the next turn
         restores from. Returns False, with the ticket still the caller's,
         when there is nothing to copy."""
+        remove = remove or self.store.drop
         if prefills(be):
             return False              # it can be read again here
         with self.cv:
@@ -3064,12 +3132,13 @@ class Pool:
             time.sleep(0.01)
         return self.park_jobs.unfinished_tasks == 0
 
-    def park_partial(self, conv, be, slot, post, remove=drop_file):
+    def park_partial(self, conv, be, slot, post, remove=None):
         """Keep what an abandoned read got through, so the retry starts there.
         Thrown away, a prompt too long for the client's patience is never
         read: every attempt gives up in the same place. Measured once at a
         114,354 token turn, abandoned twice after an hour, two thirds read
         each time."""
+        remove = remove or self.store.drop
         if not conv:
             return False
         with self.cv:
@@ -3098,12 +3167,13 @@ class Pool:
             self.holds[(be["name"], record["slot"])] = {key for _, key in cuts}
             self.holds_depth[(be["name"], record["slot"])] = max(i for i, _ in cuts)
 
-    def forget_stale_park(self, conv, cuts, remove=drop_file):
+    def forget_stale_park(self, conv, cuts, remove=None):
         """Drop a copy whose opening the client has changed since. llama.cpp
         restores the state, finds no checkpoint before the point where the
         prompts part, and reads everything again. Measured once at 117,847
         tokens for prompts that parted at token 503. Without the copy the
         conversation loads a shared opening instead."""
+        remove = remove or self.store.drop
         if not conv or not cuts:
             return False
         with self.cv:
@@ -3135,7 +3205,7 @@ class Pool:
                          slot=slot, ok=False, error=str(err)[:120])
             return False
         # Sized: the dashboard draws each file event over its byte count.
-        read = file_size(name)
+        read = self.store.size(name)
         with self.cv:
             shelf = None
             if key in self.openings:
@@ -3159,7 +3229,7 @@ class Pool:
         index, key = cut
         name = f"{mark}{key}.park"
         began = time.time()
-        link_block(name)           # so the save lands on the faster disk
+        self.store.link_block(name)   # so the save lands on the faster disk
         try:
             block = self._render_block(system, tools, messages[:index + 1],
                                        be, post, path)
@@ -3179,7 +3249,7 @@ class Pool:
                          secs=round(time.time() - began, 1))
             return False
         # From the disk, as _save_park: unpatched backends under-report.
-        written = file_size(name) or (answer.get("n_written") or 0)
+        written = self.store.size(name) or (answer.get("n_written") or 0)
         if written < PARK_FLOOR:
             remove(name)           # the slot had already changed hands
             EVENTS.write("build", key=short_key(key), shelf=mark_shelf(mark),

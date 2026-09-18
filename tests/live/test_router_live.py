@@ -91,19 +91,17 @@ class LiveRouter(LiveCase):
     def setUp(self):
         super().setUp()
         self.kept = {name: getattr(router, name) for name in
-                     ("SLOT_DIR", "BLOCK_DIR", "RUN_DIR", "POLL", "BUILD_POLL",
-                      "PIN_PATIENCE", "PARK_ALL_TIMEOUT", "PARK_FLOOR",
-                      "IDLE_POLLS", "HANDOFF_ON")}
+                     ("STORE", "POLL", "BUILD_POLL", "PIN_PATIENCE",
+                      "PARK_ALL_TIMEOUT", "PARK_FLOOR", "IDLE_POLLS",
+                      "HANDOFF_ON")}
         self.had_pool = getattr(router, "POOL", None)
         router.HANDOFF_ON = self.HANDOFF
         # The backends share this test's slot directory, and a backend only
         # takes a bare filename under its own --slot-save-path.
-        router.SLOT_DIR = self.root / "slots"
-        router.SLOT_DIR.mkdir(parents=True, exist_ok=True)
-        router.BLOCK_DIR = self.root / "blocks"
         # Every instance writes <name>.log here, which is where CacheWatch
         # looks, so the cache counters are read off a real log for once.
-        router.RUN_DIR = self.root
+        router.STORE = router.Store(self.root)
+        router.STORE.slots.mkdir(parents=True, exist_ok=True)
         router.POLL = 0.2
         router.BUILD_POLL = 0.3
         router.IDLE_POLLS = 1
@@ -350,7 +348,7 @@ class SavedOpeningsAreLoaded(LiveRouter):
         self.assertTrue(wait_for(lambda: bool(self.pool_.openings), patience=180),
                         "no opening was kept")
         name = next(iter(self.pool_.openings.values()))
-        kept = router.SLOT_DIR / name
+        kept = router.STORE.slots / name
         self.assertTrue(kept.exists())
         self.assertGreater(kept.stat().st_size, router.PARK_FLOOR)
 
@@ -431,7 +429,7 @@ class ParkedCachesComeBack(LiveRouter):
         first, home, away, box = self.displace()
         self.assertTrue(wait_for(lambda: bool(self.pool_.pins["mine"]["parked"])),
                         "the cache was never copied out")
-        copy = router.SLOT_DIR / self.pool_.pins["mine"]["parked"]
+        copy = router.STORE.slots / self.pool_.pins["mine"]["parked"]
         self.assertTrue(copy.exists())
         self.assertGreater(copy.stat().st_size, router.PARK_FLOOR)
 
@@ -584,7 +582,7 @@ class DrainUnderLoad(LiveRouter):
         try:
             self.assertGreaterEqual(report["parked"], 1, "the drain parked nothing")
             copy = self.pool_.pins["living"]["parked"]
-            self.assertTrue(copy and (router.SLOT_DIR / copy).exists())
+            self.assertTrue(copy and (router.STORE.slots / copy).exists())
         finally:
             self.pool_.resume(home)
 

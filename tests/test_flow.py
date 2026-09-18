@@ -27,14 +27,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import tempfile
 import router
 
-# The same reasoning as CACHE_LOG above, for the slot directory. SLOT_DIR is a
-# module global, so a case that forgets to redirect it reads and writes inside
-# the checkout's own run/slots - where a live router keeps conversation caches
-# worth hundreds of gigabytes, and where a stray pins.json is adopt()'s
-# instruction to delete every copy it does not name. One sandbox for the whole
-# run, under the temporary directory; a case wanting its own still redirects.
-router.SLOT_DIR = pathlib.Path(tempfile.mkdtemp(prefix="router-slots-"))
-router.BLOCK_DIR = router.SLOT_DIR / "blocks"
+# The same reasoning as CACHE_LOG above, for what this run writes. STORE is the
+# default a Pool takes when it is handed none, so a case that forgets to give
+# it one reads and writes inside the checkout's own run/slots - where a live
+# router keeps conversation caches worth hundreds of gigabytes, and where a
+# stray pins.json is adopt()'s instruction to delete every copy it does not
+# name. One sandbox for the whole run, under the temporary directory; a case
+# wanting its own builds another Store.
+router.STORE = router.Store(tempfile.mkdtemp(prefix="router-run-"))
 
 
 class ATurnWalksItsStages(unittest.TestCase):
