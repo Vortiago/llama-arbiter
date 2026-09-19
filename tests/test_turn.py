@@ -9,7 +9,9 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
@@ -44,7 +46,6 @@ class FakeClient:
     def __init__(self, alive=True):
         self._alive = alive
         self.opened = None             # the opening event, once a stream began
-        self.settled = 0               # times the keep-alive was stopped
         self.relayed = []              # (backend name, conversation)
         self.failed = []               # (code, message)
         self.sent = None               # what relay was given to forward
@@ -58,7 +59,6 @@ class FakeClient:
         self.did.append("open")
 
     def settle(self):
-        self.settled += 1
         self.did.append("settle")
 
     def relay(self, be, body, conv):
@@ -127,13 +127,6 @@ def one_backend(n_ctx=150000, **kw):
     return pool
 
 
-def streamed(chars):
-    """A chat request whose client reads the reply as a stream."""
-    return json.dumps({"stream": True,
-                       "messages": [{"role": "user",
-                                     "content": "x" * chars}]}).encode()
-
-
 def with_system(rules, said="hello"):
     """A chat request that opens with a system prompt, so it has a cut for
     an opening to be parked at."""
@@ -148,9 +141,11 @@ def parked_copy(name="c1.park"):
             "tokens": 1000, "moved": None}
 
 
-def prompt(chars):
-    """A chat request whose prompt is about this many characters long."""
-    return json.dumps({"messages": [{"role": "user",
+def prompt(chars, **extra):
+    """A chat request whose prompt is about this many characters long. `extra`
+    adds top level fields, such as `stream=True`."""
+    return json.dumps({**extra,
+                       "messages": [{"role": "user",
                                      "content": "x" * chars}]}).encode()
 
 
@@ -315,6 +310,31 @@ class ACopyBeatsAnOpening(unittest.TestCase):
         self.assertEqual(pool.recent_requests[0]["started"], "saved prompt")
 
 
+class AWaitForAnOpeningWatchesTheClient(unittest.TestCase):
+    """One turn reads a shared opening and the rest wait for it, rather than
+    every one of them reading the same 24,000 tokens.
+
+    The wait holds a prefill slot, so a client that has gone has to end it.
+    build_patience is half an hour, and claim_turn, acquire, the read and the
+    handoff all want that slot.
+    """
+
+    def test_a_client_that_has_gone_does_not_wait_out_build_patience(self):
+        patience = 5.0
+        pool = one_backend(tuning=replace(SANDBOX.tuning,
+                                          build_patience=patience))
+        body = with_system("You follow these rules. " * 400)
+        base = router.prompt_cuts(body, pool.tuning)[0][0]
+        pool.building[base[1]] = time.time()   # another turn is reading it
+
+        began = time.monotonic()
+        pool.turn(router.Ask("/v1/chat/completions", body, "c1"),
+                  FakeClient(alive=False))
+        waited = time.monotonic() - began
+
+        self.assertLess(waited, patience / 2)
+
+
 class AClientThatGoesMidReadLeavesItsCacheOnDisk(unittest.TestCase):
     """The read is the expensive half of a turn. What it got through is
     parked, so the next turn of that conversation starts from it instead of
@@ -409,6 +429,41 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
         self.assertEqual(pool.link.ops(), ["read", "save"])
 
 
+class TheHandOffOutlivesItsGenerator(unittest.TestCase):
+    """The wait for a slot to generate in is re-entered with whatever
+    `generator` found, and that is None once the last generator has gone.
+
+    A raise there costs more than the wait it interrupts. hand_off has
+    already given the prefiller back, so the turn's ending gives it back a
+    second time: the count falls below zero, and nothing puts a floor under
+    it. The backend then reads one more prompt at a time than it has slots,
+    for the life of the process.
+    """
+
+    def test_no_generator_left_is_a_wait_and_not_a_raise(self):
+        pool = make_pool([
+            {"name": "cpu", "url": "http://cpu", "pref": 0, "generate": False},
+            {"name": "gpu", "url": "http://gpu", "pref": 1, "prefill": False}])
+        cpu, gpu = pool.backends
+        cpu.update(up=True, n_ctx=150000, busy=1)   # it holds the read
+        gpu.update(up=True, n_ctx=150000, busy=1)   # its one slot is taken
+        pool.pins["c1"] = parked_copy()
+        pool.pins["c1"]["slot"] = 0
+        asked = []
+
+        def wanted():
+            """The client, and the generator going away inside the wait."""
+            asked.append(None)
+            if len(asked) == 1:
+                gpu["up"] = False
+            return len(asked) < 3          # and then the client gives up
+
+        self.assertIsNone(pool.hand_off("c1", cpu, 10, wanted=wanted))
+        # Once, by hand_off. The turn's ending releases what it still holds,
+        # and past a None it holds nothing.
+        self.assertEqual(cpu["busy"], 0)
+
+
 class ACacheIsWrittenToDiskOnce(unittest.TestCase):
     """Two saves of one conversation at once write the same file name from the
     same slot. ensure_parked already refuses a record a save is running on;
@@ -429,6 +484,20 @@ class ACacheIsWrittenToDiskOnce(unittest.TestCase):
         self.assertFalse(pool.park_partial("c1", pool.backends[0], 0))
         self.assertEqual(pool.link.ops(), [])
 
+    def test_a_copy_on_the_worker_is_not_queued_over_a_running_save(self):
+        """The same meeting, one step later. The turn's ending releases the
+        backend, which clears `inflight`, and park_all can take the record in
+        the two lines before the copy is queued."""
+        pool = one_backend()
+        pool.backends[0]["prefill"] = False    # it cannot read the next turn
+        pool.pins["c1"] = parked_copy()
+        pool.pins["c1"]["slot"] = 0
+        pool.pins["c1"]["inflight"] = True     # a save is running on it now
+
+        self.assertFalse(pool.park_later(pool.backends[0], "c1", "t1"))
+        self.assertTrue(pool.park_jobs.empty())
+        self.assertIsNone(pool.parker)         # no worker was even started
+
 
 class AStreamSaysNothingAfterItsLastWord(unittest.TestCase):
     """A keep-alive chunk written after the stream's terminator stays on the
@@ -440,7 +509,7 @@ class AStreamSaysNothingAfterItsLastWord(unittest.TestCase):
         pool = one_backend()
         client = FakeClient()
 
-        pool.turn(router.Ask("/v1/chat/completions", streamed(10), "c1"),
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10, stream=True), "c1"),
                   client)
 
         self.assertIsNotNone(client.opened, "the stream never opened")
@@ -450,7 +519,7 @@ class AStreamSaysNothingAfterItsLastWord(unittest.TestCase):
         pool = one_backend(link=TurnLink(reading=OSError("backend went away")))
         client = FakeClient()
 
-        pool.turn(router.Ask("/v1/chat/completions", streamed(10), "c1"),
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10, stream=True), "c1"),
                   client)
 
         self.assertEqual([code for code, _ in client.failed], [502])
