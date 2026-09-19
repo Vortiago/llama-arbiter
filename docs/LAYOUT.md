@@ -119,3 +119,32 @@ against 247.
 **`PARK_BUDGET_GB` is 256 and `BLOCK_BUDGET_GB` is 64.** Both are sized to a
 large SATA disk, with the saved openings moved to NVMe. Set either one too low
 and the cost is a full re-read.
+
+## Typed questions, on this machine
+
+`/v1/systemone` asks one question with one generated token. What that costs is
+a property of the model and the box, so the numbers are here rather than in
+the README. Qwen3-Next at Q8, three cpu backends and an A4000.
+
+**A question costs its own words, not another reading of the state.** A state
+of 348 tokens with three questions, by the backend's own prompt evals:
+
+| | tokens read |
+|---|---|
+| the state, once | 351 |
+| each question after it | 4, 42, 37 |
+| the whole call again, warm | 46, 4, 42, 37 |
+
+**The read pass has to carry the first question.** Reading the state alone
+cost the first question a full re-read: 351 tokens of a state of 348, and 778
+tokens for the call against 434. Why is an open question in
+`tests/live/README.md`; neither small model there reproduces it.
+
+**`mass` depends on the chat template, not on the question.** Qwen3-0.6B, one
+prompt, changing only the thinking flag: 0.000000 with thinking on, 0.999618
+with it off. Both wrote the same letter. This is why the router sends
+`enable_thinking: false`, and why `mass` is worth reading.
+
+**A typed turn answers where it read.** One token is not worth a park and a
+recall of the whole slot. Measured against the same question on
+`/v1/chat/completions`, which still migrates: 0.8 s against 2.3 s warm.

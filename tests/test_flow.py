@@ -78,6 +78,20 @@ class ATurnWalksItsStages(unittest.TestCase):
         self.flow.note("conv-a", "done")
         self.assertEqual(self.flow.report(), {"live": [], "log": []})
 
+    def test_a_labelled_turn_keeps_its_label_through_the_walk(self):
+        """Only the route knows a turn is a typed question. The stages noted
+        from inside the pool must not drop the word."""
+        self.flow.note("conv-a", "prefill", "cpu0_0", 1, "typed")
+        self.flow.note("conv-a", "generate-queue")
+        self.flow.note("conv-a", "generate", "gpu0_0", 0)
+        self.assertEqual(self.flow.report()["live"][0]["kind"], "typed")
+        self.flow.note("conv-a", "done")
+        self.assertEqual(self.flow.report()["log"][0]["kind"], "typed")
+
+    def test_an_ordinary_turn_wears_no_label(self):
+        self.flow.note("conv-a", "prefill", "cpu0_0", 1)
+        self.assertIsNone(self.flow.report()["live"][0]["kind"])
+
     def test_no_conversation_no_row(self):
         self.flow.note("", "queued")
         self.assertEqual(self.flow.report(), {"live": [], "log": []})

@@ -9,13 +9,17 @@ import { renderRegion, reconcileList } from "../../lib/render.js";
 import { num, time } from "../../lib/format.js";
 import { subscribe } from "../feed.js";
 import { isStalled, readerBeside, secondsLeft, poolReason, nextFree, backendsOf, slotsOf,
-         reuseShare, waitLabel, promptBands, TAPE_SECONDS } from "../status.js";
+         reuseShare, waitLabel, promptBands, slotKey, workBySlot, workLabel,
+         TAPE_SECONDS } from "../status.js";
 
 /** @typedef {import("../status.js").Status} Status */
 /** @typedef {import("../status.js").Backend} Backend */
 /** @typedef {import("../status.js").Slot} Slot */
 /** @typedef {import("../status.js").FileEvent} FileEvent */
-/** @typedef {{ kind: "backend", be: Backend } | { kind: "slot", be: Backend, sl: Slot }} Row */
+/** `work` is the router's label for the turn in that slot, or null for an
+ * ordinary one.
+ * @typedef {{ kind: "backend", be: Backend }
+ *          | { kind: "slot", be: Backend, sl: Slot, work: string | null }} Row */
 
 const MIB = 1024 * 1024;
 const SVG = "http://www.w3.org/2000/svg";
@@ -110,10 +114,15 @@ function waitingText(status) {
 // ---------------------------------------------------------------- rows
 /** @param {Status} status @returns {Row[]} */
 function rowsOf(status) {
+  // One pass over the live flow rows, not one lookup per slot.
+  const work = workBySlot(status);
   /** @type {Row[]} */ const rows = [];
   for (const be of backendsOf(status)) {
     rows.push({ kind: "backend", be });
-    for (const sl of slotsOf(be)) rows.push({ kind: "slot", be, sl });
+    for (const sl of slotsOf(be)) {
+      rows.push({ kind: "slot", be, sl,
+                  work: work.get(slotKey({ backend: be.name, slot: sl.id })) || null });
+    }
   }
   return rows;
 }
@@ -132,7 +141,7 @@ function create(row) {
 /** @param {Element} el @param {Row} row */
 function update(el, row) {
   if (row.kind === "backend") updateBackend(el, row.be);
-  else updateSlot(el, row.be, row.sl);
+  else updateSlot(el, row.be, row.sl, row.work);
 }
 
 /** @param {Element} el @param {Backend} be */
@@ -161,8 +170,9 @@ function restart(el, cls) {
   el.classList.add(cls);
 }
 
-/** @param {Element} el @param {Backend} be @param {Slot} sl */
-function updateSlot(el, be, sl) {
+/** @param {Element} el @param {Backend} be @param {Slot} sl
+ * @param {string | null} work the router's label for this turn, or null */
+function updateSlot(el, be, sl, work) {
   const stalled = isStalled(sl);
   const shown = stalled ? "stalled" : sl.phase;
   pick(el, "id").textContent = `slot ${sl.id}`;
@@ -172,9 +182,22 @@ function updateSlot(el, be, sl) {
   badge.className = `phase ${shown}`;
   badge.title = stalled ? "Generating under 0.5 tokens a second: another slot on this backend is reading."
     : sl.phase === "reading" ? "Sends nothing to the client until the prompt is read." : "";
+  // A kind of work, not a phase: it sits beside the phase badge rather than
+  // replacing it, because a typed question still reads and still generates.
+  const label = workLabel(work);
+  const kind = pick(el, "kind");
+  kind.hidden = !label;
+  if (label) {
+    pick(el, "kindIcon").textContent = label.icon;
+    pick(el, "kindWord").textContent = label.word;
+    kind.title = label.why;
+  }
   if (el instanceof HTMLElement) {
     if (el.dataset.phase && el.dataset.phase !== shown && !reduced()) restart(el, "changed");
     el.dataset.phase = shown;
+    // Deleted, not blanked: `[data-kind]` would match an empty attribute.
+    if (work) el.dataset.kind = work;
+    else delete el.dataset.kind;
   }
 
   // One bar for the whole prompt: the reused band is calm, the read band is active.

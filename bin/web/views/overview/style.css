@@ -19,6 +19,9 @@
   tr.slot td:first-child { padding-inline-start: 1.7rem; color: var(--text-dim); }
   /* A slot whose phase just changed settles from a wash of accent. */
   tr.slot.changed td { animation: settle 1.2s ease-out; }
+  /* A typed question is one token of work in a table of replies. A rule down
+     the left edge of the row picks it out without moving a column. */
+  tr.slot[data-kind] td:first-child { box-shadow: inset 3px 0 0 var(--typed); }
 
   .rows.waiting { --cols: max-content max-content max-content 1fr; }
 

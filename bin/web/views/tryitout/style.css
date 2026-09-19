@@ -1,0 +1,24 @@
+@layer components;
+
+@scope (.tryitout) {
+  :scope { container-type: inline-size; display: grid; gap: 1.4rem; max-width: 52rem; }
+
+  textarea, input.q, select {
+    font: inherit; font-size: .85rem; color: var(--text); background: var(--surface);
+    border: 1px solid var(--hairline); border-radius: var(--r); padding: .4rem .6rem;
+  }
+  textarea { width: 100%; resize: vertical; }
+  textarea:focus-visible, input.q:focus-visible, select:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+
+  .ask { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  .ask input.q { flex: 1 1 18rem; }
+  .answers { display: grid; gap: .3rem; }
+
+  .headline { margin: 0 0 .6rem; font-size: 1.1rem; }
+  .headline .dim { font-size: .8rem; color: var(--text-dim); font-weight: 400; }
+  .rows.probs { --cols: max-content minmax(8rem, 1fr) max-content; max-width: 34rem; }
+  .bar.wide { width: 100%; }
+  .answer { display: grid; gap: .5rem; }
+}

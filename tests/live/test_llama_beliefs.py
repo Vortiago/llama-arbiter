@@ -15,6 +15,7 @@ minutes, and `unittest discover -s tests` does not reach them.
 """
 
 import json
+import math
 import threading
 import time
 import unittest
@@ -687,6 +688,239 @@ class ADivergenceAtTheFirstUserMessage(LiveCase):
             f"the whole system prompt was read again. It stopped matching at "
             f"{want}; the checkpoints on offer were {sorted(offered)}, none at "
             f"or below it.")
+
+
+class AskingForOneLetter(LiveCase):
+    """What /v1/systemone rests on: one token, a grammar, and the numbers.
+
+    The grammar decides what is written. It does **not** decide what is
+    reported: before sampling, the probabilities are a plain softmax over the
+    whole vocabulary, so they cover words no letter stands for and they may not
+    mention the letters at all. The router keeps the letters and scales them
+    back up, which is only meaningful when the prompt asked for a letter.
+    """
+
+    LETTERS = "ABC"
+
+    def setUp(self):
+        super().setUp()
+        self.be = self.start("letter", slots=1)
+
+    def body(self, messages, post_sampling=False, top=14):
+        allowed = " | ".join(f'"{letter}"' for letter in self.LETTERS)
+        return {"model": "live", "id_slot": 0, "stream": False,
+                "messages": messages,
+                "max_tokens": 1, "temperature": 0,
+                "logprobs": True, "top_logprobs": top,
+                "post_sampling_probs": post_sampling,
+                "grammar": "root ::= " + allowed}
+
+    @staticmethod
+    def bare():
+        """A prompt with no hint that an answer is wanted."""
+        return [{"role": "user", "content": prose(300, "notes")}]
+
+    @classmethod
+    def lettered(cls):
+        """The shape the router sends: a rubric, a state, a lettered question."""
+        return [
+            {"role": "system", "content":
+                "Answer the question about the text above with one letter.\n"
+                "The question gives a letter for every answer it takes.\n"
+                "Write that letter and nothing else."},
+            {"role": "user", "content": "cpu1_0 read 150000 tokens in 94 minutes"},
+            {"role": "user", "content":
+                "What happened to this turn?\n\n"
+                "A = it reused a cache\n"
+                "B = it read from the start\n"
+                "C = it never reached a backend\n\n"
+                "Answer with one letter.\nAnswer:"},
+        ]
+
+    @staticmethod
+    def offered(reply):
+        """Every token the reply offered for the one position, as {token: p}.
+
+        llama.cpp reports a logprob before sampling and a plain prob after it,
+        so a test that read only one of the two would pass on either setting."""
+        content = (reply["choices"][0].get("logprobs") or {}).get("content") or []
+        rows = (content[0].get("top_logprobs") or []) if content else []
+        found = {}
+        for row in rows:
+            p = row["prob"] if "prob" in row else math.exp(row["logprob"])
+            token = row["token"].strip()
+            found[token] = found.get(token, 0.0) + p
+        return found
+
+    def carried(self, reply):
+        """How much of the reported mass fell on the answer letters."""
+        found = self.offered(reply)
+        return sum(p for token, p in found.items() if token in self.LETTERS), found
+
+    def test_the_grammar_holds_what_is_written_to_one_letter(self):
+        reply = self.be.post("/v1/chat/completions", self.body(self.bare()))
+        self.assertIn(reply["choices"][0]["message"]["content"].strip(),
+                      list(self.LETTERS))
+        self.assertEqual(reply["usage"]["completion_tokens"], 1)
+
+    def test_but_the_numbers_reported_ignore_it_entirely(self):
+        """The belief that decides how the router reads an answer.
+
+        The same request that is forced to write `A` reports the words it
+        would rather have written, and the letters barely appear. So a
+        confidence taken from these numbers means nothing unless the prompt
+        itself asked for a letter."""
+        on_letters, found = self.carried(
+            self.be.post("/v1/chat/completions", self.body(self.bare())))
+        self.assertGreater(len(found), 1, "only the written token was reported")
+        self.assertLess(on_letters, 0.05,
+                        f"the letters carried the prompt after all: {found}")
+
+    def test_a_prompt_that_asks_for_a_letter_gets_letters(self):
+        """And with the router's own prompt shape, they do carry it.
+
+        Measured at 0.46 on the 0.5B model these tests run, against 0.0007 for
+        the bare prompt above. The number is the model's, not the router's, so
+        this asserts the difference rather than a level."""
+        on_letters, found = self.carried(
+            self.be.post("/v1/chat/completions", self.body(self.lettered())))
+        self.assertGreater(on_letters, 0.1,
+                           f"a prompt that asked for a letter got {found}")
+        spread = [p for token, p in found.items() if token in self.LETTERS]
+        self.assertGreaterEqual(len(spread), 2,
+                                f"one letter took the whole answer: {found}")
+
+    def test_more_room_in_the_report_does_not_find_more_letters(self):
+        """Why top_logprobs stays small. The letters are near the top or
+        nowhere: asking for 120 rather than 14 moved 0.0002."""
+        small, _ = self.carried(
+            self.be.post("/v1/chat/completions", self.body(self.lettered(), top=14)))
+        large, _ = self.carried(
+            self.be.post("/v1/chat/completions", self.body(self.lettered(), top=120)))
+        self.assertAlmostEqual(small, large, places=2)
+
+    def test_post_sampling_probs_reports_nothing_to_read(self):
+        """The trap this endpoint had to avoid.
+
+        After the sampling chain the grammar and greedy sampling have already
+        chosen. On this route what comes back carries no probabilities at all,
+        and on /completion it is the one token at 1.0. Either way a confidence
+        read from here would be the same number every time."""
+        reply = self.be.post("/v1/chat/completions",
+                             self.body(self.lettered(), post_sampling=True))
+        found = self.offered(reply)
+        self.assertLessEqual(len(found), 1, f"a distribution survived: {found}")
+        for p in found.values():
+            self.assertAlmostEqual(p, 1.0, places=3)
+
+    def test_one_token_leaves_the_slot_holding_the_prompt(self):
+        """Belief 6 at k = 1, which is why a question costs the next turn
+        nothing. A slot holding prompt + 1 makes the bare prompt a prefix
+        again, and rewinding into a prefix needs a checkpoint."""
+        reply = self.be.post("/v1/chat/completions", self.body(self.lettered()))
+        self.assertEqual(self.be.held(0), reply["usage"]["prompt_tokens"],
+                         "the slot holds something other than the prompt")
+
+
+
+class ReadingWhatTheGrammarAllows(LiveCase):
+    """patches/grammar-probs.patch: the readout AskingForOneLetter wanted.
+
+    That class records what the stock readouts do. Before the sampler the
+    probabilities cover the whole vocabulary and the grammar is not in them,
+    so the answers may not appear at all; after it, the grammar and the
+    sampler have already chosen. `grammar_probs` reports the tokens the
+    grammar allows, and `grammar_mass` what they held before being scaled up.
+
+    Skipped on a build without the patch: it is not one of the three the
+    router requires, and llama.cpp ignores a field it does not know.
+    """
+
+    LETTERS = "ABC"
+
+    def setUp(self):
+        super().setUp()
+        self.be = self.start("allowed", slots=1)
+
+    def body(self, messages, **extra):
+        allowed = " | ".join(f'"{letter}"' for letter in self.LETTERS)
+        return {"model": "live", "id_slot": 0, "stream": False,
+                "messages": messages, "max_tokens": 1, "temperature": 0,
+                "grammar": "root ::= " + allowed, **extra}
+
+    @staticmethod
+    def lettered():
+        return [{"role": "user", "content":
+                 "Is this about caching?\n\nA = yes\nB = no\nC = unclear\n\n"
+                 "Answer with one letter.\nAnswer:"}]
+
+    def read(self, reply):
+        """The first token's rows and its grammar_mass, or a skip."""
+        content = (reply["choices"][0].get("logprobs") or {}).get("content") or []
+        head = content[0] if content else {}
+        mass = head.get("grammar_mass")
+        if mass is None:
+            raise unittest.SkipTest("this build has no grammar-probs patch")
+        rows = {row["token"].strip(): math.exp(row["logprob"])
+                for row in head.get("top_logprobs") or []}
+        return rows, mass
+
+    def test_it_reports_the_allowed_tokens_and_nothing_else(self):
+        """The whole point. The stock readout returns whatever the model was
+        going to write, which for a prompt like this is a word, not a letter."""
+        rows, _ = self.read(self.be.post("/v1/chat/completions",
+                                         self.body(self.lettered(),
+                                                   grammar_probs=True)))
+        self.assertEqual(sorted(rows), sorted(self.LETTERS))
+
+    def test_the_answers_add_up_to_one(self):
+        rows, _ = self.read(self.be.post("/v1/chat/completions",
+                                         self.body(self.lettered(),
+                                                   grammar_probs=True)))
+        self.assertAlmostEqual(sum(rows.values()), 1.0, places=4)
+
+    def test_it_needs_no_n_probs_at_all(self):
+        """Three gates on n_probs stood between the readout and the reply, and
+        a request that asks for none has to pass all three. The body here sets
+        neither logprobs nor top_logprobs."""
+        reply = self.be.post("/v1/chat/completions",
+                             self.body(self.lettered(), grammar_probs=True))
+        rows, _ = self.read(reply)
+        self.assertEqual(len(rows), len(self.LETTERS))
+
+    def test_the_mass_is_a_share_of_the_whole_distribution(self):
+        """It is what the answers held before the scaling, so it is at most
+        one, and it is not the scaled numbers over again."""
+        _, mass = self.read(self.be.post("/v1/chat/completions",
+                                         self.body(self.lettered(),
+                                                   grammar_probs=True)))
+        self.assertGreater(mass, 0.0)
+        self.assertLessEqual(mass, 1.0)
+
+    def test_prose_holds_less_of_it_than_a_question_does(self):
+        """The reason the field exists. Both answers are a letter, because the
+        grammar says so. Only the mass tells them apart."""
+        _, asked = self.read(self.be.post("/v1/chat/completions",
+                                          self.body(self.lettered(),
+                                                    grammar_probs=True)))
+        prose_body = self.body(
+            [{"role": "user", "content": prose(300, "notes")}],
+            grammar_probs=True)
+        _, wandering = self.read(self.be.post("/v1/chat/completions", prose_body))
+        self.assertGreater(asked, wandering * 10,
+                           f"a question held {asked}, prose held {wandering}")
+
+    def test_the_readout_happens_before_the_grammar_moves_on(self):
+        """common_sampler_accept advances the grammar past the token just
+        chosen. Read after it and the answer is what may follow the answer,
+        which for a one-token grammar is the end of the string."""
+        rows, _ = self.read(self.be.post("/v1/chat/completions",
+                                         self.body(self.lettered(),
+                                                   grammar_probs=True)))
+        self.assertNotIn("", rows, "the end-of-string token was reported")
+        for token in rows:
+            self.assertIn(token, self.LETTERS)
+
 
 if __name__ == "__main__":
     unittest.main()

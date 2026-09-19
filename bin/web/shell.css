@@ -13,6 +13,11 @@
     --bad:       light-dark(#cf222e, #f85149);
     --hairline:  light-dark(#d8dce2, #232936);
     --idle:      light-dark(#e4e7ec, #1c2230);
+    /* A typed question, the one kind of work a slot is labelled with. Violet
+       is the only hue left that is not a state: --ok, --busy and --bad are
+       taken, and --accent is the blue a cache in a slot wears. 6.4:1 on
+       #ffffff, 7.7:1 on #131722. */
+    --typed:     light-dark(#7a3fbd, #c792ea);
     --hatch:     repeating-linear-gradient(135deg, transparent 0 3px, rgba(255, 255, 255, .35) 3px 5px);
     --r: 6px;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;

@@ -6,4 +6,5 @@ export const views = [
   { id: "hardware", title: "Hardware", load: () => import("./hardware/index.js") },
   { id: "caching", title: "Caching", load: () => import("./caching/index.js") },
   { id: "disk", title: "Disk", load: () => import("./disk/index.js") },
+  { id: "tryitout", title: "Try it out", load: () => import("./tryitout/index.js") },
 ];

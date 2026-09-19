@@ -130,6 +130,17 @@ test("a node carries the conversation the flow says is in its slot", () => {
   assert.deepEqual(n.bands, { total: 118109, reused: 7821, read: 87836, left: 22452 });
 });
 
+test("a node carries the router's label for the turn in its slot", () => {
+  /** @param {string | null} kind */
+  const status = (kind) => ({
+    backends: [backend({ name: "cpu0_0", slots_detail: [slot({ phase: /** @type {const} */ ("reading") })] })],
+    flow: { live: [{ conv: "f37a52af/230358", stage: /** @type {const} */ ("prefill"),
+                     backend: "cpu0_0", slot: 0, since: 1, changed: 1, kind }], log: [] },
+  });
+  assert.equal(nodesOf(status("typed"), never)[0].kind, "typed");
+  assert.equal(nodesOf(status(null), never)[0].kind, null, "an ordinary turn wears no label");
+});
+
 test("the arrivals say what each turn is waiting for", () => {
   const rows = arrivalsOf({ waiting_detail: [
     { conv: "a", since: 0, waited: 4695.6, tokens: 70989, wants: "turn", backend: null },

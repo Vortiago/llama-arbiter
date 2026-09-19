@@ -127,12 +127,23 @@ REPLY_TOKENS  = 1024   # room to reserve for the reply
 MAX_BODY = 256 * 1024 * 1024   # largest request body read into memory.
                        # A turn at ctx 150000 is a few megabytes.
 
+# A typed question: one generated token, and the probabilities behind it.
+# The path and the field names are TypeSafe's Jev, so a client written for
+# that API reaches this router by changing the base URL.
+SYSTEMONE = "/v1/systemone"
+# The backend has never heard of SYSTEMONE. Every post for one goes here.
+SYSTEMONE_UP = "/v1/chat/completions"
+# One token an option. Verified against the production model: every one of
+# these is a single token, with and without a leading space.
+SYSTEMONE_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
 # Endpoints that use a slot.
 INFERENCE = {
     "/completion", "/completions", "/v1/completions",
     "/chat/completions", "/v1/chat/completions",
     "/infill", "/v1/messages", "/responses", "/v1/responses",
     "/embedding", "/embeddings", "/v1/embeddings",
+    SYSTEMONE,
 }
 
 # An allowlist. The backends run with --agent, which is shell and file
@@ -1109,6 +1120,222 @@ def hoist_system(body):
     return json.dumps(fields).encode()
 
 
+class Refused(Exception):
+    """A typed question this router will not guess at. The text reaches the
+    client as a 400, so it says what to send instead."""
+
+
+SYSTEMONE_RUBRIC = ("Answer the question about the text above with one letter.\n"
+                    "The question gives a letter for every answer it takes.\n"
+                    "Write that letter and nothing else.")
+
+
+NOUL_YES = {"yes", "true", "1"}
+NOUL_NO = {"no", "false", "0"}
+
+
+def noul_criteria(criteria):
+    """What yes and no mean for one noul question, or None.
+
+    A noul answers yes or no whatever it is asked, so its criteria do not name
+    the answers: they say what the two stand for. Jev writes them as
+    `{"true": ..., "false": ...}`, which is what a client in the wild sends."""
+    if not isinstance(criteria, dict) or len(criteria) != 2:
+        return None
+    said = {str(name).strip().lower(): means for name, means in criteria.items()}
+    yes = next((said[name] for name in said if name in NOUL_YES), None)
+    no = next((said[name] for name in said if name in NOUL_NO), None)
+    if yes is None or no is None:
+        yes, no = list(criteria.values())      # two of them, in the order given
+    return {"yes": yes, "no": no}
+
+
+def systemone_options(kind, criteria):
+    """The answers one question takes, in the order they are lettered."""
+    if kind == "noul":
+        return ["yes", "no"]
+    if kind == "choice":
+        if not isinstance(criteria, dict) or not criteria:
+            raise Refused("a choice question needs criteria: an object of "
+                          "answer name to what that answer means")
+        return [str(key) for key in criteria]
+    if kind == "score":
+        if not isinstance(criteria, list) or not criteria:
+            raise Refused("a score question needs criteria: a list of levels, "
+                          "lowest first")
+        return [str(level) for level in criteria]
+    raise Refused(f"no question type called {kind!r}. The types are "
+                  f"choice, score and noul")
+
+
+def systemone_plan(raw):
+    """Read a typed body into the questions to ask, one at a time."""
+    try:
+        fields = json.loads(raw)
+    except Exception:
+        raise Refused("the body is not json")
+    if not isinstance(fields, dict):
+        raise Refused("the body is not a json object")
+    if fields.get("stream"):
+        raise Refused(f"{SYSTEMONE} does not stream. One token has nothing to "
+                      f"stream, so the answer arrives in one piece")
+    state = fields.get("state")
+    if state is None:
+        state = ""
+    elif not isinstance(state, str):
+        # State is what the asking program holds, and a client in the wild
+        # sends an object: an email, a request, a row. Render it once here, so
+        # the prompt, the cuts and the conversation's name all see one text.
+        state = json.dumps(state, indent=2, ensure_ascii=False)
+    asked = fields.get("questions")
+    if not isinstance(asked, dict) or not asked:
+        raise Refused("questions is an object of one or more named questions")
+
+    plan = []
+    for name, question in asked.items():
+        if not isinstance(question, dict):
+            raise Refused(f"question {name!r} is not an object")
+        kind = str(question.get("type") or "noul")
+        options = systemone_options(kind, question.get("criteria"))
+        if len(options) < 2:
+            raise Refused(f"question {name!r} needs at least two answers to "
+                          f"choose between, and has {len(options)}")
+        if len(options) > len(SYSTEMONE_LETTERS):
+            raise Refused(f"question {name!r} takes {len(options)} answers. "
+                          f"One token carries {len(SYSTEMONE_LETTERS)} at most")
+        said = question.get("criteria")
+        plan.append({"name": name, "type": kind, "options": options,
+                     "letters": SYSTEMONE_LETTERS[:len(options)],
+                     "instructions": str(question.get("instructions") or ""),
+                     "criteria": noul_criteria(said) if kind == "noul" else said})
+    key = fields.get("prompt_cache_key")
+    return {"model": fields.get("model") or "systemone",
+            "key": key if isinstance(key, str) and key.strip() else None,
+            "state": state, "questions": plan}
+
+
+def systemone_says(question):
+    """The message that asks one question and letters its answers."""
+    criteria = question["criteria"]
+    head = question["instructions"].strip()
+    lines = [head, ""] if head else []
+    for letter, option in zip(question["letters"], question["options"]):
+        means = criteria.get(option) if isinstance(criteria, dict) else None
+        lines.append(f"{letter} = {means or option}")
+    lines += ["", "Answer with one letter.", "Answer:"]
+    return "\n".join(lines)
+
+
+def systemone_body(plan, question):
+    """The chat body that asks one question about this plan's state."""
+    messages = [{"role": "system", "content": SYSTEMONE_RUBRIC},
+                {"role": "user", "content": plan["state"]},
+                {"role": "user", "content": systemone_says(question)}]
+    body = {"model": plan["model"], "messages": messages, "stream": False}
+    if plan["key"]:
+        body["prompt_cache_key"] = plan["key"]
+    letters = question["letters"]
+    body.update({
+        # One token. tests/live belief 6: at one token the slot still holds
+        # exactly the prompt, so a question leaves nothing behind it.
+        "max_tokens": 1,
+        "temperature": 0,        # -1 means greedy upstream, but field_num
+                                 # clamps a soft limit, so -1 arrives as 0
+        "logprobs": True,
+        "top_logprobs": 2 * len(letters) + 8,
+        # False, or the grammar and greedy sampling have already collapsed
+        # the distribution and every answer comes back at 1.0.
+        "post_sampling_probs": False,
+        # patches/grammar-probs.patch: report every token the grammar allows,
+        # and what they held of the distribution before it. Stock llama.cpp
+        # ignores a field it does not know, and the two lines above still
+        # answer - less exactly, because they see only the top of the list.
+        "grammar_probs": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "grammar": "root ::= " + " | ".join(f'"{x}"' for x in letters)})
+    return body
+
+
+def systemone_read(reply, question):
+    """One typed answer, from the one token the backend wrote.
+
+    The probabilities are the raw softmax over the whole vocabulary: llama.cpp
+    reports them before the grammar, so they are absolute and they cover words
+    no answer letter stands for. Weight lands on " A" as well as on "A", and
+    both mean the same answer. What is left after the letters are kept is
+    scaled back up to one, and `mass` records how much was thrown away."""
+    choices = (reply or {}).get("choices") or []
+    first = choices[0] if choices else {}
+    content = (first.get("logprobs") or {}).get("content") or []
+    head = content[0] if content else {}
+    letters = question["letters"]
+    mass = {letter: 0.0 for letter in letters}
+    for item in head.get("top_logprobs") or []:
+        letter = (item.get("token") or "").strip()
+        if letter in mass and isinstance(item.get("logprob"), (int, float)):
+            mass[letter] += math.exp(item["logprob"])
+
+    total = sum(mass.values())
+    # A patched backend has already scaled those to sum to one over the
+    # answers, and reports what they held before that scaling. It counts every
+    # token the grammar allowed; the sum above counts only the ones that fit
+    # in top_logprobs, and undercounts whenever an answer fell off the end.
+    reported = head.get("grammar_mass")
+    held = reported if isinstance(reported, (int, float)) and reported >= 0 else total
+    if total <= 0:
+        # The grammar let one letter through, but the model's own next token
+        # was going to be something else entirely, so no letter was reported.
+        # What the backend wrote is still the answer. `mass` stays at 0, which
+        # is the reader's warning that the rest of this is one letter's word.
+        wrote = ((first.get("message") or {}).get("content") or "").strip()
+        if wrote not in mass:
+            raise RuntimeError(f"no probabilities came back for question "
+                               f"{question['name']!r}")
+        mass[wrote] = 1.0
+
+    probs = {option: weight / (total or 1.0) for option, weight
+             in zip(question["options"], mass.values())}
+    best = max(probs, key=lambda option: probs[option])
+    answer = {"type": question["type"], "probabilities": probs,
+              "confidence": probs[best], "mass": held}
+    if question["type"] == "noul":
+        answer["noul"] = probs[question["options"][0]]
+    elif question["type"] == "score":
+        # The expected level, not the likeliest one. A score of 1.6 says the
+        # answer sits between the second and third level, which is what the
+        # distribution says and what one letter cannot.
+        answer["score"] = sum(rank * probs[option] for rank, option
+                              in enumerate(question["options"]))
+    else:
+        answer["choice"] = best
+    return answer
+
+
+def systemone_answers(be, slot, plan, post):
+    """Ask every question against the slot that already holds the state.
+
+    `slot` is None when the turn was carried to another instance: the slot it
+    landed in is that instance's to choose, and llama.cpp finds the state by
+    prefix, exactly as it does for every turn the router forwards."""
+    answers, wrote, steps = {}, 0, []
+    for question in plan["questions"]:
+        body = systemone_body(plan, question)
+        if slot is not None:
+            body["id_slot"] = slot
+        reply = post(be["url"], SYSTEMONE_UP, body, READ_TIMEOUT)
+        answers[question["name"]] = systemone_read(reply, question)
+        usage = (reply or {}).get("usage") or {}
+        wrote += int(usage.get("completion_tokens") or 0)
+        # What this question cost on top of the state, by the backend's own
+        # count. The first question extends what the read pass left; the ones
+        # after it roll back to the end of the state and read their own words.
+        timing = (reply or {}).get("timings") or {}
+        steps.append({"question": question["name"],
+                      "read": timing.get("prompt_n"),
+                      "reused": timing.get("cache_n")})
+    return answers, wrote, steps
+
+
 PLACE_RE = re.compile(r"(\d+)_(\d+)$")
 
 
@@ -1706,12 +1933,17 @@ class Flow:
         self.live = {}                        # conv -> current stage and where
         self.log = deque(maxlen=FLOW_LOG)     # newest first, for the animation
 
-    def note(self, conv, stage, backend=None, slot=None):
-        """Move a turn to its next stage. Held under the lock."""
+    def note(self, conv, stage, backend=None, slot=None, kind=None):
+        """Move a turn to its next stage. Held under the lock.
+
+        `kind` is a word for the work, or None for an ordinary turn. This
+        class does not read it. The turn keeps the word once one stage says
+        it, so a stage noted from inside the pool does not drop it."""
         if not conv:
             return
         now = time.time()
         row = self.live.get(conv)
+        kind = kind or (row or {}).get("kind")
         if stage == "done":
             if row is None:
                 return
@@ -1719,10 +1951,10 @@ class Flow:
                                      since=None, changed=None))
             del self.live[conv]
             return
-        if (row and row["stage"] == stage
+        if (row and row["stage"] == stage and row["kind"] == kind
                 and row["backend"] == backend and row["slot"] == slot):
             return
-        entry = {"conv": short_key(conv), "stage": stage,
+        entry = {"conv": short_key(conv), "stage": stage, "kind": kind,
                  "backend": backend, "slot": slot}
         self.live[conv] = dict(entry, since=row["since"] if row else now,
                                changed=now)
@@ -1854,10 +2086,10 @@ class Pool:
                                 "backend": be["name"], "slot": slot,
                                 "bytes": size})
 
-    def note_stage(self, conv, stage, backend=None, slot=None):
+    def note_stage(self, conv, stage, backend=None, slot=None, kind=None):
         """Move a turn along its stages, for the flow dashboard."""
         with self.cv:
-            self.flow.note(conv, stage, backend, slot)
+            self.flow.note(conv, stage, backend, slot, kind)
 
     def begin_wait(self, conv, tokens, images=0, image_tokens_=0):
         """Count a request as waiting until end_wait. Returns its ticket."""
@@ -1875,7 +2107,7 @@ class Pool:
             self.waiters.pop(ticket, None)
             self.waiting = len(self.waiters)
 
-    def claim_turn(self, conv, ticket, wanted=None):
+    def claim_turn(self, conv, ticket, wanted=None, kind=None):
         """Hold this conversation until finish_turn. One turn of it at a time.
 
         Returns True when the turn holds it. False means the client left and
@@ -1892,7 +2124,9 @@ class Pool:
             self.turns[conv] = ticket
             # Noted here, not in begin_wait: a waiting turn must not move the
             # row of the turn ahead, which is keyed by conversation too.
-            self.flow.note(conv, "queued")
+            # `kind` rides along, or a queue of typed questions shows as a
+            # queue of unlabelled rows until each one starts reading.
+            self.flow.note(conv, "queued", kind=kind)
         if began is not None:
             print(f"[router] {short_key(conv)} waited "
                   f"{time.time() - began:.0f}s for the turn ahead of it",
@@ -2891,16 +3125,24 @@ class Pool:
         write_rows(pins_file(), kept)
         return len(kept)
 
-    def hand_off(self, conv, source, tokens, post, remove=drop_file, wanted=None):
+    def hand_off(self, conv, source, tokens, post, remove=drop_file, wanted=None,
+                 migrate=True):
         """Move a conversation to the backend it generates on.
 
         The prefiller is released before the wait to generate. The other
         order left three prefillers idle for seven minutes on one reply.
         Between the save and the restore the conversation is parked, so a
         failure leaves it parked, not lost. Returns the backend to generate
-        on: `source` when nothing was carried, None when nobody waits."""
+        on: `source` when nothing was carried, None when nobody waits.
+
+        `migrate` false asks for a turn that is not worth carrying: a park and
+        a recall of the whole slot, to write one token. A source that may not
+        generate is carried anyway. Which instances answer is the operator's
+        to say, not this turn's."""
         if not HANDOFF_ON:
             return self._stay(source, "the handoff is turned off")
+        if not migrate and generates(source):
+            return self._stay(source, "this turn is not worth carrying")
         target = self.generator(tokens)
         while target is None and not generates(source):
             # Nothing to carry this to, and the instance holding it does
@@ -3530,6 +3772,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._error(503, "no backend is up")
             return self._forward(be, body)
 
+        # A typed question becomes an ordinary chat body: the rubric and the
+        # state, which every question shares. The questions extend it one at
+        # a time, once the state is read. Everything below this line then
+        # works on `messages`, as it does for any other turn.
+        plan, sent = None, body
+        if path == SYSTEMONE:
+            try:
+                plan = systemone_plan(body)
+                # The read pass carries the first question, so that both
+                # phases send the same prompt. Reading the state alone cost
+                # the first question a full re-read on production: 351 tokens
+                # of a state of 348. Why is an open question in
+                # tests/live/README.md; that it costs is measured.
+                body = json.dumps(
+                    systemone_body(plan, plan["questions"][0])).encode()
+            except Refused as err:
+                return self._error(400, str(err))
+        up_path = SYSTEMONE_UP if plan else path
+        # The word the flow board puts on this turn's slot. A typed question
+        # writes one token where a prompt writes a reply, so the board has to
+        # tell them apart. None is an ordinary turn, which wears no label.
+        work = "typed" if plan else None
+
         vision = POOL.vision()
         tokens, images, image_charge = request_cost(body, vision)
         # `tokens` carries REPLY_TOKENS of room. The dashboard measures a
@@ -3556,9 +3821,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             conv_source = "none"
         client = client_kind(self.headers)
         # Before anything is changed, so a capture holds what the client sent.
-        capture(conv, body)
-        # This model's template refuses a late system message.
-        ordered = hoist_system(body)
+        # `sent` is the typed body on a systemone turn, and `body` everywhere
+        # else: what went out is rebuilt from the plan, and what came in is not.
+        capture(conv, sent)
+        # This model's template refuses a late system message. A typed body is
+        # built above, and always in order, so asking would parse the whole
+        # state again to learn nothing.
+        ordered = body if plan else hoist_system(body)
         if ordered is not body:
             print(f"[router] a late system message became a user message "
                   f"for {path}", flush=True)
@@ -3579,7 +3848,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ticket = POOL.begin_wait(conv, tokens, images, image_charge)
         try:
             # The turn ahead holds the pin, slot and copy this one needs.
-            mine = POOL.claim_turn(conv, ticket, self._still_there)
+            mine = POOL.claim_turn(conv, ticket, self._still_there, work)
             be = POOL.acquire(conv, tokens, self._still_there) if mine else None
         finally:
             POOL.end_wait(ticket)
@@ -3609,7 +3878,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             warm = bool(conv) and POOL.holds_slot(conv)
             # One slot, decided once, for the read below to extend.
             slot = POOL.pick_slot(be, conv)
-            POOL.note_stage(conv, "prefill", be["name"], slot)
+            POOL.note_stage(conv, "prefill", be["name"], slot, work)
             # Nothing reaches the backend until the caches on it are on disk.
             POOL.ensure_parked(be, conv, http_post)
             # A copy with an opening the client no longer sends is no prefix.
@@ -3619,26 +3888,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             recalled = POOL.recall(conv, be, slot, http_post)
             loaded = (not recalled
                       and POOL.warm_prefix(conv, cuts, messages, system, tools,
-                                           be, slot, http_post, path))
+                                           be, slot, http_post, up_path))
             if asked is not None:
                 # Watch the client. The timings say what the cache saved.
-                answer = http_post_wanted(be["url"], path, read_only(body, slot),
+                answer = http_post_wanted(be["url"], up_path, read_only(body, slot),
                                           READ_TIMEOUT, self._still_there)
                 timing = (answer or {}).get("timings") or {}
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
                               "read_cache_n": timing.get("cache_n")}
                 POOL.note_slot(conv, slot)
+                # A typed question writes one token, which is not worth a park
+                # and a recall of the slot it was read into.
                 serving = POOL.hand_off(conv, be, tokens, http_post,
-                                        wanted=self._still_there)
+                                        wanted=self._still_there,
+                                        migrate=not plan)
                 if serving is None:
                     # The cache is parked, and no backend is held.
                     raise Gone("the client stopped waiting for a slot to generate in")
             if serving is be:
                 # Nothing was carried. hand_off already noted a carried turn.
-                POOL.note_stage(conv, "generate", be["name"], slot)
+                POOL.note_stage(conv, "generate", be["name"], slot, work)
             if stop_ping:
                 stop_ping()                    # waits for a ping in flight
-            self._forward(serving, body, conv, opened=opened)
+            if plan:
+                self._systemone(serving, slot if serving is be else None,
+                                plan, took_from=start, read_stats=read_stats)
+            else:
+                self._forward(serving, body, conv, opened=opened)
         except Gone:
             # Nobody to answer. What the read got through is parked below.
             print(f"[router] {short_key(conv)} left while {be['name']} was "
@@ -3778,6 +4054,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
         except Exception:
             pass                               # the client left
+
+    def _systemone(self, be, slot, plan, took_from, read_stats):
+        """Ask every question against the slot that holds the state, and
+        answer in one piece. _forward is no use here: it sends the client's
+        own path upstream, and there is one reply a question to gather."""
+        answers, wrote, steps = systemone_answers(be, slot, plan, http_post)
+        read = read_stats.get("read_prompt_n") or 0
+        reused = read_stats.get("read_cache_n") or 0
+        self._send(200, json.dumps({
+            "model": plan["model"],
+            "answers": answers,
+            "usage": {"input_tokens": read + reused, "output_tokens": wrote},
+            "router": {"backend": be["name"], "read": read, "reused": reused,
+                       "took": round(time.time() - took_from, 2),
+                       "questions": steps},
+        }).encode())
 
     def _forward(self, be, body, conv=None, opened=False):
         headers = {k: v for k, v in self.headers.items()

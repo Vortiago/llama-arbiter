@@ -84,7 +84,10 @@
 <template id="tpl-slot">
   <tr class="slot">
     <td data-slot="id"></td>
-    <td><span class="phase" data-slot="phase"></span></td>
+    <td>
+      <span class="phase" data-slot="phase"></span>
+      <span class="kind" data-slot="kind" hidden><i data-slot="kindIcon"></i><span data-slot="kindWord"></span></span>
+    </td>
     <td></td>
     <td><span class="bar sm bands"><i class="reused" data-slot="reused"></i><i data-slot="progress"></i></span></td>
     <td class="num mono" data-slot="prompt"></td>

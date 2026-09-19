@@ -31,7 +31,88 @@ that a new session starts from.
 
     http://<host>:8090/v1            openai
     http://<host>:8090/v1/messages   anthropic
+    http://<host>:8090/v1/systemone  typed questions
     http://<host>:8090/router        dashboard
+
+## Typed questions
+
+Not every question needs a reply written out. `/v1/systemone` takes a state and
+one or more typed questions, and answers each one with a single token and the
+probabilities behind it. The field names are TypeSafe's Jev, so a client
+written for that API reaches this router by changing the base URL.
+
+    POST /v1/systemone
+    {
+      "state": "cpu1_0 read 150000 tokens in 94 minutes",
+      "questions": {
+        "kind": {
+          "type": "choice",
+          "instructions": "What happened to this turn?",
+          "criteria": {"warm": "it reused a cache",
+                       "cold": "it read from the start",
+                       "lost": "it never reached a backend"}
+        }
+      }
+    }
+
+    {
+      "answers": {
+        "kind": {"type": "choice", "choice": "cold",
+                 "probabilities": {"warm": 0.04, "cold": 0.93, "lost": 0.03},
+                 "confidence": 0.93, "mass": 0.88}
+      },
+      "usage": {"input_tokens": 88, "output_tokens": 1},
+      "router": {"backend": "cpu1_0", "read": 12, "reused": 76, "took": 1.9,
+                 "questions": [{"question": "kind", "read": 4, "reused": 84}]}
+    }
+
+Three types of question:
+
+| `type` | `criteria` | what comes back |
+|---|---|---|
+| `choice` | an object of answer name to what it means | `choice`, the name that won |
+| `score` | a list of levels, lowest first | `score`, the expected level, so it lands between them |
+| `noul` | none | `noul`, the probability that the answer is yes |
+
+The router gives every answer a letter, asks for one token, and maps the letter
+back to the name. One token carries 26 answers at most, and it refuses more.
+
+`state` is text, or any json value. A client usually holds a record rather than
+a paragraph, so an object is rendered once and every question is asked about
+the same rendering. A `noul` may carry `criteria` as well: it still answers yes
+or no, and the two entries say what yes and no stand for.
+
+`confidence` is the top probability, scaled so the answers sum to one. It is
+not calibrated: a higher number has not been shown to mean a higher chance of
+being right. Read it as a margin against the runner-up, not as a percentage.
+
+`mass` is what those answers held **before** that scaling. The grammar decides
+which token is written, but the probabilities llama.cpp reports are a plain
+softmax taken before it, over the whole vocabulary. So they include words no
+answer stands for, and the router drops those and scales up what is left.
+
+Read `mass` first. Near 1 the model was answering the question. Near 0 it was
+going to write something else, the grammar made it write a letter anyway, and
+the probabilities above are the little that was left. How near either end a
+given model sits is the model's own business; what moves it most is whether
+the chat template is reasoning. The router asks for thinking off, and a model
+whose template ignores that will report a mass near zero.
+
+A call may carry several questions. The state is read once, and each question
+is asked against the slot that already holds it, so a question costs its own
+words and one token rather than another reading of the state.
+`router.questions` says what each one cost, by the backend's own count, which
+is the number to look at rather than any figure written here.
+
+Try them on the dashboard's **try it out** page first.
+
+Two things to know before sending a large state:
+
+- The reply is not streamed, and nothing is sent until every question is
+  answered. A state of a hundred thousand tokens reads for as long as any other
+  prompt of that size, so give the client a long timeout.
+- The turn queues like any other. It is not allowed to skip ahead, because how
+  long it will take is not knowable before its state is read.
 
 ## What it needs
 

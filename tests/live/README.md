@@ -61,6 +61,71 @@ Measured with the hybrid model. Every figure is the backend's own.
 | 7 | `?action=save` reports `n_written`, and defers while it works. | **True, once the patch is applied.** An empty slot saves under a kilobyte, which is what `PARK_FLOOR` exists to catch. Before the patch, `n_written` was taken before the checkpoint trailer: 49,214,256 for a file of 107,387,528 bytes. Stock llama.cpp writes no trailer, so this passes either way. It catches a half-patched build. |
 | 8 | Two instances must agree on KV layout. | **True, and it is four things.** They must agree on `--kv-unified` (`n_stream mismatch`), on flash attention (`incompatible V transposition`), and on the model (`mismatched layer count`). Context size and slot count need not match, if the state fits: 1491 tokens moved onto 2048 and onto 4 slots, and were refused by 512. Every failure returns the same opaque 400, and the reason appears only in the target's log. |
 
+## The ninth belief: a grammar does not shape what is reported
+
+`/v1/systemone` writes one token under a grammar of single letters, and reads
+the answer out of the probabilities beside it. That rests on a belief worth
+stating on its own, because it is the opposite of what the feature looks like:
+
+**A grammar decides what is written. It does not decide what is reported.**
+
+Before sampling, llama.cpp reports a plain softmax over the whole vocabulary.
+The grammar is not in it. So the same request that is forced to write `A` also
+reports the words it would rather have written, and the answer letters may not
+appear at all. Measured on the hybrid model, one token, `top_logprobs: 14`:
+
+| prompt | what the letters carried |
+|---|---|
+| a rubric, a state, and a lettered question | 0.46 |
+| prose, with no hint that an answer is wanted | 0.0007 |
+
+Two things follow, and both are in the router:
+
+- A confidence taken from these numbers means nothing unless the prompt itself
+  asked for a letter. `/v1/systemone` returns `mass`, the share those letters
+  held, so a caller can tell the two cases apart.
+- Room in the report does not help. Raising `top_logprobs` from 14 to 120
+  moved the share by 0.0002. The letters are near the top or nowhere.
+
+`post_sampling_probs: true` does not fix it and makes it worse: after the
+sampling chain there is nothing left to read. On `/v1/chat/completions` no
+probabilities come back at all, and on `/completion` it is the written token
+at 1.0, every time.
+
+## An open question: a message added after a long one, on production
+
+`/v1/systemone` reads a state once and asks each question against it. The
+obvious split is to read the state alone and let each question extend it. On
+production that cost the first question a full re-read of the state, every
+time. The backend's own prompt evals, one call, three questions, a state of
+348 tokens:
+
+| read pass carries | tokens read, in order | total |
+|---|---|---|
+| the state alone | 348, **351**, 42, 37 | 778 |
+| the state and the first question | 351, **4**, 42, 37 | 434 |
+| the same call again, second way | 46, 4, 42, 37 | 129 |
+
+Adding one message after the state made the shorter prompt worthless, while
+questions two and three rolled back to the end of the state for 42 and 37
+tokens. The router now sends the same prompt in both phases, and
+`tests/test_systemone.py` holds it there.
+
+**Why is not established.** Two explanations were tested here and both are
+wrong:
+
+- *The chat template moves the assistant header, so the shorter prompt is not
+  a prefix.* Falcon-H1 reused 380 of 384, and Qwen3-0.6B reused 380 of 382.
+  Both models, both templates, no re-read.
+- *A rollback that short has no checkpoint to reach.* The same run with
+  production's `--ctx-checkpoints 64 --checkpoint-min-step 2048` reused 380 of
+  384, unchanged.
+
+What production has that these do not is `--spec-type draft-mtp` and a draft
+model. That is the remaining suspect and it is untested: the models here have
+no MTP draft. Until someone reproduces it, there is no test for it, because a
+test that passes on a model which cannot show the fault proves nothing.
+
 ## The belief that was not on the list
 
 llama.cpp defaults to `--cache-idle-slots`. When any task starts, the server

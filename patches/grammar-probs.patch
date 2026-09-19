@@ -1,0 +1,247 @@
+Report the probabilities of the tokens a grammar allows.
+
+A grammar decides what is written. It does not decide what is reported, and
+neither of the two existing readouts gives a caller the distribution over the
+answers it constrained the model to:
+
+  post_sampling_probs false  the softmax over the whole vocabulary, taken
+                             before the sampler. The grammar is not in it, so
+                             a caller has to pick an n_probs large enough to
+                             catch its own answers and renormalise by hand -
+                             and when the model wanted to write something
+                             else, the answers are not in the top n at all.
+
+  post_sampling_probs true   after the sampling chain, where the grammar and
+                             the sampler have already chosen. One token is
+                             left, at 1.0. On the OpenAI chat route nothing
+                             comes back at all.
+
+`grammar_probs` adds the one in between: apply only the grammar to the
+pre-sampler softmax, and report every token that survives, scaled to sum to
+one. The grammar allows a handful of tokens for a classification, so they all
+fit and n_probs does not enter into it.
+
+`grammar_mass` goes with them: what those tokens held before the scaling. It
+is the difference between an answer and a letter the grammar forced out of a
+model that was going to write something else, which the scaled numbers alone
+cannot show. Measured on Qwen3-0.6B with one prompt, changing nothing but the
+chat template's thinking flag: 0.000000 with thinking on, 0.999618 with it
+off. Both wrote the same letter, and both looked like confident answers.
+
+The readout also moves above common_sampler_accept. Accepting advances the
+grammar past the token just chosen, so applying the grammar after it answers
+"what may follow the answer" - for a one-token grammar, end of string. Only
+counters sit between the two.
+
+Three gates on n_probs had to learn about a request that asks for none: the
+call to populate_token_probs, and the partial and final result builders.
+
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -100,6 +100,12 @@
+ // the .sorted flag of the result indicates whether the returned candidates are sorted
+ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort);
+ 
++// Apply only the grammar to a candidate array, giving every token the grammar
++// forbids a logit of -INFINITY. The rest of the sampling chain is left out on
++// purpose: this reads which tokens may be written, without temperature, top-k
++// or greedy deciding between them first.
++void common_sampler_apply_grammar(struct common_sampler * gsmpl, llama_token_data_array * cur_p);
++
+ // get the last accepted token
+ llama_token common_sampler_last(const struct common_sampler * gsmpl);
+ 
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -728,6 +728,11 @@
+ 
+ // helpers
+ 
++void common_sampler_apply_grammar(struct common_sampler * gsmpl, llama_token_data_array * cur_p) {
++    GGML_ASSERT(gsmpl);
++    llama_sampler_apply(gsmpl->grmr, cur_p);
++}
++
+ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
+     const auto tm = gsmpl->tm();
+ 
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -74,6 +74,9 @@
+ 
+     bool timings_per_token   = false;
+     bool post_sampling_probs = false;
++    // Report the distribution over the tokens the grammar allows, rather
++    // than the whole vocabulary before it or the one survivor after it.
++    bool grammar_probs      = false;
+ 
+     struct common_params_sampling sampling;
+     struct common_params_speculative speculative;
+@@ -299,6 +302,7 @@
+ struct completion_token_output {
+     llama_token tok;
+     float prob;
++    float grammar_mass = -1.0f;   // < 0 when grammar_probs was not asked for
+     std::string text_to_send;
+     struct prob_info {
+         llama_token tok;
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -284,7 +284,7 @@
+     for (const auto & p : probs) {
+         std::string txt(p.text_to_send);
+         txt.resize(validate_utf8(txt));
+-        out.push_back(json {
++        json entry = json {
+             {"id",           p.tok},
+             {"token",        txt},
+             {"bytes",        str_to_bytes(p.text_to_send)},
+@@ -296,7 +296,11 @@
+                 post_sampling_probs ? "top_probs" : "top_logprobs",
+                 p.to_json(post_sampling_probs)
+             },
+-        });
++        };
++        if (p.grammar_mass >= 0.0f) {
++            entry["grammar_mass"] = p.grammar_mass;
++        }
++        out.push_back(entry);
+     }
+     return out;
+ }
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -190,6 +190,11 @@
+     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
+         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
+ 
++    add((new field_bool("grammar_probs", params.grammar_probs))
++        ->set_desc("Return the probabilities of the tokens the grammar allows, "
++                   "scaled to sum to one, and the share they held of the "
++                   "distribution before the grammar was applied"));
++
+     //
+     // Speculative decoding params
+     //
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1880,7 +1880,10 @@
+                 return false;
+             }
+ 
+-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
++            // grammar_probs reads the distribution before the sampler too.
++            const bool need_pre_sample_logits =
++                (task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs)
++                || task.params.grammar_probs;
+ 
+             bool use_backend_sampling = task.params.sampling.backend_sampling;
+ 
+@@ -2057,6 +2060,61 @@
+     void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+         const size_t n_probs_request = slot.task->params.sampling.n_probs;
+ 
++        if (slot.task->params.grammar_probs) {
++            // The distribution over what the grammar allows.
++            //
++            // Neither of the branches below gives it. Before the sampler the
++            // probabilities cover the whole vocabulary and the grammar is not
++            // in them, so a caller has to guess an n_probs large enough to
++            // catch its own answers and renormalise by hand - and when the
++            // model wanted to write something else, the answers are not in the
++            // top n at all. After the sampling chain the grammar and the
++            // sampler have already chosen, and one token is left at 1.0.
++            //
++            // So: take the softmax from before the sampler, apply only the
++            // grammar to it, and report every token that survives. There are
++            // as many as the grammar allows, which for a typed question is a
++            // handful, so n_probs does not enter into it.
++            //
++            // `grammar_mass` is what those tokens held before the scaling. It
++            // separates an answer from a letter the grammar forced out of a
++            // model that was busy writing prose, which the scaled numbers on
++            // their own cannot.
++            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, 0);
++            llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++            common_sampler_apply_grammar(slot.smpl.get(), &cur_p);
++
++            float mass = 0.0f;
++            for (size_t i = 0; i < cur_p.size; i++) {
++                if (cur_p.data[i].logit != -INFINITY) {
++                    mass += cur_p.data[i].p;
++                }
++            }
++            result.grammar_mass = mass;
++
++            for (size_t i = 0; i < cur_p.size; i++) {
++                if (cur_p.data[i].logit == -INFINITY) {
++                    continue;
++                }
++                const float scaled = mass > 0.0f ? cur_p.data[i].p / mass : 0.0f;
++                if (cur_p.data[i].id == result.tok) {
++                    result.prob = scaled;
++                }
++                result.probs.push_back({
++                    cur_p.data[i].id,
++                    common_token_to_piece(ctx_tgt, cur_p.data[i].id, special),
++                    scaled
++                });
++            }
++            // Largest first, as the other two branches report them.
++            std::sort(result.probs.begin(), result.probs.end(),
++                      [](const completion_token_output::prob_info & a,
++                         const completion_token_output::prob_info & b) {
++                          return a.prob > b.prob;
++                      });
++            return;
++        }
++
+         if (post_sampling) {
+             const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
+             const size_t max_probs = cur_p->size;
+@@ -2167,7 +2225,7 @@
+         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+ 
+         // populate res.probs_output
+-        if (slot.task->params.sampling.n_probs > 0) {
++        if (slot.task->params.sampling.n_probs > 0 || slot.task->params.grammar_probs) {
+             res->prob_output = tkn; // copy the token probs
+         }
+ 
+@@ -2222,7 +2280,7 @@
+         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+ 
+         // populate res.probs_output
+-        if (slot.task->params.sampling.n_probs > 0) {
++        if (slot.task->params.sampling.n_probs > 0 || slot.task->params.grammar_probs) {
+             if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
+                 const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
+ 
+@@ -3959,8 +4017,6 @@
+ 
+             slot.i_batch = -1;
+ 
+-            common_sampler_accept(slot.smpl.get(), id, true);
+-
+             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+             const int64_t t_now = ggml_time_us();
+ 
+@@ -3979,10 +4035,17 @@
+             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+ 
+-            if (slot.task->params.sampling.n_probs > 0) {
++            // grammar_probs reports every token the grammar allows, so it
++            // asks for no n_probs and must not be gated on one.
++            if (slot.task->params.sampling.n_probs > 0 || slot.task->params.grammar_probs) {
+                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+             }
+ 
++            // After the readout, not before it: accepting advances the grammar
++            // past this token, and grammar_probs asks what the grammar allowed
++            // *here*. Only counters sit between this and the sampling above.
++            common_sampler_accept(slot.smpl.get(), id, true);
++
+             if (!process_token(result, slot)) {
+                 // release slot because of stop condition
+                 slot.print_timings();
