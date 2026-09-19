@@ -4,7 +4,9 @@ A turn walks queued -> prefill -> generate-queue -> generate -> done. The
 recorder keeps one live row per conversation and a newest-first log, so an
 animation can replay transitions that happened between two payload pushes.
 """
+import atexit
 import pathlib
+import shutil
 import sys
 import unittest
 
@@ -28,6 +30,10 @@ class SANDBOX:
     store = router.Store(tempfile.mkdtemp(prefix="router-run-"))
     tuning = router.Tuning()
     events = router.EventLog(on=False)
+
+# Nothing else deletes this. The path is read now rather than at exit, because
+# a case may point SANDBOX.store somewhere else and put it back.
+atexit.register(shutil.rmtree, SANDBOX.store.run, ignore_errors=True)
 
 
 def make_pool(backends, **kw):

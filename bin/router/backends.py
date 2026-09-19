@@ -2,6 +2,7 @@
 
 import json, os, re
 from pathlib import Path
+from .settings import handoff_on
 
 # A prefill is compute bound for tens of minutes. A generation is memory
 # bound for seconds. A `generate`-only instance is a generator: turns
@@ -44,9 +45,10 @@ def read_backend_table(env=None):
             raise SystemExit(f"[router] no backend in {whence} can "
                              f"{job}, so no request could be served")
     # A turn leaves its reader only through the handoff.
-    if env.get("HANDOFF") == "0" and not all(be["generate"] for be in table):
-        raise SystemExit("[router] HANDOFF=0 keeps every turn on the backend "
-                         "that read it, so every backend has to generate")
+    if not handoff_on(env) and not all(be["generate"] for be in table):
+        raise SystemExit("[router] the handoff is off, which keeps every turn "
+                         "on the backend that read it, so every backend has "
+                         "to generate")
     return table, whence
 
 

@@ -19,8 +19,10 @@ import urllib.request
 from ..transport import http_post, http_post_wanted
 
 # A read-only endpoint answers at once or the backend is in trouble. A slot
-# file takes as long as the slot takes.
+# file takes as long as the slot takes. Pool hands in Tuning.post_timeout.
+# This default is for a Link built on its own.
 LOOK_TIMEOUT = 3.0
+POST_TIMEOUT = 300.0
 
 
 class Link:
@@ -33,8 +35,9 @@ class Link:
     caller to stream.
     """
 
-    def __init__(self, look_timeout=LOOK_TIMEOUT):
+    def __init__(self, look_timeout=LOOK_TIMEOUT, post_timeout=POST_TIMEOUT):
         self.look_timeout = look_timeout
+        self.post_timeout = post_timeout
 
     # -- what a backend says about itself
 
@@ -52,17 +55,20 @@ class Link:
 
     def save(self, be, slot, name, timeout=None):
         return http_post(be["url"], f"/slots/{slot}?action=save",
-                         {"filename": name}, timeout or 300.0)
+                         {"filename": name},
+                         self.post_timeout if timeout is None else timeout)
 
     def restore(self, be, slot, name, timeout=None):
         return http_post(be["url"], f"/slots/{slot}?action=restore",
-                         {"filename": name}, timeout or 300.0)
+                         {"filename": name},
+                         self.post_timeout if timeout is None else timeout)
 
     # -- work
 
     def render(self, be, route, payload, timeout=None):
         """What the backend's own template makes of these messages."""
-        return http_post(be["url"], route, payload, timeout or 300.0)
+        return http_post(be["url"], route, payload,
+                         self.post_timeout if timeout is None else timeout)
 
     def prefill(self, be, block, slot, timeout=None):
         """Read a block into a slot and generate nothing. The reply's timings
@@ -70,7 +76,7 @@ class Link:
         return http_post(be["url"], "/completion",
                          {"prompt": block, "n_predict": 0,
                           "cache_prompt": True, "id_slot": slot},
-                         timeout or 300.0)
+                         self.post_timeout if timeout is None else timeout)
 
     def read(self, be, path, payload, alive, timeout):
         """Read a prompt and stop when the client stops waiting. Raises Gone."""

@@ -4,7 +4,6 @@ import json, os, shutil
 from pathlib import Path
 from collections import OrderedDict
 from ..identity import SHELF_MARKS
-from ..settings import Tuning
 
 class Store:
     """Everything one run keeps on disk: the parked copies, the openings,

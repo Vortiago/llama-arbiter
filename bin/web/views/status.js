@@ -91,7 +91,8 @@ export function readerBeside(be, slot) {
 }
 
 /** Seconds until a reading slot finishes. Null until its rate resolves (10 second window).
- * `prompt` is what is still to read: router.py sets it to `whole - cached - processed`.
+ * `prompt` is what is still to read: Pool._read_slots sets it to
+ * `whole - cached - processed`.
  * Do not subtract `done` from it. `done` routinely exceeds it, which leaves this always null.
  * @param {Slot} slot @returns {number | null} */
 export function secondsLeft(slot) {

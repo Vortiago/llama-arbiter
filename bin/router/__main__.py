@@ -7,7 +7,7 @@ from .pool.pool import Pool
 from .settings import Tuning
 from .store.events import EventLog
 from .store.files import Store
-from .web.handler import Handler
+from .web.handler import Handler, passed_paths
 from .web.server import Server, Stamped
 
 def build(env=None):
@@ -24,7 +24,9 @@ def build(env=None):
                   env.get("BLOCK_DIR"))
     events = EventLog(env.get("CACHE_LOG_DIR") or store.run, on=tuning.cache_log)
     table, whence = read_backend_table(env)
-    pool = Pool(table, store=store, tuning=tuning, events=events)
+    pool = Pool(table, store=store, tuning=tuning, events=events,
+                capture_dir=Path(env["CAPTURE"]) if env.get("CAPTURE")
+                else None)
     return pool, whence
 
 
@@ -71,4 +73,5 @@ if __name__ == "__main__":
     print(f"[router] listening on {args.host}:{args.port}", flush=True)
     server = Server((args.host, args.port), Handler)
     server.pool = POOL
+    server.passed = passed_paths()
     server.serve_forever()

@@ -4,7 +4,9 @@ A turn runs against a Client and a Link, so these need no socket. The Client
 is whoever asked; the Link is the one way to a backend. Both are stood in for
 here, which is what lets a whole turn run in this process.
 """
+import atexit
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -23,6 +25,10 @@ class SANDBOX:
     store = router.Store(tempfile.mkdtemp(prefix="router-turn-"))
     tuning = router.Tuning()
     events = router.EventLog(on=False)
+
+# Nothing else deletes this. The path is read now rather than at exit, because
+# a case may point SANDBOX.store somewhere else and put it back.
+atexit.register(shutil.rmtree, SANDBOX.store.run, ignore_errors=True)
 
 
 class FakeClient:
@@ -243,6 +249,7 @@ class ATurnWritesDownWhatTheClientSent(unittest.TestCase):
 
     def test_the_body_reaches_the_capture_directory(self):
         room = Path(tempfile.mkdtemp(prefix="router-capture-"))
+        self.addCleanup(shutil.rmtree, room, ignore_errors=True)
         pool = one_backend(capture_dir=room)
         body = prompt(10)
 

@@ -7,6 +7,7 @@ on real sockets, so the threads, the timing and the files are real.
 Offline and deterministic: every slow step in the stub is measured in
 milliseconds, so the file runs in a few seconds.
 """
+import atexit
 import http.client
 import json
 import shutil
@@ -42,6 +43,10 @@ class SANDBOX:
     tuning = router.Tuning()
     events = router.EventLog(on=False)
 
+# Nothing else deletes this. The path is read now rather than at exit, because
+# a case may point SANDBOX.store somewhere else and put it back.
+atexit.register(shutil.rmtree, SANDBOX.store.run, ignore_errors=True)
+
 
 def make_pool(backends, **kw):
     """A Pool wired to the sandbox. A case that wants another store, tuning or
@@ -53,7 +58,7 @@ def make_pool(backends, **kw):
 from fake_backend import FakeBackend
 
 # A system prompt long enough that prompt_cuts names a cut in it. Below
-# PREFIX_MIN_CHARS the router writes down no opening at all.
+# Tuning.prefix_min_chars the router writes down no opening at all.
 LONG_SYSTEM = "You follow these rules. " * 400          # about 9600 characters
 
 # How long a test waits on another thread. Generous, because it is reached
@@ -261,17 +266,20 @@ class EndToEnd(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(PATIENCE)
-        # A loop only meets its bomb when it comes round, so shorten the wait
-        # whatever the test had set it to.
-        SANDBOX.tuning = replace(SANDBOX.tuning, poll=0.02, build_poll=0.02)
+        # A loop only meets its bomb when it comes round, so shorten the
+        # wait whatever the test had set it to.
         for pool in self.pools:
+            # The pool took its tuning when it was built, so shortening the
+            # sandbox's reaches no running loop. Shorten each pool's own, and
+            # do it before the bombs go in.
+            pool.tuning = replace(pool.tuning, poll=0.02, build_poll=0.02)
             pool.build_once = Bomb()
             pool.cv = Bomb()
         alive = not wait_for(lambda: not pool_threads(), patience=5.0)
         for stub in self.stubs:
             stub.stop()
         for name, value in self.kept.items():
-            setattr(router, name, value)
+            setattr(SANDBOX, name, value)
         shutil.rmtree(self.root, ignore_errors=True)
         self.assertEqual(stuck, [], "a test thread never finished")
         self.assertFalse(alive, f"pool threads outlived the test: {pool_threads()}")

@@ -171,7 +171,8 @@ class Turn:
             recalled = pool.recall(conv, be, slot)
             loaded = (not recalled
                       and pool.warm_prefix(conv, cuts, messages, system, tools,
-                                           be, slot, ask.path))
+                                           be, slot, ask.path,
+                                           wanted=client.alive))
             # warm_prefix was the last reader of these three, and each holds
             # a parsed copy of the prompt: about three times the bytes it
             # came from. The read below runs for tens of minutes.

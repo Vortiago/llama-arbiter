@@ -7,9 +7,11 @@ class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    # What a Handler reads. __main__ sets these from build(); a test sets the
-    # pool and leaves the rest. They are here rather than in the module so
-    # that two servers in one process cannot share them by accident.
+    # What a Handler reads. __main__ sets the pool and the pass-through
+    # list; a test sets the pool and leaves the rest, and `provider` unset
+    # means client_config names the machine itself. They are here rather than
+    # in the module so that two servers in one process cannot share them by
+    # accident.
     pool = None
     passed = PASSED
     provider = None

@@ -1,36 +1,52 @@
 """Rewriting a backend's stream on its way to the client."""
 
-import json
+import json, re
 from .sse import read_event, sse_event
 
-class AnthropicSplice:
-    """Join a backend's stream onto one the router has already opened.
+# SSE ends an event with a blank line. The backends write \n\n, and sse.py
+# reads \r\n as well, so the framer has to: splitting on \n\n alone holds a
+# CRLF stream back whole, and tail() then hands it to the client unspliced.
+EVENT_END = re.compile(rb"\r?\n\r?\n")
 
-    The backend's message_start must come out: two in one stream break every
-    parser. Its prompt token count moves onto the closing message_delta."""
+
+class Splice:
+    """A backend's stream, rewritten one whole event at a time.
+
+    feed() holds back a partial event, so that half a `data:` line never
+    reaches the client. What a whole one becomes is _one()'s business."""
 
     def __init__(self):
         self.rest = b""
-        self.usage = None
-        # What the client ends up seeing.
-        self.reported = {}
 
     def feed(self, chunk):
         """What to pass on for this piece of the backend's stream."""
         self.rest += chunk
         out = []
         while True:
-            event, sep, rest = self.rest.partition(b"\n\n")
-            if not sep:
+            end = EVENT_END.search(self.rest)
+            if not end:
                 break
-            self.rest = rest
-            out.append(self._one(event + sep))
+            event, self.rest = self.rest[:end.end()], self.rest[end.end():]
+            out.append(self._one(event))
         return b"".join(out)
 
     def tail(self):
         """Whatever was left when the stream ended."""
         last, self.rest = self.rest, b""
         return last
+
+
+class AnthropicSplice(Splice):
+    """Join a backend's stream onto one the router has already opened.
+
+    The backend's message_start must come out: two in one stream break every
+    parser. Its prompt token count moves onto the closing message_delta."""
+
+    def __init__(self):
+        super().__init__()
+        self.usage = None
+        # What the client ends up seeing.
+        self.reported = {}
 
     def _one(self, raw):
         name, data = read_event(raw)
@@ -39,7 +55,7 @@ class AnthropicSplice:
                 self.usage = (data.get("message") or {}).get("usage") or {}
                 self.reported.update(self.usage)
             return b""
-        if name == "message_delta" and self.usage:
+        if name == "message_delta" and self.usage is not None:
             # The backend's own generation figures win.
             data["usage"] = merged = dict(self.usage, **(data.get("usage") or {}))
             self.reported.update(merged)
@@ -78,35 +94,20 @@ def with_usage(body):
         return None
 
 
-class OaiUsageSplice:
+class OaiUsageSplice(Splice):
     """Read the usage figures out of an openai stream as they pass. The
     chunk carrying them has no choices, so it can be removed."""
 
     def __init__(self, strip=False):
-        self.rest = b""
+        super().__init__()
         self.strip = strip
         self.usage = {}
 
-    def feed(self, chunk):
-        self.rest += chunk
-        out = []
-        while True:
-            event, sep, rest = self.rest.partition(b"\n\n")
-            if not sep:
-                break
-            self.rest = rest
-            out.append(self._one(event + sep))
-        return b"".join(out)
-
-    def tail(self):
-        last, self.rest = self.rest, b""
-        return last
-
     def _one(self, raw):
         line = raw.strip()
-        if line.startswith(b"data: ") and b'"usage"' in line:
+        if line.startswith(b"data:") and b'"usage"' in line:
             try:
-                obj = json.loads(line[6:])
+                obj = json.loads(line[5:])
             except ValueError:
                 return raw
             if obj.get("choices") == [] and obj.get("usage"):

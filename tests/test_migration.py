@@ -2,6 +2,7 @@
 one backend to another. It is a pure function, so these need no server and no
 network.
 """
+import atexit
 import base64
 import io
 import json
@@ -41,6 +42,10 @@ class SANDBOX:
     store = router.Store(tempfile.mkdtemp(prefix="router-run-"))
     tuning = router.Tuning()
     events = router.EventLog(on=False)
+
+# Nothing else deletes this. The path is read now rather than at exit, because
+# a case may point SANDBOX.store somewhere else and put it back.
+atexit.register(shutil.rmtree, SANDBOX.store.run, ignore_errors=True)
 
 
 def make_pool(backends, **kw):
@@ -2941,7 +2946,9 @@ class TheBackendTableIsCheckedAtStartup(unittest.TestCase):
 
     def loading(self, table):
         """Read this table the way the router does. Returns (code, output)."""
-        path = Path(tempfile.mkdtemp(prefix="router-table-")) / "backends.json"
+        room = Path(tempfile.mkdtemp(prefix="router-table-"))
+        self.addCleanup(shutil.rmtree, room, ignore_errors=True)
+        path = room / "backends.json"
         path.write_text(json.dumps(table))
         try:
             router.read_backend_table({"ROUTER_BACKENDS": str(path)})
@@ -3788,6 +3795,12 @@ class ReadOnly(unittest.TestCase):
     def test_ignores_a_body_that_is_not_a_request(self):
         self.assertIsNone(router.read_only(b"not json"))
         self.assertIsNone(router.read_only(b"[1,2]"))
+
+    def test_naming_a_conversation_ignores_one_too(self):
+        # A body that is not an object reached the public port and raised
+        # before any status line went out.
+        for body in (b"not json", b"[1,2]", b"null", b'"hi"', b"5", b"true"):
+            self.assertIsNone(router.conversation_id(body), body)
 
 
 class HandOff(unittest.TestCase):

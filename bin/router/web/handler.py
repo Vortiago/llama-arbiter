@@ -34,11 +34,11 @@ INFERENCE = {
 # An allowlist. The backends run with --agent, which is shell and file
 # access with no key. A path not named here must never be reachable from
 # the public port. PASS_THROUGH adds to it, comma separated.
-PASSED = {
+PASSED = frozenset({
     "/health", "/props", "/slots", "/models", "/v1/models",
     "/tokenize", "/detokenize", "/apply-template",
     "/v1/messages/count_tokens", "/v1/messages/apply-template",
-}
+})
 
 
 DROP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "te", "trailers",
@@ -473,7 +473,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # A client drops a stream quiet for five minutes.
             sending = self.sending or threading.Lock()
             done = threading.Event()
-            last = [time.time()]
+            last = [time.monotonic()]
 
             def put(data):
                 if length:
@@ -481,11 +481,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
                 self.wfile.flush()
-                last[0] = time.time()
+                last[0] = time.monotonic()
 
             def keep_alive():
                 while not done.wait(1.0):
-                    if time.time() - last[0] < self.server.pool.tuning.ping_every:
+                    if time.monotonic() - last[0] < self.server.pool.tuning.ping_every:
                         continue
                     with sending:
                         if done.is_set():
@@ -507,7 +507,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             try:
                 while True:
-                    chunk = read(8192)
+                    try:
+                        chunk = read(8192)
+                    except (BrokenPipeError, ConnectionResetError) as err:
+                        # This side is the backend. A reset here must not reach
+                        # the clause that means the client left: that one ends
+                        # the stream without its terminator, and the client
+                        # then waits out its own idle timeout.
+                        raise http.client.HTTPException(
+                            f"reset mid-reply: {err}") from err
                     if not chunk:
                         break
                     if splice:

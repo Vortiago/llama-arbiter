@@ -5,6 +5,7 @@ rules it plays by are the behaviour under test: a line per event, nothing
 that can block a request, no prompt text, and every hook writing what its
 call site actually decided.
 """
+import atexit
 import json
 import shutil
 import sys
@@ -33,6 +34,10 @@ class SANDBOX:
     store = router.Store(tempfile.mkdtemp(prefix="router-run-"))
     tuning = router.Tuning()
     events = router.EventLog(on=False)
+
+# Nothing else deletes this. The path is read now rather than at exit, because
+# a case may point SANDBOX.store somewhere else and put it back.
+atexit.register(shutil.rmtree, SANDBOX.store.run, ignore_errors=True)
 
 
 class QuietLink:

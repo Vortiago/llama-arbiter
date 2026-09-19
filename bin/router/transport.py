@@ -73,7 +73,7 @@ def http_post_wanted(url, path, payload, timeout, wanted, every=2.0):
                 pass                   # already gone
             conn.close()               # the backend cancels the task
             thread.join(10)
-            raise Gone("the client stopped waiting")
+            raise Gone("while its prompt was being read")
     conn.close()
     if "error" in got:
         raise got["error"]

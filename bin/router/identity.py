@@ -9,6 +9,9 @@ def conversation_id(body):
         req = json.loads(body)
     except Exception:
         return None
+    # A body that is not an object raised before any status line went out.
+    if not isinstance(req, dict):
+        return None
 
     messages = req.get("messages")
     if isinstance(messages, list):
@@ -91,7 +94,8 @@ def session_key(headers):
 
 def client_kind(headers):
     """Which client sent this, by its user agent, or None."""
-    agent = (dict(headers).get("User-Agent") or "").lower()
+    lower = {str(name).lower(): value for name, value in dict(headers).items()}
+    agent = (lower.get("user-agent") or "").lower()
     if "claude" in agent:
         return "claude-code"
     if "opencode" in agent:

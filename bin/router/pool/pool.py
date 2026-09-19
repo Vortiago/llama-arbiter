@@ -54,8 +54,9 @@ class Pool:
         where a live router keeps its caches."""
         self.cv = threading.Condition()
         self.store = store
-        # Where a turn writes down what the client sent, or None. Nothing
-        # sets it yet: captures are for comparing two turns by hand.
+        # Where a turn writes down what the client sent, or None. build()
+        # sets it from CAPTURE: captures are for comparing two turns by
+        # hand.
         self.capture_dir = capture_dir
         self.tuning = tuning or Tuning()
         # Off unless a caller hands in a live one, so that building a Pool
@@ -63,7 +64,7 @@ class Pool:
         self.events = events or EventLog(on=False)
         # Every call to a backend goes through here. A test hands in a Link
         # that answers without a socket.
-        self.link = link or Link()
+        self.link = link or Link(post_timeout=self.tuning.post_timeout)
         self.backends = [dict(b, slots=1, n_ctx=0, busy=0, up=False, served=0, model="",
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
                               cache={}, idle_runs={}, draining=False)
@@ -960,7 +961,7 @@ class Pool:
         return True
 
     def warm_prefix(self, conv, cuts, messages, system, tools, be, slot,
-                    path):
+                    path, wanted=None):
         """Load the opening this request shares into a slot on this backend.
         Only an opening the router already has: that is a file read. An
         opening the router lacks is written down for the builder. Returns
@@ -976,19 +977,18 @@ class Pool:
 
             base = cuts[0]
             # The first cut is a system prompt by construction.
-            wanted = base[1] not in saved
+            unsaved = base[1] not in saved
             # Nobody has this opening: one request reads it, the others wait.
             plan = None
             if stored:
                 plan = ("load", stored[1], saved[stored[1]], slot)
-            elif wanted:
+            elif unsaved:
                 if base[1] in self.building:
                     plan = ("wait", base[1], None, None)
                 else:
-                    self.building[base[1]] = time.time()
                     plan = ("read", base[1], None, slot)
             # Every new session wants the base, unless it is being read now.
-            if wanted and plan is None:
+            if unsaved and plan is None:
                 self.note_want(base, "base-", system, tools,
                                messages[:base[0] + 1], path)
             # Deeper only past what is saved, where a slot holds it.
@@ -1055,11 +1055,18 @@ class Pool:
 
             if plan is None:
                 return False
+            # Committed here, not where the plan is chosen: the lock is held
+            # throughout, so no second turn can plan a read, and nothing that
+            # raises then sits between this and the finally that pops it. A
+            # key left behind makes every later conversation with this
+            # system prompt wait build_patience for a read nobody is doing.
+            if plan[0] == "read":
+                self.building[plan[1]] = time.time()
 
         if plan[0] == "load":
             return self._load_prefix(plan[1], plan[2], be, plan[3])
         if plan[0] == "wait":
-            return self._wait_for_opening(plan[1], be, slot)
+            return self._wait_for_opening(plan[1], be, slot, wanted)
         try:
             return self._read_prefix(base, messages, system, tools, be,
                                      plan[3], self.store.drop, "base-",
@@ -1069,13 +1076,16 @@ class Pool:
                 self.building.pop(plan[1], None)
                 self.cv.notify_all()
 
-    def _wait_for_opening(self, key, be, slot):
+    def _wait_for_opening(self, key, be, slot, wanted=None):
         """Wait for another request to save the opening, then load it.
         Measured: five sessions starting together read 92,000 tokens where
         24,000 would do, and the last finished after seventeen minutes."""
         deadline = time.time() + self.tuning.build_patience
         with self.cv:
             while key in self.building and time.time() < deadline:
+                if wanted is not None and not wanted():
+                    return False    # this wait holds a prefill slot, and
+                                    # there is nobody left to read for
                 self.cv.wait(1.0)
             name = self.openings.get(key)
             if not name:
@@ -1116,12 +1126,14 @@ class Pool:
             key, want = next(reversed(self.wants.items()))
             be["busy"] += 1
 
-        # The builder is the second way into a slot. Reading an opening over
-        # a finished conversation's only cache lost that cache while the pin
-        # still said the slot was held. idle_polls makes that rarer only.
-        self.ensure_parked(be, None, remove)
-        began = time.time()
         try:
+            # The builder is the second way into a slot. Reading an opening
+            # over a finished conversation's only cache lost that cache while
+            # the pin still said the slot was held. idle_polls makes that
+            # rarer only. Inside the try: the finally below is the only thing
+            # that gives the slot back and drops the want.
+            self.ensure_parked(be, None, remove)
+            began = time.time()
             kept = self._read_prefix(want["cut"], want["head"], want["system"],
                                      want.get("tools") or [], be, slot,
                                      remove, want["mark"], want["path"])
@@ -1251,7 +1263,9 @@ class Pool:
             self.cv.notify_all()
 
         while True:
-            free = self._wait_to_generate(target, wanted)
+            # None once the generator went away and no other has come back:
+            # _wait_to_generate reads target["up"].
+            free = None if target is None else self._wait_to_generate(target, wanted)
             if free is not None:
                 break
             if wanted is not None and not wanted():
@@ -1352,6 +1366,10 @@ class Pool:
             record = self.pins.get(conv) if conv else None
             if not record or record["slot"] is None:
                 return False
+            if record["inflight"]:
+                return False               # park_all is writing it now, and
+                                           # two saves of one conversation
+                                           # write the same file at once.
             slot = record["slot"]
             record["inflight"] = True      # hold it still while it copies
             if self.parker is None:

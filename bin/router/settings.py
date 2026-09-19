@@ -3,6 +3,16 @@
 import os
 from dataclasses import dataclass
 
+def handoff_on(env=None):
+    """Whether a turn may move to another backend.
+
+    One reader, so every spelling that turns the handoff off also trips the
+    startup guard in backends.py. That guard catches a table with nothing
+    left to generate on."""
+    env = os.environ if env is None else env
+    return env.get("HANDOFF", "1") == "1"
+
+
 @dataclass(frozen=True)
 class Tuning:
     """The numbers this router was tuned to, and where each one came from.
@@ -103,6 +113,6 @@ class Tuning:
         return cls(
             park_budget=int(float(env.get("PARK_BUDGET_GB") or 256) * 1024 ** 3),
             block_budget=int(float(env.get("BLOCK_BUDGET_GB") or 64) * 1024 ** 3),
-            handoff=env.get("HANDOFF", "1") == "1",
+            handoff=handoff_on(env),
             deep_openings=env.get("DEEP_OPENINGS", "0") == "1",
             cache_log=env.get("CACHE_LOG", "1") == "1")

@@ -234,13 +234,16 @@ class LiveRouter(LiveCase):
             server.shutdown()
             server.server_close()
             thread.join(PATIENCE)
-        SANDBOX.tuning = replace(SANDBOX.tuning, poll=0.02, build_poll=0.02)
         for pool in self.pools:
+            # The pool took its tuning when it was built, so shortening the
+            # sandbox's reaches no running loop. Shorten each pool's own, and
+            # do it before the bombs go in.
+            pool.tuning = replace(pool.tuning, poll=0.02, build_poll=0.02)
             pool.build_once = Bomb()
             pool.cv = Bomb()
         alive = not wait_for(lambda: not pool_threads(), patience=10.0)
         for name, value in self.kept.items():
-            setattr(router, name, value)
+            setattr(SANDBOX, name, value)
         self.assertEqual(stuck, [], "a test thread never finished")
         self.assertFalse(alive, f"pool threads outlived the test: {pool_threads()}")
 
