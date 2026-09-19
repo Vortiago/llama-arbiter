@@ -42,24 +42,54 @@ patches=("$ROOT"/patches/*.patch)
 shopt -u nullglob
 (( ${#patches[@]} )) || die "no patches in $ROOT/patches"
 
+# The router does not work without these three. patches/README.md says why.
+# The rest are worth having and are not worth stopping for.
+REQUIRED=(slot-state-carries-checkpoints slots-report-the-prompt-size
+          anthropic-pass-id-slot)
+
+required() {
+  local want name=${1%.patch}
+  for want in "${REQUIRED[@]}"; do [[ $name == "$want" ]] && return 0; done
+  return 1
+}
+
 # Reverse-check first: an already-applied patch is a re-run, not a failure.
 # A patch that neither applies nor un-applies means upstream has moved.
+#
+# Every patch is tried, and the verdict comes at the end. Stopping at the first
+# failure hid a worse one: the patches are applied in name order, so an
+# optional patch that had gone stale ended the run before the two required ones
+# after it were tried at all. The build then failed for a patch nobody needed.
 applied=0 already=0
+missing_required=() missing_optional=()
 for patch in "${patches[@]}"; do
   name=${patch##*/}
   if git apply --reverse --check "$patch" 2>/dev/null; then
     already=$(( already + 1 )); echo "    $name - already applied"
   elif git apply "$patch" 2>/dev/null; then
     applied=$(( applied + 1 )); echo "    $name - applied"
+  elif required "$name"; then
+    missing_required+=("$name"); echo "    $name - DOES NOT APPLY (required)"
   else
-    die "$name does not apply to $(git rev-parse --short HEAD).
-    Upstream has moved under it. Pin a commit that works with LLAMA_REF, or
-    rebase the patch; patches/README.md says what each one changes and why.
-    The ones before it are applied and stay that way - running this again
-    picks up where it stopped rather than doing them twice."
+    missing_optional+=("$name"); echo "    $name - does not apply (optional, skipped)"
   fi
 done
 say "$applied applied, $already already in the tree"
+
+if (( ${#missing_optional[@]} )); then
+  echo "    ${#missing_optional[@]} optional patch(es) skipped: ${missing_optional[*]}"
+  echo "    The build goes on without them. patches/README.md says what each one"
+  echo "    changes, and rebasing one is usually a context conflict, not a real one."
+fi
+
+if (( ${#missing_required[@]} )); then
+  die "these required patches do not apply to $(git rev-parse --short HEAD):
+      ${missing_required[*]}
+    The router does not work without them. Upstream has moved underneath.
+    Pin a commit that works with LLAMA_REF, or rebase the patch;
+    patches/README.md says what each one changes and why. Everything that
+    did apply stays applied - running this again picks up where it stopped."
+fi
 
 if [[ ${BUILD:-1} != 1 ]]; then
   say "BUILD=0, so stopping here. To build it:"

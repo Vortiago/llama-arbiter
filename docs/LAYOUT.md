@@ -1,9 +1,10 @@
 # What the defaults are based on
 
-The numbers in the launch scripts and in `bin/router.py` are measured, not
-guessed. They are also not laws. This page gives the measurement behind each
-one, in three groups: properties of llama.cpp, properties of Linux, and figures
-that belong to one machine. That machine has two Xeon sockets and an A4000.
+The numbers in the launch scripts and in `bin/router/settings.py` are measured,
+not guessed. They are also not laws. This page gives the measurement behind
+each one, in three groups: properties of llama.cpp, properties of Linux, and
+figures that belong to one machine. That machine has two Xeon sockets and an
+A4000.
 
 ## llama.cpp and the model
 

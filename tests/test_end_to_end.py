@@ -7,9 +7,9 @@ on real sockets, so the threads, the timing and the files are real.
 Offline and deterministic: every slow step in the stub is measured in
 milliseconds, so the file runs in a few seconds.
 """
+import atexit
 import http.client
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -20,29 +20,45 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# The cache event log is on by default and writes into run/. A test must not
-# add lines a real run would read as its own, so it stays off unless the test
-# is about the log and sets the variables itself.
-os.environ.setdefault("CACHE_LOG", "0")
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pathlib
+from dataclasses import replace
 import router
 
-# The same reasoning as CACHE_LOG above, for the slot directory. SLOT_DIR is a
-# module global, so a case that forgets to redirect it reads and writes inside
-# the checkout's own run/slots - where a live router keeps conversation caches
-# worth hundreds of gigabytes, and where a stray pins.json is adopt()'s
-# instruction to delete every copy it does not name. One sandbox for the whole
-# run, under the temporary directory; a case wanting its own still redirects.
-router.SLOT_DIR = pathlib.Path(tempfile.mkdtemp(prefix="router-slots-"))
-router.BLOCK_DIR = router.SLOT_DIR / "blocks"
+class SANDBOX:
+    """What this test run is wired to.
+
+    A Pool is handed its store, its tuning and its event log, so there is no
+    module state to redirect and nothing to put back. One sandbox serves the
+    whole file, under the temporary directory, and a case wanting its own
+    builds another. Without this a case would reach the checkout's own
+    run/slots, where a live router keeps parked copies worth hundreds of
+    gigabytes and a stray pins.json tells adopt() to delete every copy it does
+    not name.
+    """
+
+    store = router.Store(tempfile.mkdtemp(prefix="router-run-"))
+    tuning = router.Tuning()
+    events = router.EventLog(on=False)
+
+# Nothing else deletes this. The path is read now rather than at exit, because
+# a case may point SANDBOX.store somewhere else and put it back.
+atexit.register(shutil.rmtree, SANDBOX.store.run, ignore_errors=True)
+
+
+def make_pool(backends, **kw):
+    """A Pool wired to the sandbox. A case that wants another store, tuning or
+    event log passes it, and that one wins."""
+    kw.setdefault("store", SANDBOX.store)
+    kw.setdefault("tuning", SANDBOX.tuning)
+    kw.setdefault("events", SANDBOX.events)
+    return router.Pool(backends, **kw)
 from fake_backend import FakeBackend
 
 # A system prompt long enough that prompt_cuts names a cut in it. Below
-# PREFIX_MIN_CHARS the router writes down no opening at all.
+# Tuning.prefix_min_chars the router writes down no opening at all.
 LONG_SYSTEM = "You follow these rules. " * 400          # about 9600 characters
 
 # How long a test waits on another thread. Generous, because it is reached
@@ -126,26 +142,19 @@ class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="router-e2e-"))
         (self.root / "slots").mkdir()
-        self.kept = {name: getattr(router, name) for name in
-                     ("SLOT_DIR", "BLOCK_DIR", "RUN_DIR", "POLL",
-                      "BUILD_POLL", "PIN_PATIENCE", "PARK_ALL_TIMEOUT",
-                      "HANDOFF_ON", "PING_EVERY")}
-        # These tests are about the move, so they turn it on whatever the
-        # shipped default is.
-        router.HANDOFF_ON = True
-        self.had_pool = getattr(router, "POOL", None)
-        router.SLOT_DIR = self.root / "slots"
-        router.BLOCK_DIR = self.root / "blocks"
+        self.kept = {name: getattr(SANDBOX, name) for name in
+                     ("store", "tuning")}
         # No <name>.log is written here on purpose. CacheWatch has to survive
         # a backend whose log it cannot find.
-        router.RUN_DIR = self.root
+        SANDBOX.store = router.Store(self.root)
         # The stub answers at once, so polling fast is free. Every loop has to
         # come round quickly, because that is also how the cleanup stops it.
-        router.POLL = 0.05
-        router.BUILD_POLL = 0.05
-        router.PIN_PATIENCE = 0.3       # a pin worth 20 seconds in production
-                                        # is worth a fraction of one here.
-        router.PARK_ALL_TIMEOUT = 5.0
+        # A pin worth 20 seconds in production is worth a fraction of one
+        # here. handoff is on whatever the shipped default is, because these
+        # tests are about the move.
+        SANDBOX.tuning = replace(SANDBOX.tuning, poll=0.05, build_poll=0.05,
+                                pin_patience=0.3, park_all_timeout=5.0,
+                                handoff=True)
 
         self.stubs = []
         self.pools = []
@@ -157,6 +166,8 @@ class EndToEnd(unittest.TestCase):
 
     def stub(self, name, pref, prefill=True, generate=True, **kw):
         """Start one stub backend and return the spec the Pool takes."""
+        kw.setdefault("store", SANDBOX.store)
+        kw.setdefault("park_floor", SANDBOX.tuning.park_floor)
         backend = FakeBackend(name=name, **kw)
         self.stubs.append(backend)
         setattr(self, name, backend)
@@ -165,7 +176,7 @@ class EndToEnd(unittest.TestCase):
 
     def pool(self, specs, watch=True):
         """Build a Pool and wait until it has seen every backend."""
-        made = router.Pool(specs, watch=watch)
+        made = make_pool(specs, watch=watch)
         self.pools.append(made)
         if watch:
             self.assertTrue(
@@ -175,8 +186,10 @@ class EndToEnd(unittest.TestCase):
 
     def serve(self, pool):
         """Put the real Handler in front of this pool. Returns its base url."""
-        router.POOL = pool
         server = router.Server(("127.0.0.1", 0), router.Handler)
+        # The Handler reads the pool off its own server, so two servers in one
+        # process cannot take each other's.
+        server.pool = pool
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.servers.append((server, thread))
@@ -253,18 +266,20 @@ class EndToEnd(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(PATIENCE)
-        # A loop only meets its bomb when it comes round, so shorten the wait
-        # whatever the test had set it to.
-        router.POLL = router.BUILD_POLL = 0.02
+        # A loop only meets its bomb when it comes round, so shorten the
+        # wait whatever the test had set it to.
         for pool in self.pools:
+            # The pool took its tuning when it was built, so shortening the
+            # sandbox's reaches no running loop. Shorten each pool's own, and
+            # do it before the bombs go in.
+            pool.tuning = replace(pool.tuning, poll=0.02, build_poll=0.02)
             pool.build_once = Bomb()
             pool.cv = Bomb()
         alive = not wait_for(lambda: not pool_threads(), patience=5.0)
         for stub in self.stubs:
             stub.stop()
         for name, value in self.kept.items():
-            setattr(router, name, value)
-        router.POOL = self.had_pool
+            setattr(SANDBOX, name, value)
         shutil.rmtree(self.root, ignore_errors=True)
         self.assertEqual(stuck, [], "a test thread never finished")
         self.assertFalse(alive, f"pool threads outlived the test: {pool_threads()}")
@@ -319,7 +334,7 @@ class RecallFires(EndToEnd):
         # Somebody else takes early's slot, so its cache has to go to disk.
         # The other backend is out of service while that happens, so there is
         # nowhere else the filler could land.
-        pool.drain(other.name, router.http_post, deadline=PATIENCE)
+        pool.drain(other.name, deadline=PATIENCE)
         mine.hold()
         self.start_turn(url, "filler")
         self.assertTrue(wait_for(lambda: self.backend(pool, home)["busy"] == 1),
@@ -359,7 +374,7 @@ class ParkBeforeTheNewcomer(EndToEnd):
         self.assertLess(chats[1], save, "the save came before the first turn")
         self.assertLess(save, chats[2], "the newcomer went in before the save")
         self.assertEqual(pool.pins["resident"]["parked"], "resident.park")
-        self.assertTrue((router.SLOT_DIR / "resident.park").exists())
+        self.assertTrue((SANDBOX.store.slots / "resident.park").exists())
 
     def test_nothing_is_parked_when_the_slot_had_already_changed_hands(self):
         """A short file means the slot holds someone else. It is not a cache."""
@@ -370,7 +385,7 @@ class ParkBeforeTheNewcomer(EndToEnd):
 
         self.assertIsNone(pool.pins["resident"]["parked"])
         self.assertIsNone(pool.pins["resident"]["slot"])
-        self.assertFalse((router.SLOT_DIR / "resident.park").exists())
+        self.assertFalse((SANDBOX.store.slots / "resident.park").exists())
 
 
 class DrainUnderLoad(EndToEnd):
@@ -387,7 +402,7 @@ class DrainUnderLoad(EndToEnd):
         self.assertTrue(wait_for(lambda: self.backend(pool, "cpu2")["busy"] == 1),
                         "the turn never reached cpu2")
 
-        report = self.background(lambda: pool.drain("cpu2", router.http_post,
+        report = self.background(lambda: pool.drain("cpu2",
                                                     deadline=PATIENCE),
                                  name="drain")
         time.sleep(0.4)
@@ -406,19 +421,19 @@ class DrainUnderLoad(EndToEnd):
         self.assertEqual(report["value"], {"backend": "cpu2", "quiet": True,
                                            "parked": 1, "left": 0})
         self.assertEqual(self.cpu2.saves, ["inflight.park"])
-        self.assertTrue((router.SLOT_DIR / "inflight.park").exists())
+        self.assertTrue((SANDBOX.store.slots / "inflight.park").exists())
 
     def test_resume_puts_the_backend_back_in_service(self):
         pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 2)])
         url = self.serve(pool)
-        pool.drain("cpu", router.http_post, deadline=PATIENCE)
+        pool.drain("cpu", deadline=PATIENCE)
         self.turn(url, "while-drained")
         self.assertEqual(len(self.cpu2.answers), 1)
 
         # Back in service means work can land there again. Reading takes pref
         # backwards, so cpu2 goes out of service to leave only one answer.
         self.assertTrue(pool.resume("cpu"))
-        pool.drain("cpu2", router.http_post, deadline=PATIENCE)
+        pool.drain("cpu2", deadline=PATIENCE)
         self.turn(url, "after-resume")
         self.assertEqual(len(self.cpu.answers), 1)
 
@@ -441,28 +456,32 @@ class ShutdownRoundTrip(EndToEnd):
             "the turn was never finished with")
         # A file the pin map does not vouch for. Nothing knows whose cache it
         # is, so the next run must throw it away.
-        (router.SLOT_DIR / "orphan.park").write_bytes(b"nobody claims this")
-        self.parked = self.first.park_all(router.http_post)
+        (SANDBOX.store.slots / "orphan.park").write_bytes(b"nobody claims this")
+        self.parked = self.first.park_all()
         self.kept_pins = self.first.save_pins()
 
     def second_pool(self):
-        """A fresh Pool over the same stubs, as a restart would build."""
+        """A fresh Pool over the same stubs, as a restart would build.
+
+        The servers already running are pointed at it, because that is what a
+        restart does: the port comes back in front of a new pool."""
         pool = self.pool(self.spec)
         pool.adopt()
-        router.POOL = pool
+        for server, _ in self.servers:
+            server.pool = pool
         return pool
 
     def test_the_copies_survive_and_the_pin_map_names_them(self):
         self.assertEqual((self.parked, self.kept_pins), (1, 1))
-        self.assertTrue((router.SLOT_DIR / "survivor.park").exists())
-        kept = json.loads((router.SLOT_DIR / "pins.json").read_text())
+        self.assertTrue((SANDBOX.store.slots / "survivor.park").exists())
+        kept = json.loads((SANDBOX.store.slots / "pins.json").read_text())
         self.assertEqual([row["conv"] for row in kept], ["survivor"])
         self.assertEqual(kept[0]["file"], "survivor.park")
 
     def test_an_unvouched_copy_is_deleted_on_adoption(self):
         self.second_pool()
-        self.assertFalse((router.SLOT_DIR / "orphan.park").exists())
-        self.assertTrue((router.SLOT_DIR / "survivor.park").exists())
+        self.assertFalse((SANDBOX.store.slots / "orphan.park").exists())
+        self.assertTrue((SANDBOX.store.slots / "survivor.park").exists())
 
     def test_a_fresh_pool_restores_the_cache_on_the_next_turn(self):
         pool = self.second_pool()
@@ -499,10 +518,10 @@ class TheFirstSessionSavesTheOpening(EndToEnd):
         # Two renderings, then the read of the opening itself.
         self.assertEqual(self.cpu.templates, 2)
         self.assertIn(name, self.cpu.saves)
-        self.assertTrue((router.SLOT_DIR / name).exists())
+        self.assertTrue((SANDBOX.store.slots / name).exists())
         # A block goes on the faster disk, reached through a link.
-        self.assertTrue((router.SLOT_DIR / name).is_symlink())
-        self.assertTrue((router.BLOCK_DIR / name).exists())
+        self.assertTrue((SANDBOX.store.slots / name).is_symlink())
+        self.assertTrue((SANDBOX.store.blocks / name).exists())
 
     def test_the_next_session_loads_it_rather_than_reading_it(self):
         pool = self.pool([self.stub("cpu", 1, slots=2)])
@@ -542,7 +561,7 @@ class AnOpenCodeSessionHasAnOpeningToo(EndToEnd):
         self.assertTrue(pool.openings, "the opening was not kept")
         name = next(iter(pool.openings.values()))
         self.assertIn(name, self.cpu.saves)
-        self.assertTrue((router.SLOT_DIR / name).exists())
+        self.assertTrue((SANDBOX.store.slots / name).exists())
 
     def test_the_next_session_loads_it(self):
         pool = self.pool([self.stub("cpu", 1, slots=2)])
@@ -685,7 +704,7 @@ class MissingBackendLog(EndToEnd):
 
     def test_a_backend_with_no_log_file_still_reports_its_cache(self):
         pool = self.pool([self.stub("cpu", 1)])
-        self.assertFalse((router.RUN_DIR / "cpu.log").exists())
+        self.assertFalse((SANDBOX.store.run / "cpu.log").exists())
         self.assertTrue(wait_for(lambda: self.backend(pool, "cpu")["cache"]))
         self.assertEqual(self.backend(pool, "cpu")["cache"]["evictions"], 0)
         self.assertEqual(self.backend(pool, "cpu")["up"], True)
@@ -725,7 +744,7 @@ class TheHandoff(EndToEnd):
         save, one restore, and what is left on disk is its park."""
         self.assertEqual(self.cpu.saves, ["talker.park"])
         self.assertEqual(self.gpu.restores, ["talker.park"])
-        self.assertFalse((router.SLOT_DIR / "talker.kv").exists(),
+        self.assertFalse((SANDBOX.store.slots / "talker.kv").exists(),
                          "a carrier file was written after all")
 
     def test_the_gpu_is_given_no_prompt_to_read(self):
@@ -835,7 +854,7 @@ class TheNextTurnComesBack(EndToEnd):
         self.assertTrue(wait_for(lambda: self.gpu.saves == ["talker.park"]),
                         f"the gpu kept the only copy of the cache: {self.gpu.saves}")
         self.assertTrue(pool.pins["talker"].get("parked"))
-        self.assertTrue((router.SLOT_DIR / "talker.park").exists())
+        self.assertTrue((SANDBOX.store.slots / "talker.park").exists())
 
         self.turn(url, "talker")
         self.assertEqual(self.cpu.restores, ["talker.park"])
@@ -869,7 +888,7 @@ class TheCarrierFails(EndToEnd):
         self.assertTrue(wait_for(lambda: [be["busy"] for be in self.duo.backends]
                                  == [0, 0]),
                         "a slot was counted busy after the turn ended")
-        self.assertFalse((router.SLOT_DIR / "stuck.kv").exists(),
+        self.assertFalse((SANDBOX.store.slots / "stuck.kv").exists(),
                          "a carrier file was written after all")
 
     def test_a_failed_save_leaves_it_where_it_was_read(self):
@@ -951,7 +970,7 @@ class AFullBoxMakesTheClientWait(EndToEnd):
 
     def setUp(self):
         super().setUp()
-        router.PING_EVERY = 0.05
+        SANDBOX.tuning = replace(SANDBOX.tuning, ping_every=0.05)
         self.only = self.pool([self.stub("cpu", 0, busy_ms=READ_MS)])
         self.url = self.serve(self.only)
 
@@ -1100,9 +1119,9 @@ class TheClientIsNeverLeftInSilence(EndToEnd):
     def test_bytes_arrive_while_the_prompt_is_still_being_read(self):
         """The reply starts before the reading does, and is kept alive through
         it with the keep-alive that client's protocol defines."""
-        was = router.PING_EVERY
-        router.PING_EVERY = 0.2
-        self.addCleanup(lambda: setattr(router, "PING_EVERY", was))
+        was = SANDBOX.tuning
+        SANDBOX.tuning = replace(was, ping_every=0.2)
+        self.addCleanup(lambda: setattr(SANDBOX, "tuning", was))
 
         pool = self.pool([self.stub("cpu", 1)])
         url = self.serve(pool)
@@ -1141,9 +1160,9 @@ class AnAnthropicStreamIsAMessageFromTheStart(EndToEnd):
 
     def setUp(self):
         super().setUp()
-        was = router.PING_EVERY
-        router.PING_EVERY = 0.2
-        self.addCleanup(lambda: setattr(router, "PING_EVERY", was))
+        was = SANDBOX.tuning
+        SANDBOX.tuning = replace(was, ping_every=0.2)
+        self.addCleanup(lambda: setattr(SANDBOX, "tuning", was))
         self.only = self.pool([self.stub("cpu", 0)])
         self.url = self.serve(self.only)
 
@@ -1209,7 +1228,7 @@ class AnAnthropicStreamIsAMessageFromTheStart(EndToEnd):
 class AnIdleClientIsNotAGoneOne(EndToEnd):
     """A live client that sends nothing must never be judged to have left.
 
-    _still_there aborts the read when it answers False, and a read is the
+    alive aborts the read when it answers False, and a read is the
     only thing this box does slowly. A false positive here would kill every
     long read on it, so idleness has to be proven harmless rather than
     assumed to be."""

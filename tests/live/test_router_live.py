@@ -12,8 +12,8 @@ tests/live/README.md says how to run them.
 """
 
 import json
-import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -22,12 +22,35 @@ from pathlib import Path
 
 from harness import REREAD_LINE, LiveCase, prompt_evals, prose, read_tokens
 
-# The cache event log is on by default and writes into run/. These tests
-# write nothing there, so it stays off here.
-os.environ.setdefault("CACHE_LOG", "0")
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "bin"))
 import router                                                    # noqa: E402
+from dataclasses import replace                                   # noqa: E402
+
+class SANDBOX:
+    """What this test run is wired to.
+
+    A Pool is handed its store, its tuning and its event log, so there is no
+    module state to redirect and nothing to put back. One sandbox serves the
+    whole file, under the temporary directory, and a case wanting its own
+    builds another. Without this a case would reach the checkout's own
+    run/slots, where a live router keeps parked copies worth hundreds of
+    gigabytes and a stray pins.json tells adopt() to delete every copy it does
+    not name.
+    """
+
+    store = None            # setUp builds one on this test's run directory
+    tuning = router.Tuning()
+    events = router.EventLog(on=False)
+
+
+def make_pool(backends, **kw):
+    """A Pool wired to the sandbox. A case that wants another store, tuning or
+    event log passes it, and that one wins."""
+    kw.setdefault("store", SANDBOX.store)
+    kw.setdefault("tuning", SANDBOX.tuning)
+    kw.setdefault("events", SANDBOX.events)
+    return router.Pool(backends, **kw)
+
 
 POOL_LOOPS = ("_watch", "_builder")
 
@@ -74,11 +97,10 @@ class LiveRouter(LiveCase):
     started, on ports from 18080 up.
     """
 
-    # Long enough that prompt_cuts names a cut in it. PREFIX_MIN_CHARS cannot
-    # be lowered from a test: prompt_cuts takes it as a default argument, which
-    # Python binds once at import, so patching the module attribute afterwards
-    # changes nothing. The system prompt is sized for the real constant
-    # instead, and the context is sized for the system prompt.
+    # Long enough that prompt_cuts names a cut in it. prefix_min_chars is a
+    # field of the tuning now, so a test could lower it instead; this suite
+    # keeps the shipped figure, because the size of a real system prompt is
+    # part of what it measures. The context is sized for the system prompt.
     SYSTEM_CHARS = 9000
     CTX = 8192
 
@@ -90,30 +112,26 @@ class LiveRouter(LiveCase):
 
     def setUp(self):
         super().setUp()
-        self.kept = {name: getattr(router, name) for name in
-                     ("SLOT_DIR", "BLOCK_DIR", "RUN_DIR", "POLL", "BUILD_POLL",
-                      "PIN_PATIENCE", "PARK_ALL_TIMEOUT", "PARK_FLOOR",
-                      "IDLE_POLLS", "HANDOFF_ON")}
-        self.had_pool = getattr(router, "POOL", None)
-        router.HANDOFF_ON = self.HANDOFF
-        # The backends share this test's slot directory, and a backend only
-        # takes a bare filename under its own --slot-save-path.
-        router.SLOT_DIR = self.root / "slots"
-        router.SLOT_DIR.mkdir(parents=True, exist_ok=True)
-        router.BLOCK_DIR = self.root / "blocks"
-        # Every instance writes <name>.log here, which is where CacheWatch
-        # looks, so the cache counters are read off a real log for once.
-        router.RUN_DIR = self.root
-        router.POLL = 0.2
-        router.BUILD_POLL = 0.3
-        router.IDLE_POLLS = 1
-        router.PIN_PATIENCE = 1.0       # worth 20 seconds in production
-        router.PARK_ALL_TIMEOUT = 30.0
+        self.kept = {name: getattr(SANDBOX, name) for name in
+                     ("store", "tuning")}
+
+        # One store over this test's whole run directory. The backends share
+        # its slot directory, because a backend takes only a bare filename
+        # under its own --slot-save-path. Every backend also writes
+        # <name>.log there, which is where CacheWatch looks. The cache
+        # counters come off a real log for once. harness.Server builds the
+        # slot and log paths the same way from the same root.
+        SANDBOX.store = router.Store(self.root)
+        SANDBOX.store.slots.mkdir(parents=True, exist_ok=True)
+        # pin_patience is worth 20 seconds in production.
+        SANDBOX.tuning = replace(SANDBOX.tuning, handoff=self.HANDOFF,
+                                poll=0.2, build_poll=0.3, idle_polls=1,
+                                pin_patience=1.0, park_all_timeout=30.0)
         # "A real state is at least this big". The figure in the router is for
         # the production model's fixed recurrent state; the test model's
         # states are smaller. An empty save is still under a kilobyte, so this
         # tells a real copy from an empty one just as well.
-        router.PARK_FLOOR = 32 * 1024
+        SANDBOX.tuning = replace(SANDBOX.tuning, park_floor=32 * 1024)
         self.pools = []
         self.http = []
         self.helpers = []
@@ -140,11 +158,11 @@ class LiveRouter(LiveCase):
         test with one slot an instance it lands in the middle of whatever is
         being measured. The loop still comes round, so the teardown can still
         stop it."""
-        pool.build_once = lambda post, **kw: None
+        pool.build_once = lambda **kw: None
         return pool
 
     def pool(self, specs):
-        made = router.Pool(specs, watch=True)
+        made = make_pool(specs, store=SANDBOX.store, watch=True)
         self.pools.append(made)
         self.assertTrue(
             wait_for(lambda: all(b["up"] for b in made.backends)),
@@ -152,8 +170,10 @@ class LiveRouter(LiveCase):
         return made
 
     def serve(self, pool):
-        router.POOL = pool
         server = router.Server(("127.0.0.1", 0), router.Handler)
+        # The Handler reads the pool off its own server, so two servers in one
+        # process cannot take each other's.
+        server.pool = pool
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.http.append((server, thread))
@@ -214,14 +234,16 @@ class LiveRouter(LiveCase):
             server.shutdown()
             server.server_close()
             thread.join(PATIENCE)
-        router.POLL = router.BUILD_POLL = 0.02
         for pool in self.pools:
+            # The pool took its tuning when it was built, so shortening the
+            # sandbox's reaches no running loop. Shorten each pool's own, and
+            # do it before the bombs go in.
+            pool.tuning = replace(pool.tuning, poll=0.02, build_poll=0.02)
             pool.build_once = Bomb()
             pool.cv = Bomb()
         alive = not wait_for(lambda: not pool_threads(), patience=10.0)
         for name, value in self.kept.items():
-            setattr(router, name, value)
-        router.POOL = self.had_pool
+            setattr(SANDBOX, name, value)
         self.assertEqual(stuck, [], "a test thread never finished")
         self.assertFalse(alive, f"pool threads outlived the test: {pool_threads()}")
 
@@ -350,9 +372,9 @@ class SavedOpeningsAreLoaded(LiveRouter):
         self.assertTrue(wait_for(lambda: bool(self.pool_.openings), patience=180),
                         "no opening was kept")
         name = next(iter(self.pool_.openings.values()))
-        kept = router.SLOT_DIR / name
+        kept = SANDBOX.store.slots / name
         self.assertTrue(kept.exists())
-        self.assertGreater(kept.stat().st_size, router.PARK_FLOOR)
+        self.assertGreater(kept.stat().st_size, SANDBOX.tuning.park_floor)
 
     def test_a_second_session_starts_from_it_instead_of_reading_it(self):
         self.first_session()
@@ -431,9 +453,9 @@ class ParkedCachesComeBack(LiveRouter):
         first, home, away, box = self.displace()
         self.assertTrue(wait_for(lambda: bool(self.pool_.pins["mine"]["parked"])),
                         "the cache was never copied out")
-        copy = router.SLOT_DIR / self.pool_.pins["mine"]["parked"]
+        copy = SANDBOX.store.slots / self.pool_.pins["mine"]["parked"]
         self.assertTrue(copy.exists())
-        self.assertGreater(copy.stat().st_size, router.PARK_FLOOR)
+        self.assertGreater(copy.stat().st_size, SANDBOX.tuning.park_floor)
 
     def test_the_next_turn_restores_it_on_the_backend_that_serves_it(self):
         first, home, away, box = self.displace()
@@ -534,14 +556,14 @@ class DrainUnderLoad(LiveRouter):
         self.assertTrue(wait_for(lambda: any(b["busy"] for b in self.pool_.backends)),
                         "the turn never took a slot")
         busy = next(b["name"] for b in self.pool_.backends if b["busy"])
-        report = self.pool_.drain(busy, router.http_post, deadline=PATIENCE)
+        report = self.pool_.drain(busy, deadline=PATIENCE)
         self.assertTrue(report["quiet"], "the drain gave up on a running turn")
         self.assertNotIn("error", box, f"the turn failed: {box.get('error')}")
         self.assertIn("reply", box)
         self.pool_.resume(busy)
 
     def test_a_drained_instance_takes_nothing_new(self):
-        self.pool_.drain("cpu1_0", router.http_post, deadline=PATIENCE)
+        self.pool_.drain("cpu1_0", deadline=PATIENCE)
         try:
             before = self.one.mark()
             for n in range(3):
@@ -560,15 +582,21 @@ class DrainUnderLoad(LiveRouter):
         backend was up and had a slot spare -- so a drain reported an instance
         quiet, parked its caches, and the builder then read a whole opening into
         it: work a restart was about to throw away, on an instance somebody was
-        waiting to stop. `_idle_slot` now looks at `draining` as well."""
-        # One turn, so the builder has an opening it wants.
-        self.turn(self.url, "wanting", self.head + [{"role": "user", "content": "Hi."}])
+        waiting to stop. `_idle_slot` now looks at `draining` as well.
+
+        The want is noted here rather than left over from a turn. A turn reads
+        its own base opening inline in warm_prefix, so it leaves nothing
+        wanted, and the only want a turn can leave is a deep one, which needs
+        DEEP_OPENINGS. tests/test_migration.py notes wants the same way."""
+        self.pool_.note_want((0, "wanted-by-the-builder"), "base-",
+                             self.head[0]["content"], [], self.head[:1],
+                             "/v1/chat/completions")
         self.assertTrue(self.pool_.wants, "nothing was wanted, so nothing is proved")
         for name in ("cpu1_0", "cpu1_1"):
-            self.pool_.drain(name, router.http_post, deadline=PATIENCE)
+            self.pool_.drain(name, deadline=PATIENCE)
         try:
             before = [(s, s.mark()) for s in (self.one, self.two)]
-            built = router.Pool.build_once(self.pool_, router.http_post)
+            built = router.Pool.build_once(self.pool_)
             read = sum(read_tokens(s.since(m)) for s, m in before)
             self.assertIsNone(built, "an opening was read into a drained instance")
             self.assertEqual(read, 0, f"a drained instance read {read} tokens "
@@ -580,11 +608,11 @@ class DrainUnderLoad(LiveRouter):
     def test_a_drain_copies_the_caches_out_before_the_instance_stops(self):
         self.turn(self.url, "living", self.head + [{"role": "user", "content": "Hello."}])
         home = self.pool_.pins["living"]["backend"]
-        report = self.pool_.drain(home, router.http_post, deadline=PATIENCE)
+        report = self.pool_.drain(home, deadline=PATIENCE)
         try:
             self.assertGreaterEqual(report["parked"], 1, "the drain parked nothing")
             copy = self.pool_.pins["living"]["parked"]
-            self.assertTrue(copy and (router.SLOT_DIR / copy).exists())
+            self.assertTrue(copy and (SANDBOX.store.slots / copy).exists())
         finally:
             self.pool_.resume(home)
 
