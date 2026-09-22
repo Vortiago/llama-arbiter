@@ -67,7 +67,11 @@ class Store:
                   f"keeping blocks with the rest: {err}", flush=True)
             return
         if link.is_symlink() or link.exists():
-            link.unlink()
+            # missing_ok, as drop above: the test and the unlink are two
+            # syscalls, and every other thread's sweep deletes slot files. A
+            # raise here escapes _read_prefix before its try and answers a
+            # client whose prompt had already been read with a 502.
+            link.unlink(missing_ok=True)
         # Absolute: the kernel resolves a relative target against the link's
         # directory.
         link.symlink_to(self.blocks.resolve() / name)

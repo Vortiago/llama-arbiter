@@ -1,7 +1,7 @@
 """The slots, the pins, and everything a turn moves."""
 
 import queue, threading, time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from ..backends import by_place, generates, prefills
 from ..identity import copy_is_current, last_used, short_key, worth_keeping
 from ..protocol.body import common_prefix, deepest_shared, template_route
@@ -67,7 +67,8 @@ class Pool:
         self.backends = [dict(b, slots=1, n_ctx=0, busy=0, up=False, served=0, model="",
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
                               cache={}, draining=False,
-                              saving=set())
+                              # slot id -> how many saves are reading it.
+                              saving=Counter())
                          for b in backends]
         # Each backend reports prompt cache evictions only in its own log.
         self.cache_watch = {be["name"]: CacheWatch(
@@ -116,6 +117,7 @@ class Pool:
         # The park worker starts on the first park, so tests start no thread.
         self.park_jobs = queue.Queue()
         self.parker = None
+        self.stopping = False         # set by stop_parks, and never unset
         if watch:
             threading.Thread(target=self._watch, daemon=True).start()
 
@@ -758,12 +760,19 @@ class Pool:
         """Write one cache to disk. Mark the pin only if it holds one."""
         remove = remove or self.store.drop
         with self.cv:
-            be["saving"].add(slot)
+            # Counted, not a set: two pins can name one slot, so two saves of
+            # it can overlap. A set let whichever finished first drop the
+            # claim, and the slot was handed out while the other copy was
+            # still being read out of it.
+            be["saving"][slot] += 1
         try:
             return self._park(conv, be, slot, remove, timeout)
         finally:
             with self.cv:
-                be["saving"].discard(slot)
+                if be["saving"][slot] <= 1:
+                    del be["saving"][slot]     # the last saver lets it go
+                else:
+                    be["saving"][slot] -= 1
                 self.cv.notify_all()
 
     def _park(self, conv, be, slot, remove, timeout):
@@ -1221,6 +1230,9 @@ class Pool:
         if prefills(be):
             return False              # it can be read again here
         with self.cv:
+            if self.stopping:
+                return False          # stop_parks has been through: a job now
+                                      # would start a worker nothing stops
             record = self.pins.get(conv) if conv else None
             if not record or record["slot"] is None:
                 return False
@@ -1244,8 +1256,13 @@ class Pool:
         The loop below blocks on its queue, not on the condition, so the way
         every other loop is stopped cannot reach it. A router exits without
         this; a test that leaves it running holds its pool, its store and its
-        directory for the rest of the process."""
-        parker, self.parker = self.parker, None
+        directory for the rest of the process.
+
+        Final: park_later refuses after this, so a job arriving late cannot
+        start a second worker that nothing is left to stop."""
+        with self.cv:
+            self.stopping = True
+            parker, self.parker = self.parker, None
         if parker is None:
             return
         self.park_jobs.put(None)          # after the jobs already queued

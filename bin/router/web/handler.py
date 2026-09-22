@@ -231,8 +231,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             slots = []
             for be in live:
                 part = link.slots(be, timeout=5)
-                if isinstance(part, list):
-                    for slot in part:
+                # Each row as well as the list: a proxy in front of a backend
+                # answers 200 with whatever it likes, and assigning into a row
+                # that is not an object raised out of do_GET with no status
+                # line sent, so the client saw a reset rather than an answer.
+                for slot in part if isinstance(part, list) else ():
+                    if isinstance(slot, dict):
                         slot["backend"] = be["name"]
                         slots.append(slot)
             return self._send(200, json.dumps(slots).encode())

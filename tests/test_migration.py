@@ -382,7 +382,9 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         """Five callers reach _save_park. A claim each one has to remember is
         a claim one of them forgets."""
         self.saving("first")
-        self.assertEqual(self.be["saving"], {0})
+        # As a set: `saving` counts the saves reading each slot, and this is
+        # about which slots are claimed, not how many claims each one has.
+        self.assertEqual(set(self.be["saving"]), {0})
 
     def test_the_claim_and_the_slot_come_back_once_the_save_lands(self):
         """_save_park discards the claim in a finally, before the thread
@@ -391,7 +393,7 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         self.link.release()
         self.saver.join(10)
 
-        self.assertEqual(self.be["saving"], set())
+        self.assertEqual(set(self.be["saving"]), set())
         self.assertEqual(self.pool.pick_slot(self.be, "second"), 0)
 
 

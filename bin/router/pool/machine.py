@@ -224,6 +224,11 @@ class Machine:
                         proc.wait(timeout=1)
                     except Exception:
                         pass               # it will be reaped at exit
+                    # Nothing is known about the card now, as on the failing
+                    # branch below. Left standing, the last good reading was
+                    # charged into every later history bucket and the page
+                    # drew a flat healthy line for a GPU nobody could measure.
+                    self.gpu = None
                     self.gpu_proc = None
                 return
             out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
