@@ -264,9 +264,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     "this router does not read chunked requests")
         body = self.rfile.read(length) if length else b""
         path = self.path.split("?")[0].rstrip("/") or "/"
-        # Per request, not per connection: this handler serves every request
-        # on a keep-alive connection, and a stream left open in `streaming`
-        # would tell the next request it had already answered.
+        # Per request, not per connection: one handler serves a whole
+        # keep-alive connection.
         self.sending = threading.Lock()        # one writer at a time
         self.streaming = False
         self.stop_ping = None
@@ -392,10 +391,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Put an error into a stream that has already started, and close it.
         An anthropic stream ends in its error event. Under `sending`: the
         keep-alive thread may still be running."""
-        # Before the lock, not inside it: settle() joins the keep-alive
-        # thread, and that thread takes `sending` to write. Stopping it here
-        # rather than in each caller is what makes "nothing follows the
-        # terminator" a property of this method.
+        # Before the lock: settle() joins the keep-alive thread, and that
+        # thread takes `sending` to write.
         self.settle()
         print(f"[router] {message}", flush=True)
         if anthropic(self.path.split("?")[0]):
@@ -510,10 +507,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     try:
                         chunk = read(8192)
                     except (BrokenPipeError, ConnectionResetError) as err:
-                        # This side is the backend. A reset here must not reach
-                        # the clause that means the client left: that one ends
-                        # the stream without its terminator, and the client
-                        # then waits out its own idle timeout.
+                        # This side is the backend. The clause below that
+                        # means the client left ends the stream without its
+                        # terminator, which this must not reach.
                         raise http.client.HTTPException(
                             f"reset mid-reply: {err}") from err
                     if not chunk:

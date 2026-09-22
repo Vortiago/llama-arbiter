@@ -54,9 +54,8 @@ class Pool:
         where a live router keeps its caches."""
         self.cv = threading.Condition()
         self.store = store
-        # Where a turn writes down what the client sent, or None. build()
-        # sets it from CAPTURE: captures are for comparing two turns by
-        # hand.
+        # Where a turn writes down what the client sent, or None.
+        # build() sets it from CAPTURE.
         self.capture_dir = capture_dir
         self.tuning = tuning or Tuning()
         # Off unless a caller hands in a live one, so that building a Pool
@@ -1055,11 +1054,9 @@ class Pool:
 
             if plan is None:
                 return False
-            # Committed here, not where the plan is chosen: the lock is held
-            # throughout, so no second turn can plan a read, and nothing that
-            # raises then sits between this and the finally that pops it. A
-            # key left behind makes every later conversation with this
-            # system prompt wait build_patience for a read nobody is doing.
+            # Next to the finally that pops it, so nothing that raises can
+            # sit between. A key left behind makes every later conversation
+            # with this system prompt wait build_patience for nothing.
             if plan[0] == "read":
                 self.building[plan[1]] = time.time()
 
@@ -1084,8 +1081,7 @@ class Pool:
         with self.cv:
             while key in self.building and time.time() < deadline:
                 if wanted is not None and not wanted():
-                    return False    # this wait holds a prefill slot, and
-                                    # there is nobody left to read for
+                    return False    # this wait holds a prefill slot
                 self.cv.wait(1.0)
             name = self.openings.get(key)
             if not name:
@@ -1127,11 +1123,9 @@ class Pool:
             be["busy"] += 1
 
         try:
-            # The builder is the second way into a slot. Reading an opening
-            # over a finished conversation's only cache lost that cache while
-            # the pin still said the slot was held. idle_polls makes that
-            # rarer only. Inside the try: the finally below is the only thing
-            # that gives the slot back and drops the want.
+            # The builder is the second way into a slot, so the caches on it
+            # go to disk first. Inside the try: the finally below is the
+            # only thing that gives the slot back and drops the want.
             self.ensure_parked(be, None, remove)
             began = time.time()
             kept = self._read_prefix(want["cut"], want["head"], want["system"],
@@ -1237,10 +1231,9 @@ class Pool:
             # Nothing to carry this to, and the instance holding it does
             # not generate. Wait, holding a prefill slot.
             if wanted is not None and not wanted():
-                # Giving up here is the client leaving mid-turn, which
-                # the caller's ending already knows how to finish. Giving up
-                # below is not: past the save the cache is safe on disk, and
-                # only the reply is lost.
+                # The client leaving mid-turn, which the caller's ending
+                # already finishes. The give-up below is not: past the save
+                # the cache is on disk and only the reply is lost.
                 raise Gone("while it waited for a slot to generate in")
             with self.cv:
                 self.cv.wait(1.0)
@@ -1263,8 +1256,7 @@ class Pool:
             self.cv.notify_all()
 
         while True:
-            # None once the generator went away and no other has come back:
-            # _wait_to_generate reads target["up"].
+            # None once the last generator went away.
             free = None if target is None else self._wait_to_generate(target, wanted)
             if free is not None:
                 break
@@ -1367,9 +1359,8 @@ class Pool:
             if not record or record["slot"] is None:
                 return False
             if record["inflight"]:
-                return False               # park_all is writing it now, and
-                                           # two saves of one conversation
-                                           # write the same file at once.
+                return False               # a save is running: two of them
+                                           # write the same file at once
             slot = record["slot"]
             record["inflight"] = True      # hold it still while it copies
             if self.parker is None:
@@ -1423,9 +1414,8 @@ class Pool:
                                            # A save from a slot it has left
                                            # would delete the copy.
             if record["inflight"]:
-                return False               # ensure_parked is writing it now,
-                                           # and two saves of one conversation
-                                           # write the same file at once.
+                return False               # a save is running: two of them
+                                           # write the same file at once
             record["inflight"] = True      # hold it still while it copies
         return self._save_park(conv, be, slot, remove)
 

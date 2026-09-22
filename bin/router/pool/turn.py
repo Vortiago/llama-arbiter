@@ -35,12 +35,10 @@ def capture(directory, conv, body, keep):
     try:
         directory.mkdir(parents=True, exist_ok=True)
         tag = short_key(conv).replace("/", "_")
-        # Nanoseconds and fixed width: unique names that sort by time.
         name = f"{time.time_ns()}-{tag}.json"
         (directory / name).write_bytes(body)
         kept = sorted(directory.glob(f"*-{tag}.json"))
-        # max, because a negative bound counts from the end: [:-11] of 13
-        # files deletes two that were inside the keep.
+        # max: a negative bound counts from the end and would keep fewer.
         for spent in kept[:max(0, len(kept) - keep)]:
             spent.unlink(missing_ok=True)
     except OSError as err:
@@ -99,9 +97,7 @@ class Turn:
         pool = self.pool
         tokens, images, image_charge = request_cost(ask.body, pool.vision(),
                                                     pool.tuning)
-        # `tokens` carries reply_tokens of room. The dashboard measures a
-        # turn against the prompt sent: 1,024 tokens nobody sent is 41
-        # seconds of reading nobody did.
+        # `tokens` carries reply_tokens of room the client never sent.
         prompt_tokens = max(0, tokens - pool.tuning.reply_tokens)
         largest = pool.largest()
         if largest and tokens > largest:
@@ -111,13 +107,9 @@ class Turn:
             return client.fail(503, "no backend is up yet")
 
         conv, conv_source = name_conversation(ask)
-        # `null` in the log, and not an empty string, for a turn whose
-        # conversation the router could not name.
         short = short_key(conv) if conv else None
         capture(pool.capture_dir, conv, ask.body, pool.tuning.capture_keep)
-        # This model's template refuses a late system message. The turn
-        # holds both bodies from here: about 600 KB for a ctx 150000 turn,
-        # against a box that holds the model itself.
+        # This model's template refuses a late system message.
         body = hoist_system(ask.body)
         if body is not ask.body:
             print(f"[router] a late system message became a user message "
@@ -125,7 +117,6 @@ class Turn:
             pool.events.write("start_over", conv=short, reason="late_system",
                               client=client.kind, path=ask.path)
         cuts, messages, system, tools = prompt_cuts(body, pool.tuning)
-        # The stream and its keep-alive open before the slot is asked for.
         start = time.time()
         asked = read_only(body)
         if asked is not None and wants_stream(body):
@@ -133,38 +124,31 @@ class Turn:
 
         ticket = pool.begin_wait(conv, tokens, images, image_charge)
         try:
-            # The turn ahead holds the pin, slot and copy this one needs.
             mine = pool.claim_turn(conv, ticket, client.alive)
             be = pool.acquire(conv, tokens, client.alive) if mine else None
         finally:
             pool.end_wait(ticket)
         waited = time.time() - start
         if not be:
-            # `done` only if this turn held the conversation: Flow is keyed
-            # by conversation, and a turn that gave up in claim_turn deleted
-            # the live row of the turn running.
+            # Only if this turn held it: Flow is keyed by conversation,
+            # so otherwise this deletes the running turn's row.
             if mine:
                 pool.note_stage(conv, "done")
             pool.finish_turn(conv, ticket)
             client.settle()
             return client.fail(503, "no backend can serve this request")
-        # Read here, then generate wherever is free after the read.
         serving = be
         left = False                           # the client gave up mid-read
         read_stats = {}
         recalled = loaded = warm = False
         slot = None
-        # The backend and the conversation are held from here. Every way out
-        # runs the same ending: claim_turn has no deadline, so a claim left
-        # behind stops the conversation for good.
+        # Held from here. Every way out runs the same ending: claim_turn
+        # has no deadline, so a claim left behind stops the conversation.
         try:
             warm = bool(conv) and pool.holds_slot(conv)
-            # One slot, decided once, for the read below to extend.
             slot = pool.pick_slot(be, conv)
             pool.note_stage(conv, "prefill", be["name"], slot)
-            # Nothing reaches the backend until the caches on it are on disk.
             pool.ensure_parked(be, conv)
-            # A copy with an opening the client no longer sends is no prefix.
             if pool.forget_stale_park(conv, cuts):
                 pool.events.write("start_over", conv=short, reason="stale_copy",
                                   client=client.kind, path=ask.path)
@@ -173,14 +157,11 @@ class Turn:
                       and pool.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, ask.path,
                                            wanted=client.alive))
-            # warm_prefix was the last reader of these three, and each holds
-            # a parsed copy of the prompt: about three times the bytes it
-            # came from. The read below runs for tens of minutes.
+            # warm_prefix was their last reader, and each holds a parsed
+            # copy of the prompt. The read below runs for tens of minutes.
             messages = system = tools = None
             if asked is not None:
-                # Watch the client. The timings say what the cache saved.
-                # `asked` is reused rather than read again: a second parse of
-                # this body is megabytes.
+                # `asked` is reused: a second parse of this body is megabytes.
                 answer = pool.link.read(be, ask.path,
                                         dict(asked, id_slot=slot),
                                         client.alive, pool.tuning.read_timeout)
@@ -190,17 +171,14 @@ class Turn:
                 pool.note_slot(conv, slot)
                 serving = pool.hand_off(conv, be, tokens, wanted=client.alive)
                 if serving is None:
-                    # The cache is parked, and no backend is held.
                     raise Gone("after its prompt was parked")
             if serving is be:
                 # Nothing was carried. hand_off already noted a carried turn.
                 pool.note_stage(conv, "generate", be["name"], slot)
-            client.settle()                    # waits for a ping in flight
+            client.settle()
             client.relay(serving, body, conv)
         except Gone as gone:
             # Nobody to answer. What the read got through is parked below.
-            # `gone` says which wait it gave up on: the read itself, or the
-            # wait for a slot to generate in, which comes after the read.
             print(f"[router] {short} left {gone}, {time.time() - start:.0f}s "
                   f"into {be['name']} ({client.went})", flush=True)
             left = True
@@ -217,19 +195,15 @@ class Turn:
                 # After the release: these write the copy that is not behind.
                 if left:
                     pool.park_partial(conv, be, slot)
-                # A backend that does not read cannot serve the next turn, so
-                # leave a copy for one that does, on a worker.
                 if serving is not None:
                     parking = pool.park_later(serving, conv, ticket)
             except Exception as err:
-                # A ticket not given back costs the conversation every later
-                # turn: claim_turn has no deadline. The lines below must run.
+                # claim_turn has no deadline, so the lines below must run.
                 print(f"[router] {short} could not be put away: {err}",
                       flush=True)
             took = time.time() - start
             started = how_started(warm, recalled, loaded)
             pool.note_stage(conv, "done")
-            # The worker ends the turn once the copy has landed.
             if not parking:
                 pool.finish_turn(conv, ticket)
             pool.note_request(conv, be, ask.path, took, waited, started,

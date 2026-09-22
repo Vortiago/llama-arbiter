@@ -3,9 +3,8 @@
 import json, re
 from .sse import read_event, sse_event
 
-# SSE ends an event with a blank line. The backends write \n\n, and sse.py
-# reads \r\n as well, so the framer has to: splitting on \n\n alone holds a
-# CRLF stream back whole, and tail() then hands it to the client unspliced.
+# SSE ends an event with a blank line. sse.py reads \r\n as well, so the
+# framer has to: on \n\n alone a CRLF stream is never split at all.
 EVENT_END = re.compile(rb"\r?\n\r?\n")
 
 

@@ -20,7 +20,6 @@ from ..transport import http_post, http_post_wanted
 
 # A read-only endpoint answers at once or the backend is in trouble. A slot
 # file takes as long as the slot takes. Pool hands in Tuning.post_timeout.
-# This default is for a Link built on its own.
 LOOK_TIMEOUT = 3.0
 POST_TIMEOUT = 300.0
 

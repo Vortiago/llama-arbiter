@@ -311,13 +311,9 @@ class ACopyBeatsAnOpening(unittest.TestCase):
 
 
 class AWaitForAnOpeningWatchesTheClient(unittest.TestCase):
-    """One turn reads a shared opening and the rest wait for it, rather than
-    every one of them reading the same 24,000 tokens.
-
-    The wait holds a prefill slot, so a client that has gone has to end it.
-    build_patience is half an hour, and claim_turn, acquire, the read and the
-    handoff all want that slot.
-    """
+    """One turn reads a shared opening and the rest wait for it. That wait
+    holds a prefill slot for up to build_patience, half an hour, so a client
+    that has gone has to end it."""
 
     def test_a_client_that_has_gone_does_not_wait_out_build_patience(self):
         patience = 5.0
@@ -384,15 +380,9 @@ class ATurnWithNowhereToGenerateStopsAfterTheRead(unittest.TestCase):
 
 
 class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
-    """A slot the pool never gets back is worse than a slow turn: acquire
-    counts it busy for the life of the process, so the backend serves one
-    fewer conversation until somebody restarts it.
-
-    hand_off gives up in two places. The later one releases the prefiller
-    before it waits for a generator, and its caller reads None as `nothing is
-    held`. The earlier one gives up before any of that, so it says so the way
-    the rest of the turn says it: a Gone, which the ending already handles.
-    """
+    """acquire counts a slot the pool never gets back busy for the life of
+    the process. hand_off gives up in two places: the later one releases the
+    prefiller first and returns None, the earlier one raises Gone."""
 
     def test_giving_up_before_the_handoff_says_the_client_went(self):
         pool = one_backend()
@@ -430,15 +420,10 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
 
 
 class TheHandOffOutlivesItsGenerator(unittest.TestCase):
-    """The wait for a slot to generate in is re-entered with whatever
-    `generator` found, and that is None once the last generator has gone.
-
-    A raise there costs more than the wait it interrupts. hand_off has
-    already given the prefiller back, so the turn's ending gives it back a
-    second time: the count falls below zero, and nothing puts a floor under
-    it. The backend then reads one more prompt at a time than it has slots,
-    for the life of the process.
-    """
+    """The wait for a generator slot is re-entered with whatever `generator`
+    found, which is None once the last one has gone. A raise there is paid for
+    twice: hand_off has released the prefiller, so the ending releases it
+    again and the count falls below zero with no floor under it."""
 
     def test_no_generator_left_is_a_wait_and_not_a_raise(self):
         pool = make_pool([
@@ -465,14 +450,9 @@ class TheHandOffOutlivesItsGenerator(unittest.TestCase):
 
 
 class ACacheIsWrittenToDiskOnce(unittest.TestCase):
-    """Two saves of one conversation at once write the same file name from the
-    same slot. ensure_parked already refuses a record a save is running on;
-    park_partial has to refuse it too.
-
-    Releasing the prefill slot before the partial copy is parked is what makes
-    the two meet: the turn that takes the slot next parks this cache on its
-    way in, while the turn that left is still on its way out.
-    """
+    """Two saves of one conversation write the same file name from the same
+    slot. The prefill slot is released before the partial copy is parked, so
+    the turn taking that slot next meets the turn still on its way out."""
 
     def test_a_copy_already_being_written_is_not_written_twice(self):
         pool = one_backend()
