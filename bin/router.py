@@ -705,16 +705,17 @@ def copy_is_current(record):
     return bool(record.get("parked")) and record.get("parked_turn") == record.get("turns")
 
 
-def copy_worth(record):
-    """What a copy on disk earns, against what it costs to hold.
+def last_used(record):
+    """When this conversation last ran. PARK_BUDGET keeps the copies used
+    most recently, so what goes is what nobody has come back to.
 
-    The tokens it saves reading again, times the turns that have asked for
-    them, over the bytes it takes. A question asked once and never returned
-    to earns almost nothing however recently it was written; a conversation
-    in daily use earns its size many times over. PARK_BUDGET spends on this
-    order, so the copies that go are the ones nobody comes back for."""
-    return ((record.get("tokens") or 0) * (record.get("turns") or 1)
-            / max(1, record.get("bytes") or 0))
+    Size is deliberately not in it. Measured over 131 real copies at a
+    64 GiB budget: ranking a copy by the tokens it holds against its bytes
+    kept 19 of them but only 7 of the 16 conversations in use that week,
+    because the big copies of finished work outranked the small ones
+    somebody was still typing into. Ranking by when each was last used kept
+    18, and all 16."""
+    return record.get("last") or 0
 
 
 def worth_keeping(record):
@@ -2098,7 +2099,11 @@ class Pool:
                     # Not a live name, so recall restores the copy first.
                     "backend": "(before the restart)",
                     "slot": None, "tokens": row.get("tokens", 0),
-                    "last": time.time(), "inflight": False,
+                    # When it last ran, not now: the budget sweep drops what
+                    # has gone longest without a turn, and `now` for every
+                    # copy hides exactly that.
+                    "last": row.get("last") or file_mtime(name),
+                    "inflight": False,
                     "turns": row.get("turns", 1), "parked": name,
                     "bytes": row.get("bytes", 0),
                     # Without it every copy reads as age zero.
@@ -2850,16 +2855,17 @@ class Pool:
                 if lost and mine:
                     # The slot holds someone else.
                     record["slot"] = None
-            # Keep the copies worth the most that fit the budget. Ordered by
-            # write time instead, a question asked once outlived a
-            # conversation of 80,000 tokens that had run for days: 90 of 127
-            # copies held under 2,048 tokens each and a sixth of the disk.
+            # Keep the copies used most recently that fit the budget. Ordered
+            # by write time instead, a copy the migration had just rewritten
+            # looked fresh though nobody had asked for it, and a conversation
+            # somebody was working in was dropped for a question answered
+            # days ago.
             # The copy just written is counted first and never swept. Dropping
             # it only has it written again: cpu1_0 wrote the same 9.45 GiB
             # copy 1,456 times in four and a half hours that way.
             held = sorted((c for c, p in self.pins.items() if p.get("parked")),
-                          key=lambda c: copy_worth(self.pins[c]))
-            held.reverse()                 # worth the most first
+                          key=lambda c: last_used(self.pins[c]))
+            held.reverse()                 # used most recently first
             if conv in held:
                 held.remove(conv)
                 held.insert(0, conv)
@@ -3161,9 +3167,12 @@ class Pool:
                      "tokens": record.get("tokens", 0),
                      "bytes": record.get("bytes", 0),
                      "turns": record.get("turns", 1),
-                     # `tokens`, `turns` and `bytes` above are what the budget
-                     # sweep orders by. This is for adopt, which dates a file
-                     # the last run vouched for.
+                     # What the budget sweep orders by, so it has to outlive
+                     # the process: restored as `now`, every copy reads as
+                     # freshly used and the first sweep after a restart has
+                     # nothing to tell them apart by.
+                     "last": record.get("last"),
+                     # For adopt, which dates a file the last run vouched for.
                      "parked_at": record.get("parked_at")}
                     for conv, record in self.pins.items() if record.get("parked")]
         write_rows(pins_file(), kept)
@@ -3557,11 +3566,11 @@ class Pool:
                                   for key, want in self.wants.items()]}
             # `slot` is set only while the slot still holds the cache, or
             # three copies naming one single-slot backend look like three
-            # caches in one slot. `worth` is the PARK_BUDGET sweep order.
+            # caches in one slot. `used` is the PARK_BUDGET sweep order.
             copies = [{"name": p["parked"], "kind": "copy", "conv": short_key(conv),
                        "bytes": p.get("bytes") or 0, "backend": p["backend"],
                        "slot": p.get("slot"), "parked_at": p.get("parked_at"),
-                       "worth": copy_worth(p)}
+                       "used": last_used(p)}
                       for conv, p in self.pins.items() if p.get("parked")]
             disk = disk_summary(self.pins, self.openings, self.opening_bytes,
                                 self.wants)

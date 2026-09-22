@@ -360,7 +360,7 @@ export function shelvesOf(status) {
  *              where: string, label: boolean, doomed: boolean }} Block */
 
 /** The copies as shares of PARK_BUDGET. The budget caps bytes, so width is
- * linear in bytes. Worth the most first, as the sweep orders them: the
+ * linear in bytes. Used most recently first, as the sweep orders them: the
  * right-hand end of the run goes next. A label goes only in a block wide
  * enough for it.
  * @param {Status} status @param {number} px strip width
@@ -368,7 +368,7 @@ export function shelvesOf(status) {
  * @returns {{ blocks: Block[], used: number, count: number, live: number, kept: number }} */
 export function blocksOf(status, px, minPx = 44, maxLabels = 6) {
   const files = (status.disk?.files || []).filter((f) => f.kind === "copy")
-    .slice().sort((a, b) => (b.worth ?? 0) - (a.worth ?? 0));
+    .slice().sort((a, b) => (b.used ?? 0) - (a.used ?? 0));
   const budget = status.disk?.copies?.budget || 1;
   const held = residency(files, backendsOf(status), status.flow?.live || []);
   /** @type {Block[]} */

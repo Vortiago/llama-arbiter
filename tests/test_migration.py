@@ -1418,46 +1418,39 @@ class ParkBeforeAdmitting(SlotDirCase):
         self.assertEqual(removed, [])
         self.assertEqual(self.pool.pins["new"]["parked"], "new.park")
 
-    def test_the_copy_nobody_returns_to_goes_before_one_in_daily_use(self):
-        """Ordered by write time this was backwards. A run of one-shot
-        questions filled the disk with copies of 36 tokens each, and the
-        sweep dropped the conversations they displaced because those had
-        been written earlier. Both copies here are the same size, so only
-        the tokens they hold and the turns that asked for them separate
-        them."""
+    def test_the_copy_nobody_has_come_back_to_goes_first(self):
+        """Size does not decide it. A big copy of a conversation nobody has
+        touched for days goes before a small one used a minute ago.
+
+        Measured on 131 real copies at a 64 GiB budget: ordering on the
+        tokens a copy holds against its bytes kept 19 of them and only 7 of
+        the 16 conversations in use that week. Ordering on when each was last
+        used kept 18, and all 16."""
         removed = []
         half = router.PARK_BUDGET // 2
-        asked_once = pin("cpu", slot=0, last=99.0, tokens=36, turns=1,
-                         parked="asked_once.park")
-        asked_once["bytes"] = half
-        long_running = pin("cpu", slot=0, last=1.0, tokens=80_000, turns=40,
-                           parked="long_running.park")
-        long_running["bytes"] = half
-        # Written most recently, so by the old order it outlived the other.
-        self.pool.pins["asked_once"] = asked_once
-        self.pool.pins["long_running"] = long_running
-        self.pool.pins["new"] = pin("cpu", slot=0, last=0.0, inflight=True)
+        now = time.time()
+        # The stale one is the SMALL one, so that any rule reading size keeps
+        # it and drops the large copy somebody is still working in.
+        self.hold("small_and_stale", half // 8, last=now - 3 * 86400)
+        self.hold("big_and_fresh", half, last=now - 60)
+        self.pool.pins["new"] = pin("cpu", slot=0, last=now, inflight=True)
         self.pool._save_park("new", self.cpu, 0, self.saver(written=half),
                              remove=removed.append)
-        self.assertEqual(removed, ["asked_once.park"])
-        self.assertEqual(self.pool.pins["long_running"]["parked"],
-                         "long_running.park")
+        self.assertEqual(removed, ["small_and_stale.park"])
+        self.assertEqual(self.pool.pins["big_and_fresh"]["parked"],
+                         "big_and_fresh.park")
 
-    def test_a_copy_earns_by_what_it_holds_and_how_often_it_is_asked_for(self):
-        """The three numbers the sweep spends on, one at a time."""
-        same = {"bytes": 1000, "tokens": 1000, "turns": 1}
-        self.assertGreater(router.copy_worth({**same, "tokens": 2000}),
-                           router.copy_worth(same), "more tokens saved")
-        self.assertGreater(router.copy_worth({**same, "turns": 2}),
-                           router.copy_worth(same), "asked for more often")
-        self.assertGreater(router.copy_worth(same),
-                           router.copy_worth({**same, "bytes": 2000}),
-                           "the same for fewer bytes")
+    def test_a_copy_is_ranked_by_when_its_conversation_last_ran(self):
+        self.assertGreater(router.last_used({"last": 200.0}),
+                           router.last_used({"last": 100.0}))
+        self.assertEqual(router.last_used({}), 0,
+                         "a pin with no last turn sorts at the back")
 
-    def test_a_copy_of_nothing_is_worth_nothing(self):
-        """A pin the router adopted at startup knows neither number yet."""
-        self.assertEqual(router.copy_worth({}), 0)
-        self.assertEqual(router.copy_worth({"bytes": 0, "tokens": 0}), 0)
+    def test_a_copy_the_router_knows_nothing_about_sorts_at_the_back(self):
+        """A pin adopted from a file an older run wrote carries no last turn,
+        so it goes before anything this run has served."""
+        self.assertEqual(router.last_used({}), 0)
+        self.assertEqual(router.last_used({"last": None}), 0)
 
     def test_a_short_prompt_is_read_again_rather_than_copied(self):
         """A copy costs the same few hundred megabytes whatever it holds.
@@ -2320,6 +2313,23 @@ class ShutDownCleanly(unittest.TestCase):
         self.assertEqual(kept[0]["conv"], "a")
         self.assertEqual(kept[0]["file"], "a.park")
         self.assertEqual(kept[0]["tokens"], 4321)
+
+    def test_when_a_conversation_last_ran_survives_the_restart(self):
+        """The budget sweep drops whatever has gone longest without a turn,
+        so that time has to outlive the process. Restored as `now` instead,
+        every copy read as freshly used and the sweep had nothing to sort
+        by on the first pass after a restart."""
+        then = time.time() - 5 * 86400
+        self.pool.pins["a"] = pin("cpu", slot=1, tokens=4321, last=then)
+        self.pool.park_all(self.saver())
+        self.pool.save_pins()
+        self.assertAlmostEqual(
+            router.read_rows(router.pins_file())[0]["last"], then, places=3)
+
+        fresh = router.Pool([{"name": "cpu", "url": "http://cpu"}], watch=False)
+        fresh.adopt(["a.park"])
+        self.assertAlmostEqual(fresh.pins["a"]["last"], then, places=3,
+                               msg="the copy came back looking newly used")
 
     def test_writes_nothing_for_a_conversation_with_no_copy(self):
         self.pool.pins["a"] = pin("cpu", slot=1, parked=None)
