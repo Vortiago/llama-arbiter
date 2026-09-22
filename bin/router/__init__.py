@@ -29,7 +29,7 @@ The modules, in the order a turn meets them:
 from .backends import (DEFAULT_BACKENDS, by_place, generates, prefills,
                        read_backend_table)
 from .identity import (SHELF_MARKS, client_kind, conversation_id,
-                       copy_is_current, file_safe, mark_shelf, prompt_key,
+                       copy_is_current, file_safe, prompt_key,
                        session_key, short_key)
 from .pool.machine import (GPU_CMD, RATE_FLOOR, Flow, History, Machine,
                            cpu_times, gpu_query, node_busy, node_meminfo,
@@ -70,7 +70,7 @@ __all__ = ["ANTHROPIC_PING", "AnthropicSplice", "Ask", "CONFIG_FILES",
     "cpu_times", "deepest_shared", "default_provider", "disk_summary",
     "file_safe", "generates", "gpu_query", "hoist_system", "host_only",
     "how_started", "http_post", "http_post_watched", "image_size",
-    "image_tokens", "images_in", "leading_system", "mark_shelf",
+    "image_tokens", "images_in", "leading_system",
     "message_shape", "name_conversation", "node_busy", "node_meminfo",
     "on_the_page", "opening_event", "opening_key", "parse_cpulist",
     "passed_paths", "per_second", "ping_for", "prefills", "prompt_cuts",

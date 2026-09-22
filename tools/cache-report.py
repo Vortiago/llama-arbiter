@@ -2,7 +2,7 @@
 """What the cache did, read from its own event log.
 
 The dashboard shows the present; this answers questions about the past, from
-run/cache-events-*.jsonl: which openings paid for themselves, how long wants
+run/cache-events-*.jsonl: which openings paid for themselves, how long they
 starved, how much of every read the prompt cache skipped, what the forks did.
 
     python3 tools/cache-report.py [--dir run] [--since-hours 24]
@@ -145,16 +145,6 @@ if builds:
     print(f"built and never loaded: {len(waste)} of {len(per)}"
           + (": " + ", ".join(f"{s}/{k}" for s, k, _ in waste[:8]) if waste else ""))
 
-wants = [r for r in rows if r["event"] == "want"]
-if wants:
-    part("wants")
-    acts = Counter(r.get("action") for r in wants)
-    print("  ".join(f"{k}={v}" for k, v in acts.most_common()))
-    for act in ("built", "dropped"):
-        ages = numbers([r for r in wants if r.get("action") == act], "age")
-        if ages:
-            print(f"age when {act:<8} median {statistics.median(ages):>6.0f}s, "
-                  f"max {max(ages):>6.0f}s")
 
 for event, label in (("park", "parked"), ("recall", "recalled"),
                      ("migrate", "migrated")):

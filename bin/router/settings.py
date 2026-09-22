@@ -73,10 +73,6 @@ class Tuning:
                                       # to read, a fifth of a second to load.
     build_patience: float = 1800.0    # longest a request waits for another to
                                       # save the opening they share
-    # A deeper cut, where two conversations diverge, is detected and
-    # recorded in the `choice` event but never saved: over two days of real
-    # traffic one was built 0 times and loaded 0 times.
-    # tools/cache-report.py reads that event.
 
     # -- moving a turn
     # A restored slot needs its context checkpoints in the state file, which

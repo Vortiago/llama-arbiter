@@ -3,7 +3,7 @@
 import queue, threading, time
 from collections import OrderedDict, deque
 from ..backends import by_place, generates, prefills
-from ..identity import copy_is_current, mark_shelf, short_key
+from ..identity import copy_is_current, short_key
 from ..protocol.body import common_prefix, deepest_shared, template_route
 from ..settings import Tuning
 from ..sizing import VISION
@@ -18,9 +18,9 @@ from .machine import Flow, History, Machine, per_second
 def disk_summary(pins, openings, opening_bytes, tuning):
     """What the two slot directories hold against their budgets.
 
-    `tuning` has no default. Two of the three budgets below are the
-    operator's to set, so a caller that dropped it drew one number
-    while the sweeps enforced another."""
+    `tuning` has no default. Both budgets below are the operator's to
+    set, so a caller that dropped it drew one number while the sweeps
+    enforced another."""
     copies = [(conv, p) for conv, p in pins.items() if p.get("parked")]
     kinds = [shelf_of(name) for name in openings.values()]
     return {"copies": {"count": len(copies),
@@ -574,7 +574,7 @@ class Pool:
             ids = [s["id"] for s in detail] or list(
                 range(max(1, be.get("slots", 1))))
             working = {s["id"] for s in detail if s.get("busy")}
-            taken |= set(be.get("saving") or ())
+            taken.update(be["saving"])
             # Free by both accounts first. Then merely not handed out: the
             # poll is the older of the two.
             # None rather than ids[0]: a slot a save is still reading must
@@ -607,7 +607,7 @@ class Pool:
 
         A slot a save is reading counts as busy. `busy` does not say so:
         the turn that filled it has its reply and has been released."""
-        held = be["busy"] + len(be.get("saving") or ())
+        held = be["busy"] + len(be["saving"])
         return (be["up"] and not be.get("draining")
                 and held < be["slots"] and tokens <= be["n_ctx"])
 
@@ -946,10 +946,9 @@ class Pool:
 
     def warm_prefix(self, conv, cuts, messages, system, tools, be, slot,
                     path, alive=None):
-        """Load the opening this request shares into a slot on this backend.
-        Only an opening the router already has: that is a file read. An
-        opening the router lacks is written down for the builder. Returns
-        True when an opening was loaded."""
+        """Load the opening this request shares into a slot on this backend,
+        or read and save the one nobody has yet. Returns True when an
+        opening was loaded."""
         with self.cv:
             if not cuts:
                 return False
@@ -971,14 +970,11 @@ class Pool:
                     plan = ("wait", base[1], None, None)
                 else:
                     plan = ("read", base[1], None, slot)
-            # How deep a fork could have started. Measurement only: the
-            # router reads an opening for itself and builds none ahead.
+            # Measurement only, both of these: how deep a fork could have
+            # started. `shared` needs the parent to hold a slot, so the rate
+            # it shows is a floor. A parked copy restores as an opening does.
             seen = set().union(*self.holds.values()) if self.holds else set()
             shared = deepest_shared(cuts, seen)
-
-            # Measurement only: what a fork could have started from. `shared`
-            # needs the parent to hold a slot, so the fork rate it shows is a
-            # floor. A parked copy restores the same way an opening does.
             copied, copied_from = None, None
             for other, other_pin in self.pins.items():
                 if other == conv or not other_pin.get("parked"):
@@ -992,8 +988,7 @@ class Pool:
                                   "stored": stored[0] if stored else None,
                                   "shared": shared[0] if shared else None,
                                   "copied": copied[0] if copied else None,
-                                  "held": len(set().union(*self.holds.values())
-                                             if self.holds else set())}
+                                  "held": len(seen)}
             self.choices.move_to_end(conv)
             while len(self.choices) > self.tuning.recent_requests:
                 self.choices.popitem(last=False)
@@ -1043,8 +1038,7 @@ class Pool:
             return self._wait_for_opening(plan[1], be, slot, alive)
         try:
             return self._read_prefix(base, messages, system, tools, be,
-                                     plan[3], self.store.drop, "base-",
-                                     path)
+                                     plan[3], path)
         finally:
             with self.cv:
                 self.building.pop(plan[1], None)
@@ -1412,11 +1406,10 @@ class Pool:
               f"slot {slot}", flush=True)
         return True
 
-    def _read_prefix(self, cut, messages, system, tools, be, slot,
-                     remove, mark, path):
+    def _read_prefix(self, cut, messages, system, tools, be, slot, path):
         """Read one opening into a slot, then keep a copy of the slot."""
         index, key = cut
-        name = f"{mark}{key}.park"
+        name = f"base-{key}.park"
         began = time.time()
         self.store.link_block(name)   # so the save lands on the faster disk
         try:
@@ -1429,8 +1422,8 @@ class Pool:
         except Exception as err:
             print(f"[router] opening {key[:8]} failed to save on "
                   f"{be['name']}: {err}", flush=True)
-            remove(name)           # take back the link made before the read
-            self.events.write("build", key=short_key(key), shelf=mark_shelf(mark),
+            self.store.drop(name)  # take back the link made before the read
+            self.events.write("build", key=short_key(key), shelf="base",
                          backend=be["name"], slot=slot, ok=False,
                          error=str(err)[:120],
                          secs=round(time.time() - began, 1))
@@ -1438,8 +1431,8 @@ class Pool:
         # From the disk, as _save_park: unpatched backends under-report.
         written = self.store.size(name) or (answer.get("n_written") or 0)
         if written < self.tuning.park_floor:
-            remove(name)           # the slot had already changed hands
-            self.events.write("build", key=short_key(key), shelf=mark_shelf(mark),
+            self.store.drop(name)  # the slot had already changed hands
+            self.events.write("build", key=short_key(key), shelf="base",
                          backend=be["name"], slot=slot, ok=False,
                          error="slot changed hands",
                          secs=round(time.time() - began, 1))
@@ -1455,10 +1448,10 @@ class Pool:
                                     keep=set(self.building),
                                     budget=self.tuning.block_budget)
         for extra in dropped:
-            remove(extra)
+            self.store.drop(extra)
         self.save_openings()
         timing = read.get("timings") or {}
-        self.events.write("build", key=short_key(key), shelf=mark_shelf(mark),
+        self.events.write("build", key=short_key(key), shelf="base",
                      backend=be["name"], slot=slot, ok=True,
                      secs=round(time.time() - began, 1),
                      bytes=written,

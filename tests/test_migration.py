@@ -336,30 +336,16 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
                         "the second one waited for a build that had failed")
 
 
-class HeldSave:
-    """A link whose save stops until the test lets it finish, so a case can
-    look at the pool while a copy is in flight."""
-
-    def __init__(self):
-        self.began = threading.Event()
-        self.may_finish = threading.Event()
-
-    def save(self, be, slot, name, timeout=None):
-        self.began.set()
-        self.may_finish.wait(10)
-        return {"n_written": 1 << 30}
-
-
 class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
     """A save reads the slot it copies. A restore into that slot while the save
     runs writes one conversation's cache to disk under another's name, and the
     first conversation then re-reads its whole prompt.
 
-    pick_slot works out which slots are taken and then falls through to ids[0]
-    regardless, so on a one-slot backend it always answers 0."""
+    pick_slot used to work out which slots were taken and then fall through
+    to ids[0] regardless, so on a one-slot backend it always answered 0."""
 
     def setUp(self):
-        self.link = HeldSave()
+        self.link = FakeLink(block=True, written=1 << 30)
         self.pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
                               link=self.link, watch=False)
         self.be = self.pool.backends[0]
@@ -371,12 +357,12 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         self.pool._take(self.be, conv, tokens=10)
         self.pool.pick_slot(self.be, conv)
         self.pool.release(self.be, conv)       # the client has its reply
-        saver = threading.Thread(target=self.pool.park_partial,
-                                 args=(conv, self.be, 0), daemon=True)
-        saver.start()
-        self.addCleanup(saver.join, 10)
-        self.addCleanup(self.link.may_finish.set)
-        self.assertTrue(self.link.began.wait(10), "the save never began")
+        self.saver = threading.Thread(target=self.pool.park_partial,
+                                      args=(conv, self.be, 0), daemon=True)
+        self.saver.start()
+        self.addCleanup(self.saver.join, 10)
+        self.addCleanup(self.link.release)
+        self.assertTrue(self.link.started.wait(10), "the save never began")
 
     def test_the_only_slot_is_refused_while_its_cache_is_saved(self):
         self.saving("first")
@@ -393,22 +379,17 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         """Five callers reach _save_park. A claim each one has to remember is
         a claim one of them forgets."""
         self.saving("first")
-        self.assertEqual(self.pool.backends[0]["saving"], {0})
-        self.link.may_finish.set()
-        for _ in range(100):
-            if not self.pool.backends[0]["saving"]:
-                return
-            time.sleep(0.05)
-        self.fail("the claim was never given back")
+        self.assertEqual(self.be["saving"], {0})
 
-    def test_the_slot_comes_back_once_the_save_lands(self):
+    def test_the_claim_and_the_slot_come_back_once_the_save_lands(self):
+        """_save_park discards the claim in a finally, before the thread
+        ends, so the join is enough: no polling."""
         self.saving("first")
-        self.link.may_finish.set()
-        for _ in range(100):
-            if self.pool.pick_slot(self.be, "second") == 0:
-                return
-            time.sleep(0.05)
-        self.fail("the slot never came back")
+        self.link.release()
+        self.saver.join(10)
+
+        self.assertEqual(self.be["saving"], set())
+        self.assertEqual(self.pool.pick_slot(self.be, "second"), 0)
 
 
 class TwoRequestsNeverShareASlot(unittest.TestCase):
@@ -1745,7 +1726,6 @@ class PrefixCase:
                                       {"id": 1, "busy": False},
                                       {"id": 2, "busy": False}])
         self.pool.pins["new"] = pin("cpu", slot=None, inflight=True)
-        self.removed = []
 
     def put_back(self):
         SANDBOX.store = self.was
@@ -1754,13 +1734,6 @@ class PrefixCase:
         block = self.BLOCK
 
         class Talk(FakeLink):
-            before = None               # a hook, so a test can watch the state
-
-            def _note(inner, op, be, *rest):
-                if inner.before:
-                    inner.before()
-                return FakeLink._note(inner, op, be, *rest)
-
             def render(inner, be, route, payload, timeout=None):
                 inner._note("render", be, route)
                 # The longer rendering carries the extra user message, so the
@@ -1790,9 +1763,6 @@ class PrefixCase:
 
     def paths(self, post):
         return post.ops()
-
-    def saved_names(self, post):
-        return post.files()
 
 
 class WarmPrefix(PrefixCase, unittest.TestCase):

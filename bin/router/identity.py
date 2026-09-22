@@ -73,13 +73,6 @@ def short_key(conv):
     return conv[:8] if len(conv) <= 36 else f"{conv[:8]}/{conv[-6:]}"
 
 
-def mark_shelf(mark):
-    """The shelf of a "base-" / "deep-" mark. Marks keep
-    their dash for file names."""
-    mark = mark.get("mark") if isinstance(mark, dict) else mark
-    return (mark or "deep-").rstrip("-")
-
-
 def session_key(headers):
     """Name the conversation from Claude Code's session headers, or None. A
     subagent runs its own prompt, so it is a separate conversation."""

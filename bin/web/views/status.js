@@ -50,7 +50,7 @@
  *              conv?: string, backend?: string, slot?: number | null,
  *              parked_at?: number | null }} DiskFile */
 /** @typedef {{ bases: DiskFile[], deeps: DiskFile[] }} Openings */
-/** @typedef {{ count: number, bytes?: number, budget?: number, keep?: number }} Budget */
+/** @typedef {{ count: number, bytes?: number, budget?: number }} Budget */
 /** `openings` is one budget over both shelves. `bases` and `deeps` are usage of it, not caps.
  * @typedef {{ copies: Budget, openings: Budget, bases: Budget, deeps: Budget,
  *             files?: DiskFile[],
