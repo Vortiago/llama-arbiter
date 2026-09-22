@@ -29,19 +29,6 @@ print(f"  dropped cache for {count} model files")
 PYEOF
 }
 
-start() { # start <name> <port> <script> [VAR=value ...]
-  local name=$1 port=$2 script=$3; shift 3
-  echo "starting $name..."
-  local began=$SECONDS
-  keep_log "$name"
-  # `env`, not prefix assignments: a prefix assignment on a shell function
-  # stays set for every later call.
-  env PORT="$port" "$@" nohup "$ROOT/bin/$script" > "$RUN/$name.log" 2>&1 &
-  echo $! > "$RUN/$name.pid"
-  wait_for "$port" "$name" 2400 || return 1
-  echo "    took $((SECONDS - began))s"
-}
-
 echo "dropping stale page cache..."
 drop_cache "$MODELS/*/*.gguf" "$MODELS2/*/*.gguf"
 
@@ -51,7 +38,7 @@ drop_cache "$MODELS/*/*.gguf" "$MODELS2/*/*.gguf"
 while read -r name port script rest; do
   [[ -n $name ]] || continue
   # shellcheck disable=SC2086  # rest is a list of VAR=value words, by design
-  start "$name" "$port" "$script" $rest
+  start_backend "$name" "$port" "$script" $rest
 done < <(backend_rows)
 
 echo "starting router..."

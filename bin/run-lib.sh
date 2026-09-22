@@ -34,6 +34,21 @@ wait_for() { # wait_for <port> <name> <seconds> [path]
   echo "$name did not start within ${limit}s" >&2; return 1
 }
 
+# The one place a backend starts. The trailing arguments are the VAR=value
+# words from its row in the BACKENDS table.
+start_backend() { # start_backend <name> <port> <script> [VAR=value ...]
+  local name=$1 port=$2 script=$3; shift 3
+  echo "starting $name..."
+  local began=$SECONDS
+  keep_log "$name"
+  # `env`, not prefix assignments: a prefix assignment on a shell function
+  # stays set for every later call.
+  env PORT="$port" "$@" nohup "$ROOT/bin/$script" > "$RUN/$name.log" 2>&1 &
+  echo $! > "$RUN/$name.pid"
+  wait_for "$port" "$name" 2400 || return 1
+  echo "    took $((SECONDS - began))s"
+}
+
 # The one place the router starts. Source common.sh first: it reads
 # config.local.sh, which exports ROUTER_BACKENDS.
 start_router() {

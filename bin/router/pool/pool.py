@@ -161,15 +161,55 @@ class Pool:
                     "bytes": row.get("bytes", 0),
                     # Without it every copy reads as age zero.
                     "parked_at": row.get("parked_at") or self.store.mtime(name)}
+            # The budget is spent here too, not only where a copy is written.
+            # Lowering it otherwise did nothing until the next turn parked,
+            # and on a quiet router that is never: 251 GiB of copies sat
+            # under a 64 GiB budget with one conversation in a slot.
+            spent += self._trim_copies()
+            # After the trim, not `parked`, which counts what the last run
+            # left rather than what this one is keeping: the line read
+            # "131 conversation(s)" on a start that kept 19.
+            keeping = sum(1 for p in self.pins.values() if p.get("parked"))
         for name in spent:
             remove(name)
         self.save_openings()      # trimmed, so write it
-        if openings or parked or spent:
+        if spent:
+            # Or the map still vouches for files this start has deleted,
+            # until whenever the next turn happens to park.
+            self.save_pins()
+        if openings or keeping or spent:
             kinds = [shelf_of(name) for name in openings.values()]
             print(f"[router] kept {kinds.count('base')} system prompt(s), "
-                  f"{kinds.count('deep')} deeper opening(s) and {len(parked)} "
+                  f"{kinds.count('deep')} deeper opening(s) and {keeping} "
                   f"conversation(s), dropped {len(spent)} stale file(s)",
                   flush=True)
+
+    def _trim_copies(self, keep=None):
+        """Drop copies until they fit park_budget, least recently used first.
+        Returns the file names to delete. Held under the lock.
+
+        `keep` names one copy that stays whatever its age: the one just
+        written. Dropping that only has it written again, which is how cpu1_0
+        wrote the same 9.45 GiB copy 1,456 times in four and a half hours.
+
+        Ordered by write time instead, a copy the migration had just
+        rewritten looked fresh though nobody had asked for it, and a
+        conversation somebody was working in was dropped for a question
+        answered days ago."""
+        held = sorted((c for c, p in self.pins.items() if p.get("parked")),
+                      key=lambda c: last_used(self.pins[c]))
+        held.reverse()                     # used most recently first
+        if keep in held:
+            held.remove(keep)
+            held.insert(0, keep)
+        spent, total = [], 0
+        for name in held:
+            record = self.pins[name]
+            total += record.get("bytes") or 0
+            if total > self.tuning.park_budget and name != keep:
+                spent.append(record["parked"])
+                record["parked"] = None
+        return spent
 
     def note_file(self, did, name, be, slot, size=0):
         """Record one slot file written or read. Held under the lock."""
@@ -773,27 +813,7 @@ class Pool:
                 if lost and mine:
                     # The slot holds someone else.
                     record["slot"] = None
-            # Keep the copies used most recently that fit the budget.
-            # Ordered by write time instead, a copy the migration had just
-            # rewritten looked fresh though nobody had asked for it, and a
-            # conversation somebody was working in was dropped for a question
-            # answered days ago. The copy just written is counted first and
-            # never swept: dropping it only has it written again, and cpu1_0
-            # wrote the same 9.45 GiB copy 1,456 times in four and a half
-            # hours that way.
-            held = sorted((c for c, p in self.pins.items() if p.get("parked")),
-                          key=lambda c: last_used(self.pins[c]))
-            held.reverse()                 # used most recently first
-            if conv in held:
-                held.remove(conv)
-                held.insert(0, conv)
-            spent, total = [], 0
-            for name_held in held:
-                older = self.pins[name_held]
-                total += older.get("bytes") or 0
-                if total > self.tuning.park_budget and name_held != conv:
-                    spent.append(older["parked"])
-                    older["parked"] = None
+            spent = self._trim_copies(keep=conv)
             self.cv.notify_all()
         for gone in spent:
             remove(gone)
