@@ -53,7 +53,7 @@ from .store.backendlog import CacheWatch, cache_event, read_config, read_vision
 from .store.events import EventLog
 from .store.files import (Store, adopt_files, opening_key, shelf_of,
                           trim_openings)
-from .transport import Gone, http_post, http_post_wanted, said, said_in
+from .transport import Gone, http_post, http_post_watched, said, said_in
 from .web.config import CONFIG_FILES, client_config, default_provider, host_only
 from .web.handler import (DROP_HEADERS, INFERENCE, MIME, PASSED, WEB, Handler,
                           on_the_page, passed_paths)
@@ -69,7 +69,7 @@ __all__ = ["ANTHROPIC_PING", "AnthropicSplice", "Ask", "CONFIG_FILES",
     "closes", "common_prefix", "conversation_id", "copy_is_current",
     "cpu_times", "deepest_shared", "default_provider", "disk_summary",
     "file_safe", "generates", "gpu_query", "hoist_system", "host_only",
-    "how_started", "http_post", "http_post_wanted", "image_size",
+    "how_started", "http_post", "http_post_watched", "image_size",
     "image_tokens", "images_in", "leading_system", "mark_shelf",
     "message_shape", "name_conversation", "node_busy", "node_meminfo",
     "on_the_page", "opening_event", "opening_key", "parse_cpulist",

@@ -387,7 +387,7 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         already waits for a slot, already watches the client, and already
         ranks the other backends, so it is the one that has to know."""
         self.saving("first")
-        self.assertIsNone(self.pool.acquire("second", 10, wanted=lambda: False))
+        self.assertIsNone(self.pool.acquire("second", 10, alive=lambda: False))
 
     def test_the_save_is_claimed_by_save_park_and_not_its_callers(self):
         """Five callers reach _save_park. A claim each one has to remember is
@@ -774,9 +774,9 @@ class FakeLink:
     def files(self, op=None):
         """The file names this link was asked to save or restore. A prefill
         carries a block where those carry a name, so it is not one of these."""
-        wanted = (op,) if op else ("save", "restore")
+        asked = (op,) if op else ("save", "restore")
         return [call[3] for call in self.calls
-                if len(call) > 3 and call[0] in wanted]
+                if len(call) > 3 and call[0] in asked]
 
     def _note(self, op, be, *rest):
         self.calls.append((op, be["name"]) + rest)
@@ -2620,14 +2620,14 @@ class WhoIsWaiting(unittest.TestCase):
     def test_a_new_conversation_wants_a_reader(self):
         self.pool.begin_wait("abcdefghij", 500)
         row = self.pool.status()["waiting_detail"][0]
-        self.assertEqual((row["conv"], row["tokens"], row["wants"]), ("abcdefgh", 500, "prefill"))
+        self.assertEqual((row["conv"], row["tokens"], row["waiting_on"]), ("abcdefgh", 500, "prefill"))
         self.assertGreaterEqual(row["waited"], 0)
 
     def test_a_pinned_conversation_wants_its_backend(self):
         self.pool.pins["abc"] = pin("cpu")
         self.pool.begin_wait("abc", 500)
         row = self.pool.status()["waiting_detail"][0]
-        self.assertEqual((row["wants"], row["backend"]), ("pinned", "cpu"))
+        self.assertEqual((row["waiting_on"], row["backend"]), ("pinned", "cpu"))
 
     def test_turns_queued_for_the_gpu_are_counted(self):
         """They hold no backend while they wait, so nothing else counts them.
@@ -2669,11 +2669,11 @@ class WhoIsWaiting(unittest.TestCase):
         self.pool.pins["abc"] = pin("gpu")
         self.pool.begin_wait("abc", 500)
         row = self.pool.status()["waiting_detail"][0]
-        self.assertEqual((row["wants"], row["backend"]), ("prefill", None))
+        self.assertEqual((row["waiting_on"], row["backend"]), ("prefill", None))
 
     def test_too_big_for_any_reader(self):
         self.pool.begin_wait("abc", 5000)
-        self.assertEqual(self.pool.status()["waiting_detail"][0]["wants"], "big")
+        self.assertEqual(self.pool.status()["waiting_detail"][0]["waiting_on"], "big")
 
     def test_status_says_what_each_backend_may_do(self):
         can = {b["name"]: (b["prefill"], b["generate"])
@@ -2753,13 +2753,13 @@ class OneTurnAtATime(unittest.TestCase):
             be["up"] = True
             be["n_ctx"] = 1000
 
-    def claim(self, conv, wanted=None):
+    def claim(self, conv, alive=None):
         """Claim in a thread, and say when it got in. Returns (thread, got)."""
         got = threading.Event()
         ticket = self.pool.begin_wait(conv, 500)
 
         def run():
-            if self.pool.claim_turn(conv, ticket, wanted):
+            if self.pool.claim_turn(conv, ticket, alive):
                 got.set()
 
         thread = threading.Thread(target=run, daemon=True)
@@ -2816,8 +2816,8 @@ class OneTurnAtATime(unittest.TestCase):
             if len(rows) == 2:
                 break
             time.sleep(0.05)
-        wants = [row["wants"] for row in rows]
-        self.assertEqual(wants, ["prefill", "turn"])
+        waiting_on = [row["waiting_on"] for row in rows]
+        self.assertEqual(waiting_on, ["prefill", "turn"])
 
     def test_the_turn_ahead_keeps_its_place_on_the_flow_board(self):
         """Both turns are one conversation, and the board has one row for it."""
@@ -3243,15 +3243,15 @@ class AnInstanceThatDoesNotGenerate(unittest.TestCase):
         self.pool.pins["a"] = pin("pre", slot=0)
         self.gen.update(up=False)          # no generator to carry it to
         gave_up = []
-        # `wanted` is what ends the wait, so answer False on the second ask.
-        def wanted(asked=[]):
+        # `alive` is what ends the wait, so answer False on the second ask.
+        def alive(asked=[]):
             asked.append(1)
             gave_up.append(len(asked))
             return len(asked) < 2
         with self.assertRaises(router.Gone,
                                msg="it generated on an instance set not to"):
             with_link(self.pool, FakeLink(written=200_000_000)).hand_off(
-                "a", self.pre, 1000, wanted=wanted)
+                "a", self.pre, 1000, alive=alive)
         self.assertTrue(gave_up, "it never waited at all")
 
     def test_it_generates_in_place_only_when_the_carry_never_happened(self):
@@ -3542,9 +3542,9 @@ class HandOff(unittest.TestCase):
     def mover(self, written=200_000_000, fail_on=None):
         return FakeLink(written=written, fail_on=fail_on)
 
-    def go(self, post, wanted=None):
+    def go(self, post, alive=None):
         return with_link(self.pool, post).hand_off(
-            "a", self.cpu, 1000, remove=self.removed.append, wanted=wanted)
+            "a", self.cpu, 1000, remove=self.removed.append, alive=alive)
 
     def test_saves_here_and_restores_there(self):
         post = linked(self.pool, self.mover())
@@ -3595,7 +3595,7 @@ class HandOff(unittest.TestCase):
         Nothing is held and nothing is lost: the conversation is on disk, so
         the turn the client sends again starts from what this one read."""
         self.gpu["busy"] = 1
-        self.assertIsNone(self.go(self.mover(), wanted=lambda: False))
+        self.assertIsNone(self.go(self.mover(), alive=lambda: False))
         self.assertEqual(self.pool.pins["a"]["parked"], "a.park")
         self.assertEqual((self.cpu["busy"], self.gpu["busy"]), (0, 1))
 

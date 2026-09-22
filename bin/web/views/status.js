@@ -24,7 +24,7 @@
  *              bytes: number }} FileEvent */
 /** `image_tokens` is the vision encoder's charge for `images`, far below their base64 text cost.
  * @typedef {{ conv: string, since: number, waited: number, tokens: number,
- *              wants: "prefill"|"pinned"|"big"|"turn", backend: string | null,
+ *              waiting_on: "prefill"|"pinned"|"big"|"turn", backend: string | null,
  *              images?: number, image_tokens?: number }} Waiter */
 /** `reused` and `read` are the backend's `timings.cache_n` and `timings.prompt_n`.
  * Null for a turn that never reached the read path. Absent from an older router.
@@ -168,9 +168,9 @@ export function reuseShare(status) {
 /** A waiter's own status, or empty when it matches the queue's shared reason.
  * @param {Waiter} w @param {string} reason */
 export function waitLabel(w, reason) {
-  if (w.wants === "turn") return "waits for the turn ahead of it in the same conversation";
-  if (w.wants === "pinned") return `holds for ${w.backend || "its backend"}, its cache is there`;
-  if (w.wants === "big") return "too big for what is free";
+  if (w.waiting_on === "turn") return "waits for the turn ahead of it in the same conversation";
+  if (w.waiting_on === "pinned") return `holds for ${w.backend || "its backend"}, its cache is there`;
+  if (w.waiting_on === "big") return "too big for what is free";
   return reason.includes("busy") ? "" : "needs a backend that prefills";
 }
 

@@ -89,6 +89,13 @@ _Avoid_: split, boundary, checkpoint
 What a slot has in it now, named by the cuts it covers.
 _Avoid_: contents, state
 
+**Want**:
+Only ever what the request asked the router for: `wants_stream`,
+`wants_usage`, `wants_ping`. Whether the client is still there is `alive`, the
+name the Client port uses. Why a queued request is still queued is
+`waiting_on`.
+_Avoid_: `wanted` for liveness, `wants` for a queue reason
+
 **Shelf**:
 The kind an opening belongs to. A **base** opening is a system prompt that
 every conversation shares. A **deep** opening is parked at a cut where two

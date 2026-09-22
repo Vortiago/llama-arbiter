@@ -28,10 +28,10 @@ def said(err):
 
 
 class Gone(Exception):
-    """The client stopped waiting, so what it asked for is no longer wanted."""
+    """The client stopped waiting, so there is nobody to answer."""
 
 
-def http_post_wanted(url, path, payload, timeout, wanted, every=2.0):
+def http_post_watched(url, path, payload, timeout, alive, every=2.0):
     """POST to a backend. Stop when nobody waits for the answer.
 
     Closing the connection cancels the task in llama.cpp and frees the slot.
@@ -66,7 +66,7 @@ def http_post_wanted(url, path, payload, timeout, wanted, every=2.0):
         thread.join(every)
         if not thread.is_alive():
             break
-        if not wanted():
+        if not alive():
             try:
                 conn.sock.shutdown(socket.SHUT_RDWR)   # the backend sees this
             except (OSError, AttributeError):

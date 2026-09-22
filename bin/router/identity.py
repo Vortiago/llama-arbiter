@@ -74,7 +74,7 @@ def short_key(conv):
 
 
 def mark_shelf(mark):
-    """The shelf of a "base-" / "deep-" mark or a want record. Marks keep
+    """The shelf of a "base-" / "deep-" mark. Marks keep
     their dash for file names."""
     mark = mark.get("mark") if isinstance(mark, dict) else mark
     return (mark or "deep-").rstrip("-")

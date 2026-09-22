@@ -391,7 +391,7 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
         self.assertEqual(pool.backends[0]["busy"], 1)
 
         with self.assertRaises(router.Gone):
-            pool.hand_off("c1", pool.backends[0], 10, wanted=lambda: False)
+            pool.hand_off("c1", pool.backends[0], 10, alive=lambda: False)
 
     def test_a_turn_that_loses_its_client_before_the_handoff_holds_nothing(self):
         pool = one_backend()
@@ -436,14 +436,14 @@ class TheHandOffOutlivesItsGenerator(unittest.TestCase):
         pool.pins["c1"]["slot"] = 0
         asked = []
 
-        def wanted():
+        def alive():
             """The client, and the generator going away inside the wait."""
             asked.append(None)
             if len(asked) == 1:
                 gpu["up"] = False
             return len(asked) < 3          # and then the client gives up
 
-        self.assertIsNone(pool.hand_off("c1", cpu, 10, wanted=wanted))
+        self.assertIsNone(pool.hand_off("c1", cpu, 10, alive=alive))
         # Once, by hand_off. The turn's ending releases what it still holds,
         # and past a None it holds nothing.
         self.assertEqual(cpu["busy"], 0)

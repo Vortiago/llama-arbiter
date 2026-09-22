@@ -162,7 +162,7 @@ class Turn:
             loaded = (not recalled
                       and pool.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, ask.path,
-                                           wanted=client.alive))
+                                           alive=client.alive))
             # warm_prefix was their last reader, and each holds a parsed
             # copy of the prompt. The read below runs for tens of minutes.
             messages = system = tools = None
@@ -175,7 +175,7 @@ class Turn:
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
                               "read_cache_n": timing.get("cache_n")}
                 pool.note_slot(conv, slot)
-                serving = pool.hand_off(conv, be, tokens, wanted=client.alive)
+                serving = pool.hand_off(conv, be, tokens, alive=client.alive)
                 if serving is None:
                     raise Gone("after its prompt was parked")
             if serving is be:

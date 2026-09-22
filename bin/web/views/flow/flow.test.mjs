@@ -132,8 +132,8 @@ test("a node carries the conversation the flow says is in its slot", () => {
 
 test("the arrivals say what each turn is waiting for", () => {
   const rows = arrivalsOf({ waiting_detail: [
-    { conv: "a", since: 0, waited: 4695.6, tokens: 70989, wants: "turn", backend: null },
-    { conv: "b", since: 0, waited: 3, tokens: 10, wants: "pinned", backend: "gpu0_0" },
+    { conv: "a", since: 0, waited: 4695.6, tokens: 70989, waiting_on: "turn", backend: null },
+    { conv: "b", since: 0, waited: 3, tokens: 10, waiting_on: "pinned", backend: "gpu0_0" },
   ] });
   assert.equal(rows[0].kind, "turn");
   assert.equal(rows[0].why, "behind its own turn", "a card in a stack gets four words, not a sentence");
@@ -141,12 +141,12 @@ test("the arrivals say what each turn is waiting for", () => {
 });
 
 test("two turns of one conversation are two arrivals, not one twice", () => {
-  // `wants: "turn"` IS a turn queued behind another turn of the same
+  // `waiting_on: "turn"` IS a turn queued behind another turn of the same
   // conversation, so the conversation alone cannot key the list: keyed by it,
   // the second row is built fresh every push and the first is never dropped.
   const rows = arrivalsOf({ waiting_detail: [
-    { conv: "a", since: 10, waited: 4, tokens: 10, wants: "prefill", backend: null },
-    { conv: "a", since: 20, waited: 2, tokens: 10, wants: "turn", backend: null },
+    { conv: "a", since: 10, waited: 4, tokens: 10, waiting_on: "prefill", backend: null },
+    { conv: "a", since: 20, waited: 2, tokens: 10, waiting_on: "turn", backend: null },
   ] });
   assert.deepEqual(rows.map((r) => r.since), [10, 20]);
   assert.equal(new Set(rows.map((r) => `${r.conv}:${r.since}`)).size, 2);
@@ -178,10 +178,10 @@ test("a request carrying pictures says so, and what they cost", () => {
   // of text are not the same kind of work - the vision encoder runs in RAM on
   // whichever backend serves it, gpu included.
   const [a] = arrivalsOf({ waiting_detail: [{ conv: "a", since: 0, waited: 3, tokens: 91401,
-    wants: "prefill", backend: null, images: 2, image_tokens: 4100 }] });
+    waiting_on: "prefill", backend: null, images: 2, image_tokens: 4100 }] });
   assert.deepEqual([a.images, a.imageTokens], [2, 4100]);
   const [plain] = arrivalsOf({ waiting_detail: [{ conv: "b", since: 0, waited: 1, tokens: 10,
-    wants: "prefill", backend: null }] });
+    waiting_on: "prefill", backend: null }] });
   assert.deepEqual([plain.images, plain.imageTokens], [0, 0], "a router that sends neither reads as none");
   const t2 = turnOf({ conv: "c", backend: "b", path: "/x", took: 10, waited: 0,
     started: "cold", tokens: 5000, at: 1, images: 1, image_tokens: 300 });

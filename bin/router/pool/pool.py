@@ -193,7 +193,7 @@ class Pool:
             self.waiters.pop(ticket, None)
             self.waiting = len(self.waiters)
 
-    def claim_turn(self, conv, ticket, wanted=None):
+    def claim_turn(self, conv, ticket, alive=None):
         """Hold this conversation until finish_turn. One turn of it at a time.
 
         Returns True when the turn holds it. False means the client left and
@@ -203,7 +203,7 @@ class Pool:
         began = None
         with self.cv:
             while conv in self.turns and self.turns[conv] != ticket:
-                if wanted is not None and not wanted():
+                if alive is not None and not alive():
                     return False
                 began = began or time.time()
                 self.cv.wait(1.0)
@@ -240,22 +240,22 @@ class Pool:
             pinned = record["backend"] if record else None
             held = self.turns.get(w["conv"])
             if held is not None and held != ticket:
-                wants = "turn"
+                waiting_on = "turn"
             elif pinned and any(be["name"] == pinned and be["up"]
                                 and prefills(be) for be in self.backends):
-                wants = "pinned"
+                waiting_on = "pinned"
             elif w["tokens"] > largest:
-                wants = "big"
+                waiting_on = "big"
             else:
-                wants = "prefill"
+                waiting_on = "prefill"
             # `tokens` includes reply_tokens, as begin_wait was handed it. The
             # fix is for the ticket to carry prompt and room as two numbers.
             rows.append({"conv": short_key(w["conv"]), "since": w["since"],
                          "waited": round(now - w["since"], 1),
-                         "tokens": w["tokens"], "wants": wants,
+                         "tokens": w["tokens"], "waiting_on": waiting_on,
                          "images": w.get("images", 0),
                          "image_tokens": w.get("image_tokens", 0),
-                         "backend": pinned if wants == "pinned" else None})
+                         "backend": pinned if waiting_on == "pinned" else None})
         rows.sort(key=lambda r: r["since"])
         return rows
 
@@ -660,12 +660,12 @@ class Pool:
         return max([be["n_ctx"] for be in self.backends
                     if be["up"] and prefills(be)], default=0)
 
-    def acquire(self, conv, tokens, wanted=None):
+    def acquire(self, conv, tokens, alive=None):
         """Take a slot on the backend holding this conversation.
 
         A busy box is a queue, not a refusal, so the wait has no deadline. It
         ends when a slot frees, when no backend can serve the request, or when
-        `wanted` says the client left. A pin holds for pin_patience."""
+        `alive` says the client left. A pin holds for pin_patience."""
         patience = time.time() + self.tuning.pin_patience
         spill = False              # set once the pin is given up on
 
@@ -699,7 +699,7 @@ class Pool:
                     b["up"] and prefills(b) for b in self.backends)
                 if not served_by:
                     return None
-                if wanted is not None and not wanted():
+                if alive is not None and not alive():
                     return None
 
                 # A pin is worth a short wait, not an idle backend.
@@ -945,7 +945,7 @@ class Pool:
         return True
 
     def warm_prefix(self, conv, cuts, messages, system, tools, be, slot,
-                    path, wanted=None):
+                    path, alive=None):
         """Load the opening this request shares into a slot on this backend.
         Only an opening the router already has: that is a file read. An
         opening the router lacks is written down for the builder. Returns
@@ -1040,7 +1040,7 @@ class Pool:
         if plan[0] == "load":
             return self._load_prefix(plan[1], plan[2], be, plan[3])
         if plan[0] == "wait":
-            return self._wait_for_opening(plan[1], be, slot, wanted)
+            return self._wait_for_opening(plan[1], be, slot, alive)
         try:
             return self._read_prefix(base, messages, system, tools, be,
                                      plan[3], self.store.drop, "base-",
@@ -1050,14 +1050,14 @@ class Pool:
                 self.building.pop(plan[1], None)
                 self.cv.notify_all()
 
-    def _wait_for_opening(self, key, be, slot, wanted=None):
+    def _wait_for_opening(self, key, be, slot, alive=None):
         """Wait for another request to save the opening, then load it.
         Measured: five sessions starting together read 92,000 tokens where
         24,000 would do, and the last finished after seventeen minutes."""
         deadline = time.time() + self.tuning.build_patience
         with self.cv:
             while key in self.building and time.time() < deadline:
-                if wanted is not None and not wanted():
+                if alive is not None and not alive():
                     return False    # this wait holds a prefill slot
                 self.cv.wait(1.0)
             name = self.openings.get(key)
@@ -1129,7 +1129,7 @@ class Pool:
         self.store.write_pins(kept)
         return len(kept)
 
-    def hand_off(self, conv, source, tokens, remove=None, wanted=None):
+    def hand_off(self, conv, source, tokens, remove=None, alive=None):
         """Move a conversation to the backend it generates on.
 
         The prefiller is released before the wait to generate. The other
@@ -1152,7 +1152,7 @@ class Pool:
         while target is None and not generates(source):
             # Nothing to carry this to, and the instance holding it does
             # not generate. Wait, holding a prefill slot.
-            if wanted is not None and not wanted():
+            if alive is not None and not alive():
                 # The client leaving mid-turn, which the caller's ending
                 # already finishes. The give-up below is not: past the save
                 # the cache is on disk and only the reply is lost.
@@ -1179,10 +1179,10 @@ class Pool:
 
         while True:
             # None once the last generator went away.
-            free = None if target is None else self._wait_to_generate(target, wanted)
+            free = None if target is None else self._wait_to_generate(target, alive)
             if free is not None:
                 break
-            if wanted is not None and not wanted():
+            if alive is not None and not alive():
                 return None                # parked, and nobody to answer
             if generates(source):
                 # The generator went away. A slow answer beats none.
@@ -1244,7 +1244,7 @@ class Pool:
                     return be
             return None
 
-    def _wait_to_generate(self, target, wanted):
+    def _wait_to_generate(self, target, alive):
         """Wait until the generator has a slot. Returns the slot id, or None
         when the generator cannot serve this turn or the client left."""
         with self.cv:
@@ -1259,7 +1259,7 @@ class Pool:
                         if free is not None:
                             target["busy"] += 1   # counted like a request
                             return free
-                    if wanted is not None and not wanted():
+                    if alive is not None and not alive():
                         return None
                     self.cv.wait(1.0)
         finally:

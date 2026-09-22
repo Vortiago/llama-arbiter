@@ -2,7 +2,7 @@
 
 Every call the router makes to a llama-server goes through here. Before this
 there were four transports: bare urlopen for the three read-only endpoints,
-http_post for the slot files, http_post_wanted for the prefill probe, and a
+http_post for the slot files, http_post_watched for the prefill probe, and a
 urllib Request for the forward. Only http_post could be substituted, and it
 was threaded through thirteen Pool methods as a `post` parameter. The other
 three could be reached from a test only over a socket.
@@ -16,7 +16,7 @@ import json
 import urllib.error
 import urllib.request
 
-from ..transport import http_post, http_post_wanted
+from ..transport import http_post, http_post_watched
 
 # A read-only endpoint answers at once or the backend is in trouble. A slot
 # file takes as long as the slot takes. Pool hands in Tuning.post_timeout.
@@ -79,7 +79,7 @@ class Link:
 
     def read(self, be, path, payload, alive, timeout):
         """Read a prompt and stop when the client stops waiting. Raises Gone."""
-        return http_post_wanted(be["url"], path, payload, timeout, alive)
+        return http_post_watched(be["url"], path, payload, timeout, alive)
 
     def open(self, be, path, body, headers, method, timeout):
         """The client's own request, passed through. The caller reads the

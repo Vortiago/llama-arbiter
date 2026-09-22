@@ -268,15 +268,15 @@ class FakeBackend:
 
     # ---- the slot machinery ----------------------------------------------
 
-    def take_slot(self, wanted=None):
+    def take_slot(self, asked=None):
         """Hold a slot for a turn. Waits for one, as a real backend queues."""
         stop = time.time() + self.queue_wait
         while True:
             with self.lock:
-                if wanted is None:
+                if asked is None:
                     choices = self.slots
-                elif 0 <= wanted < len(self.slots):
-                    choices = [self.slots[wanted]]
+                elif 0 <= asked < len(self.slots):
+                    choices = [self.slots[asked]]
                 else:
                     return None
                 for slot in choices:

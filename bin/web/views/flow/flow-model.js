@@ -157,7 +157,7 @@ export function historyOf(status, backend) {
  *              images: number, imageTokens: number }} Arrival */
 
 /** The turns with no slot yet, and what each waits for. `since` is part of the
- * key: a `wants: "turn"` waiter is queued behind another turn of the same conversation.
+ * key: a `waiting_on: "turn"` waiter is queued behind another turn of the same conversation.
  * @param {Status} status @param {number} [aged] seconds since this payload
  *   arrived, measured locally @returns {Arrival[]} */
 export function arrivalsOf(status, aged = 0) {
@@ -168,11 +168,11 @@ export function arrivalsOf(status, aged = 0) {
     // by comparing this clock to the router's epoch: the skew is unknown.
     waited: w.waited + aged,
     tokens: w.tokens,
-    why: w.wants === "turn" ? "behind its own turn"
-      : w.wants === "pinned" ? `holding for ${w.backend || "its backend"}`
-      : w.wants === "big" ? "too big for what is free"
+    why: w.waiting_on === "turn" ? "behind its own turn"
+      : w.waiting_on === "pinned" ? `holding for ${w.backend || "its backend"}`
+      : w.waiting_on === "big" ? "too big for what is free"
       : "needs a reader",
-    kind: w.wants === "turn" ? "turn" : w.wants === "pinned" ? "pinned" : "other",
+    kind: w.waiting_on === "turn" ? "turn" : w.waiting_on === "pinned" ? "pinned" : "other",
     images: w.images || 0,
     imageTokens: w.image_tokens || 0,
   }));
