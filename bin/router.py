@@ -2113,13 +2113,21 @@ class Pool:
             # and on a quiet router that is never: 251 GiB of copies sat
             # under a 64 GiB budget with one conversation in a slot.
             spent += self._trim_copies()
+            # After the trim, not `parked`, which counts what the last run
+            # left rather than what this one is keeping: the line read
+            # "131 conversation(s)" on a start that kept 19.
+            keeping = sum(1 for p in self.pins.values() if p.get("parked"))
         for name in spent:
             remove(name)
         self.save_openings()      # trimmed, so write it
-        if openings or parked or spent:
+        if spent:
+            # Or the map still vouches for files this start has deleted,
+            # until whenever the next turn happens to park.
+            self.save_pins()
+        if openings or keeping or spent:
             kinds = [shelf_of(name) for name in openings.values()]
             print(f"[router] kept {kinds.count('base')} system prompt(s), "
-                  f"{kinds.count('deep')} deeper opening(s) and {len(parked)} "
+                  f"{kinds.count('deep')} deeper opening(s) and {keeping} "
                   f"conversation(s), dropped {len(spent)} stale file(s)",
                   flush=True)
 

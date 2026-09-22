@@ -2340,6 +2340,26 @@ class ShutDownCleanly(unittest.TestCase):
         self.assertIsNone(fresh.pins["stale"]["parked"])
         self.assertEqual(fresh.pins["newest"]["parked"], "newest.park")
 
+    def test_the_map_stops_vouching_for_what_the_trim_deleted(self):
+        """Left alone, pins.json still named the copies this start had just
+        removed, until whenever a turn next happened to park. A start that
+        kept 19 of 131 left 112 rows pointing at nothing."""
+        removed = []
+        third = router.PARK_BUDGET // 3
+        rows = []
+        for name, last in (("stale", 100.0), ("older", 200.0), ("newest", 300.0)):
+            (self.root / f"{name}.park").write_bytes(b"x")
+            rows.append({"conv": name, "file": f"{name}.park", "tokens": 9999,
+                         "bytes": third + 1, "turns": 1, "last": last,
+                         "parked_at": last})
+        router.write_rows(router.pins_file(), rows)
+
+        fresh = router.Pool([{"name": "cpu", "url": "http://cpu"}], watch=False)
+        fresh.adopt([f"{n}.park" for n in ("stale", "older", "newest")],
+                    remove=removed.append)
+        kept = {row["conv"] for row in router.read_rows(router.pins_file())}
+        self.assertEqual(kept, {"older", "newest"})
+
     def test_when_a_conversation_last_ran_survives_the_restart(self):
         """The budget sweep drops whatever has gone longest without a turn,
         so that time has to outlive the process. Restored as `now` instead,
