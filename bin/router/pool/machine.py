@@ -271,12 +271,17 @@ class Flow:
         self.live = {}                        # conv -> current stage and where
         self.log = deque(maxlen=flow_log)     # newest first, for the animation
 
-    def note(self, conv, stage, backend=None, slot=None):
-        """Move a turn to its next stage. Held under the lock."""
+    def note(self, conv, stage, backend=None, slot=None, kind=None):
+        """Move a turn to its next stage. Held under the lock.
+
+        `kind` is a word for the work, or None for an ordinary turn. This
+        class does not read it. The turn keeps the word once one stage says
+        it, so a stage noted from inside the pool does not drop it."""
         if not conv:
             return
         now = time.time()
         row = self.live.get(conv)
+        kind = kind or (row or {}).get("kind")
         if stage == "done":
             if row is None:
                 return
@@ -284,10 +289,10 @@ class Flow:
                                      since=None, changed=None))
             del self.live[conv]
             return
-        if (row and row["stage"] == stage
+        if (row and row["stage"] == stage and row["kind"] == kind
                 and row["backend"] == backend and row["slot"] == slot):
             return
-        entry = {"conv": short_key(conv), "stage": stage,
+        entry = {"conv": short_key(conv), "stage": stage, "kind": kind,
                  "backend": backend, "slot": slot}
         self.live[conv] = dict(entry, since=row["since"] if row else now,
                                changed=now)

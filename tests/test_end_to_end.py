@@ -151,9 +151,12 @@ class EndToEnd(unittest.TestCase):
         # A pin worth 20 seconds in production is worth a fraction of one
         # here. handoff is on whatever the shipped default is, because these
         # tests are about the move.
+        # The prompts here are a few hundred bytes, so park_min_tokens would
+        # refuse every copy and these cases would watch nothing happen. They
+        # are about the machinery; TheFloorOnShortPrompts is about the floor.
         SANDBOX.tuning = replace(SANDBOX.tuning, poll=0.05,
                                 pin_patience=0.3, park_all_timeout=5.0,
-                                handoff=True)
+                                handoff=True, park_min_tokens=0)
 
         self.stubs = []
         self.pools = []
@@ -384,6 +387,41 @@ class ParkBeforeTheNewcomer(EndToEnd):
         self.assertIsNone(pool.pins["resident"]["parked"])
         self.assertIsNone(pool.pins["resident"]["slot"])
         self.assertFalse((SANDBOX.store.slots / "resident.park").exists())
+
+
+class TheFloorOnShortPrompts(EndToEnd):
+    """A prompt too short to be worth a copy is read again instead.
+
+    A copy costs the same few hundred megabytes whatever it holds. Measured
+    on this machine over 3,806 turns, a recall of a prompt under 1,024
+    tokens carried 36 of them: seconds of reading, for a file that displaces
+    a conversation worth keeping."""
+
+    def test_a_short_prompt_leaves_no_copy_behind(self):
+        SANDBOX.tuning = replace(SANDBOX.tuning, park_min_tokens=1024)
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool)
+        self.turn(url, "brief")
+        self.turn(url, "newcomer")
+
+        paths = [row["path"] + row["query"] for row in self.cpu.requests]
+        self.assertNotIn("/slots/0?action=save", paths)
+        self.assertIsNone(pool.pins["brief"]["parked"])
+        self.assertFalse((SANDBOX.store.slots / "brief.park").exists())
+
+    def test_a_long_prompt_is_copied_as_before(self):
+        """The same two turns, with a prompt over the floor."""
+        SANDBOX.tuning = replace(SANDBOX.tuning, park_min_tokens=1024)
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool)
+        # CHARS_PER_TOK is 4, so this clears the floor by the router's own
+        # estimate without the stub having to tokenise anything.
+        long_enough = "word " * 2000
+        self.turn(url, "wordy", text=long_enough)
+        self.turn(url, "newcomer")
+
+        self.assertEqual(pool.pins["wordy"]["parked"], "wordy.park")
+        self.assertTrue((SANDBOX.store.slots / "wordy.park").exists())
 
 
 class DrainUnderLoad(EndToEnd):

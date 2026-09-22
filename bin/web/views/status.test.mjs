@@ -4,7 +4,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isStalled, secondsLeft, poolReason, nextFree, contendedRate, reuseShare, waitLabel,
-         cacheShort, promptBands, cutDeeper, throughText, deeperAnswer } from "./status.js";
+         cacheShort, promptBands, cutDeeper, throughText, deeperAnswer,
+         slotKey, workBySlot, workLabel } from "./status.js";
 
 /** @param {Partial<import("./status.js").Slot>} over */
 const slot = (over) => ({ id: 0, busy: true, prompt: 0, done: 0, cached: 0, decoded: 0,
@@ -12,6 +13,34 @@ const slot = (over) => ({ id: 0, busy: true, prompt: 0, done: 0, cached: 0, deco
 /** @param {Partial<import("./status.js").Backend>} over */
 const backend = (over) => ({ name: "cpu", up: true, slots: 1, busy: 0, served: 0, active: 0,
   n_ctx: 150000, ...over });
+
+test("a slot key reads the same whichever part of the payload it came from", () => {
+  assert.equal(slotKey({ backend: "cpu0_0", slot: 2 }), "cpu0_0:2");
+  assert.equal(slotKey({ backend: null, slot: null }), "");
+});
+
+test("the work label reaches the slot the router put it on", () => {
+  // A typed turn is labelled at prefill and keeps the label to `done`, so
+  // whichever stage the payload catches, the slot wears it.
+  /** @param {string} stage @returns {import("./status.js").Stage} */
+  const at = (stage) => /** @type {any} */ (stage);
+  const status = { flow: { live: [
+    { conv: "a", stage: at("prefill"), backend: "cpu0_0", slot: 1, since: 1, changed: 1, kind: "typed" },
+    { conv: "b", stage: at("generate"), backend: "gpu0_0", slot: 0, since: 1, changed: 1, kind: null },
+    { conv: "c", stage: at("queued"), backend: null, slot: null, since: 1, changed: 1, kind: "typed" },
+  ], log: [] } };
+  assert.deepEqual([...workBySlot(status)], [["cpu0_0:1", "typed"]],
+    "an ordinary turn wears nothing, and a queued turn stands on no slot");
+  assert.deepEqual([...workBySlot({})], []);
+});
+
+test("an unlabelled turn shows nothing and an unknown label shows its word", () => {
+  assert.equal(workLabel(null), null);
+  assert.equal(workLabel(undefined), null);
+  assert.equal(workLabel("typed")?.word, "typed question");
+  // A newer router may invent a label. Say what it sent rather than nothing.
+  assert.deepEqual(workLabel("rerank"), { icon: "◆", word: "rerank", why: "" });
+});
 
 test("a generating slot under half a token a second is stalled", () => {
   assert.equal(isStalled(slot({ phase: "generating", tg_rate: 0.05 })), true);

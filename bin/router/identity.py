@@ -50,6 +50,30 @@ def copy_is_current(record):
     return bool(record.get("parked")) and record.get("parked_turn") == record.get("turns")
 
 
+def copy_worth(record):
+    """What a copy on disk earns, against what it costs to hold.
+
+    The tokens it saves reading again, times the turns that have asked for
+    them, over the bytes it takes. A question asked once and never returned
+    to earns almost nothing however recently it was written; a conversation
+    in daily use earns its size many times over. park_budget spends on this
+    order, so the copies that go are the ones nobody comes back for."""
+    return ((record.get("tokens") or 0) * (record.get("turns") or 1)
+            / max(1, record.get("bytes") or 0))
+
+
+def worth_keeping(record, tuning):
+    """Whether a copy of this conversation earns a place on disk.
+
+    Only about storing one. A copy written to carry a turn to another
+    instance is transport, and travels whatever it holds; so is the one that
+    salvages a read the client gave up on, where the alternative is reading
+    an hour of prompt again from nothing."""
+    if not tuning.park_min_tokens:
+        return True
+    return (record.get("tokens") or 0) - tuning.reply_tokens >= tuning.park_min_tokens
+
+
 def file_safe(key):
     """A conversation key that also works as a file name.
 

@@ -62,9 +62,12 @@ def backend(name, pref, slots=1, busy=0, n_ctx=150000, up=True):
             "n_ctx": n_ctx, "up": up}
 
 
-def pin(backend_name, slot=0, tokens=1000, last=0.0, inflight=False,
-        turns=1,
+def pin(backend_name, slot=0, tokens=SANDBOX.tuning.reply_tokens + 8192,
+        last=0.0,
+        inflight=False, turns=1,
         moved=None, parked=None, parked_turn=None):
+    # `tokens` clears PARK_MIN_TOKENS by default, or no test about parking
+    # would park anything. A test about the floor names its own number.
     # A copy is of one turn. `parked_turn` defaults to the turn this pin is on,
     # so `parked=` alone means the copy is current; pass an earlier number for
     # a copy the slot has run past.
@@ -1573,10 +1576,11 @@ class ParkBeforeAdmitting(SlotDirCase):
         self.assertEqual(self.pool.pins["old"]["bytes"], 200_000_000)
 
     def test_the_copy_just_written_is_the_one_that_stays(self):
-        """Newest means most recently written, not the oldest pin.
+        """Whatever it is worth, and whatever it cost.
 
-        The conversation parked here was pinned first, so by pin order it is
-        the oldest and the budget drops it the moment it lands."""
+        The copy written here is the larger of the two, so by worth alone it
+        goes first and the budget drops it the moment it lands. The sweep
+        counts it before anything else instead."""
         removed = []
         half = SANDBOX.tuning.park_budget // 2
         self.pool.pins["early"] = pin("cpu", slot=0, last=1.0, inflight=True)
@@ -1600,7 +1604,8 @@ class ParkBeforeAdmitting(SlotDirCase):
         self.assertEqual(written.count("stuck.park"), 1)
 
     def test_keeps_the_copies_that_fit_the_budget(self):
-        """Copies run oldest first. The oldest go when the budget is spent."""
+        """Two copies that earn the same are separated by nothing else, so
+        the older one goes. The budget still has to stop somewhere."""
         removed = []
         half = SANDBOX.tuning.park_budget // 2
         self.hold("old", half, last=1.0)
@@ -1620,6 +1625,82 @@ class ParkBeforeAdmitting(SlotDirCase):
             "new", self.cpu, 0, remove=removed.append)
         self.assertEqual(removed, [])
         self.assertEqual(self.pool.pins["new"]["parked"], "new.park")
+
+    def test_the_copy_nobody_returns_to_goes_before_one_in_daily_use(self):
+        """Ordered by write time this was backwards. A run of one-shot
+        questions filled the disk with copies of 36 tokens each, and the
+        sweep dropped the conversations they displaced because those had
+        been written earlier. Both copies here are the same size, so only
+        the tokens they hold and the turns that asked for them separate
+        them."""
+        removed = []
+        half = SANDBOX.tuning.park_budget // 2
+        asked_once = pin("cpu", slot=0, last=99.0, tokens=36, turns=1,
+                         parked="asked_once.park")
+        asked_once["bytes"] = half
+        long_running = pin("cpu", slot=0, last=1.0, tokens=80_000, turns=40,
+                           parked="long_running.park")
+        long_running["bytes"] = half
+        # Written most recently, so by the old order it outlived the other.
+        self.pool.pins["asked_once"] = asked_once
+        self.pool.pins["long_running"] = long_running
+        self.pool.pins["new"] = pin("cpu", slot=0, last=0.0, inflight=True)
+        linked(self.pool, self.saver(written=half))
+        self.pool._save_park("new", self.cpu, 0, remove=removed.append)
+        self.assertEqual(removed, ["asked_once.park"])
+        self.assertEqual(self.pool.pins["long_running"]["parked"],
+                         "long_running.park")
+
+    def test_a_copy_earns_by_what_it_holds_and_how_often_it_is_asked_for(self):
+        """The three numbers the sweep spends on, one at a time."""
+        same = {"bytes": 1000, "tokens": 1000, "turns": 1}
+        self.assertGreater(router.copy_worth({**same, "tokens": 2000}),
+                           router.copy_worth(same), "more tokens saved")
+        self.assertGreater(router.copy_worth({**same, "turns": 2}),
+                           router.copy_worth(same), "asked for more often")
+        self.assertGreater(router.copy_worth(same),
+                           router.copy_worth({**same, "bytes": 2000}),
+                           "the same for fewer bytes")
+
+    def test_a_copy_of_nothing_is_worth_nothing(self):
+        """A pin the router adopted at startup knows neither number yet."""
+        self.assertEqual(router.copy_worth({}), 0)
+        self.assertEqual(router.copy_worth({"bytes": 0, "tokens": 0}), 0)
+
+    def test_a_short_prompt_is_read_again_rather_than_copied(self):
+        """A copy costs the same few hundred megabytes whatever it holds.
+        Measured here, a recall under 1,024 tokens carried 36 of them."""
+        short = pin("cpu", slot=0, last=1.0,
+                    tokens=SANDBOX.tuning.park_min_tokens - 1
+                    + SANDBOX.tuning.reply_tokens)
+        self.pool.pins["short"] = short
+        post = linked(self.pool, self.saver())
+        self.pool.ensure_parked(self.cpu, "new")
+        self.assertEqual(post.calls, [], "a short prompt was copied to disk")
+        self.assertFalse(short["inflight"], "the turn was left reserved")
+
+    def test_a_long_prompt_still_is_copied(self):
+        self.pool.pins["long"] = pin(
+            "cpu", slot=0, last=1.0,
+            tokens=SANDBOX.tuning.park_min_tokens
+            + SANDBOX.tuning.reply_tokens)
+        post = linked(self.pool, self.saver())
+        self.pool.ensure_parked(self.cpu, "new")
+        self.assertEqual(post.ops()[0], "save")
+
+    def test_the_floor_is_read_in_prompt_tokens_not_the_estimate(self):
+        """`tokens` on a pin carries REPLY_TOKENS of room for the reply. A
+        floor spent against that number would be REPLY_TOKENS lower than it
+        reads."""
+        at_the_floor = {"tokens": SANDBOX.tuning.park_min_tokens
+                        + SANDBOX.tuning.reply_tokens}
+        self.assertTrue(router.worth_keeping(at_the_floor, SANDBOX.tuning))
+        self.assertFalse(router.worth_keeping(
+            {"tokens": at_the_floor["tokens"] - 1}, SANDBOX.tuning))
+
+    def test_nothing_is_refused_when_the_floor_is_off(self):
+        off = replace(SANDBOX.tuning, park_min_tokens=0)
+        self.assertTrue(router.worth_keeping({"tokens": 0}, off))
 
 
 class Recall(unittest.TestCase):
@@ -3528,6 +3609,17 @@ class HandOff(unittest.TestCase):
         self.go(self.mover())
         self.assertEqual(self.pool.pins["a"]["backend"], "gpu")
         self.assertEqual(self.pool.pins["a"]["slot"], 0)
+
+    def test_a_short_prompt_is_carried_like_any_other(self):
+        """park_min_tokens refuses to *store* a copy of a short prompt. This
+        copy is transport: without it the turn cannot reach the instance that
+        generates, and the prompt would be read there from nothing."""
+        self.pool.pins["a"]["tokens"] = 1
+        self.assertFalse(
+            router.worth_keeping(self.pool.pins["a"], SANDBOX.tuning))
+        post = self.mover()
+        self.assertIs(self.go(post), self.gpu)
+        self.assertEqual(post.ops()[0], "save")
 
     def test_the_slot_moves_from_one_backend_to_the_other(self):
         self.go(self.mover())

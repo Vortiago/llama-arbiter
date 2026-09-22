@@ -1,0 +1,54 @@
+<template id="tpl-tryitout">
+  <section class="tryitout">
+    <div class="block">
+      <h3 class="title" title="The text every question is asked about. It is read once, and it stays warm, so the next question about the same state answers without reading it again.">state</h3>
+      <textarea class="mono" data-slot="state" rows="8" spellcheck="false"
+                placeholder="Paste the text the question is about. A log line, a file, a whole codebase."></textarea>
+    </div>
+
+    <div class="block">
+      <h3 class="title" title="One question. The router gives every answer a letter, asks for one token, and reads the probabilities behind it.">question</h3>
+      <div class="ask">
+        <input class="q" type="text" data-slot="question"
+               placeholder="What happened to this turn?">
+        <select data-slot="type" title="What shape the answer takes.">
+          <option value="noul">yes / no</option>
+          <option value="choice">choice</option>
+          <option value="score">score</option>
+        </select>
+        <button type="button" class="small" data-slot="ask">ask</button>
+      </div>
+      <div class="answers" data-slot="answersBox">
+        <label class="note" for="tryitout-criteria" data-slot="criteriaLabel"></label>
+        <textarea class="mono" id="tryitout-criteria" data-slot="criteria" rows="4"
+                  spellcheck="false"></textarea>
+      </div>
+    </div>
+
+    <div class="block">
+      <h3 class="title">answer</h3>
+      <div data-slot="result"></div>
+    </div>
+  </section>
+</template>
+
+<template id="tpl-tryitout-empty">
+  <p class="note" data-slot="text"></p>
+</template>
+
+<template id="tpl-tryitout-answer">
+  <div class="answer">
+    <p class="headline"><strong data-slot="headline"></strong><span class="dim" data-slot="second"></span></p>
+    <div class="rows probs" data-slot="probs"></div>
+    <p class="note" data-slot="mass"></p>
+    <p class="note mono" data-slot="cost"></p>
+  </div>
+</template>
+
+<template id="tpl-tryitout-prob">
+  <div class="row prob">
+    <span data-slot="name"></span>
+    <span class="bar wide"><i class="accent" data-slot="fill"></i></span>
+    <span class="num mono dim" data-slot="p"></span>
+  </div>
+</template>

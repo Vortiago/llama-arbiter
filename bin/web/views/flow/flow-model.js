@@ -3,7 +3,7 @@
  * The flow payload, read without a DOM. Pure, so the tests run in node.
  * Anything that needs a rect or a clock lives in index.js.
  */
-import { backendsOf, slotsOf, STALL_RATE, promptBands } from "../status.js";
+import { backendsOf, slotsOf, slotKey, STALL_RATE, promptBands } from "../status.js";
 
 /** @typedef {import("../status.js").Status} Status */
 /** @typedef {import("../status.js").Backend} Backend */
@@ -25,9 +25,9 @@ export const MARK_PERIOD = 15;
  * aliases past 30 marks a second. A capped wire says so. */
 export const MARK_CAP = 24;
 
-/** Every slot key on this page is built here, so keys from any source read alike.
- * @param {{backend: string|null, slot: number|null}} r */
-export const slotKey = (r) => (r.backend ? `${r.backend}:${r.slot ?? 0}` : "");
+/** Every slot key on this page is built one way. status.js owns it: the
+ * overview reads the same keys out of the same payload. */
+export { slotKey };
 
 /** The rate a reading slot moves at. A slot's own `pp_rate` is 0 until the
  * router's 10 second window closes, so 0 is silence, not a stall. Fall back
@@ -91,7 +91,7 @@ const DOWN_SLOT = { id: 0, busy: false, prompt: 0, done: 0, cached: 0, decoded: 
  *              phase: string, stuck: boolean, bands: ReturnType<typeof promptBands>,
  *              tone: string, rate: number, marks: number, capped: boolean,
  *              decoded: number, ctx: number, nCtx: number, left: number | null,
- *              conv: string | null, history: Bar[] }} SlotNode */
+ *              conv: string | null, kind: string | null, history: Bar[] }} SlotNode */
 
 /** Every live slot, readers first and the generator last, with what it holds.
  * @param {Status} status @param {(key: string) => number} sinceStep
@@ -126,6 +126,9 @@ export function nodesOf(status, sinceStep) {
           ? sl.prompt / readRate(be, sl) : null,
         history,
         conv: held ? held.conv : null,
+        // The router's word for the work, so the card can say what kind of
+        // turn this is. Null on an ordinary one.
+        kind: held?.kind || null,
       });
     }
   }
@@ -357,14 +360,15 @@ export function shelvesOf(status) {
  *              where: string, label: boolean, doomed: boolean }} Block */
 
 /** The copies as shares of PARK_BUDGET. The budget caps bytes, so width is
- * linear in bytes. Newest first, as the sweep orders them: the right-hand end
- * of the run goes next. A label goes only in a block wide enough for it.
+ * linear in bytes. Worth the most first, as the sweep orders them: the
+ * right-hand end of the run goes next. A label goes only in a block wide
+ * enough for it.
  * @param {Status} status @param {number} px strip width
  * @param {number} [minPx] pixels a name needs @param {number} [maxLabels]
  * @returns {{ blocks: Block[], used: number, count: number, live: number, kept: number }} */
 export function blocksOf(status, px, minPx = 44, maxLabels = 6) {
   const files = (status.disk?.files || []).filter((f) => f.kind === "copy")
-    .slice().sort((a, b) => (b.parked_at ?? 0) - (a.parked_at ?? 0));
+    .slice().sort((a, b) => (b.worth ?? 0) - (a.worth ?? 0));
   const budget = status.disk?.copies?.budget || 1;
   const held = residency(files, backendsOf(status), status.flow?.live || []);
   /** @type {Block[]} */

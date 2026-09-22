@@ -7,6 +7,7 @@ from ..pool.turn import Ask
 from ..protocol.body import request_shape
 from ..protocol.splice import AnthropicSplice, OaiUsageSplice, wants_usage, with_usage
 from ..protocol.sse import _say, anthropic, ping_for, sse_event, wants_ping
+from ..protocol.systemone import SYSTEMONE, Refused, systemone_body, systemone_plan
 from ..transport import said_in
 from .config import CONFIG_FILES, client_config, host_only
 
@@ -28,6 +29,7 @@ INFERENCE = {
     "/chat/completions", "/v1/chat/completions",
     "/infill", "/v1/messages", "/responses", "/v1/responses",
     "/embedding", "/embeddings", "/v1/embeddings",
+    SYSTEMONE,
 }
 
 
@@ -289,9 +291,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._error(503, "no backend is up")
             return self._forward(be, body)
 
-        self.server.pool.turn(Ask(path, body, session_key(self.headers)), self)
+        # A typed question becomes an ordinary chat body: the rubric and
+        # the state, which every question shares. The read pass carries the
+        # first question, so that both phases send the same prompt. Reading
+        # the state alone cost the first question a full re-read on
+        # production: 351 tokens of a state of 348.
+        plan = None
+        if path == SYSTEMONE:
+            try:
+                plan = systemone_plan(body)
+                body = json.dumps(
+                    systemone_body(plan, plan["questions"][0])).encode()
+            except Refused as err:
+                return self._error(400, str(err))
+        self.server.pool.turn(
+            Ask(path, body, session_key(self.headers), plan), self)
 
     # -- the client a turn answers. See pool/turn.py for what each one owes.
+
+    def answer(self, payload):
+        """Send one whole reply the router composed. A typed question
+        gathers its answers rather than forwarding a stream."""
+        self._send(200, json.dumps(payload).encode())
 
     sending = None                             # set per request in _route
     streaming = False                          # a stream has already begun

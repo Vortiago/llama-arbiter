@@ -11,6 +11,7 @@ whole turn run with no socket.
     open(opening)          start the stream, with its protocol's opening event
     settle()               stop the keep-alive. Twice is safe
     relay(be, body, conv)  send this backend's reply to the client
+answer(payload)        send one whole reply the router composed
     fail(code, message)    say the turn cannot be served. Once a stream has
                            begun there is no status line left, so a client
                            that opened one may only be able to send `message`
@@ -20,6 +21,7 @@ import time
 from dataclasses import dataclass
 
 from ..identity import conversation_id, prompt_key, short_key
+from ..protocol.systemone import SYSTEMONE_UP, answers
 from ..protocol.body import (hoist_system, prompt_cuts, read_only,
                              wants_stream)
 from ..protocol.sse import opening_event
@@ -85,6 +87,10 @@ class Ask:
     path: str
     body: bytes
     conv: str | None = None
+    # What a typed question asks for, or None for an ordinary turn. The
+    # handler plans it: a body it cannot plan is a 400 the public port owes
+    # the client.
+    plan: dict | None = None
 
 
 class Turn:
@@ -92,6 +98,23 @@ class Turn:
 
     def __init__(self, pool):
         self.pool = pool
+
+    def say_answers(self, plan, be, slot, client, began, read_stats):
+        """Ask every question against the slot that holds the state, and
+        answer in one piece. There is one reply a question to gather, so
+        there is nothing to stream on."""
+        said, wrote, steps = answers(self.pool.link, be, slot, plan,
+                                     self.pool.tuning.read_timeout)
+        read = read_stats.get("read_prompt_n") or 0
+        reused = read_stats.get("read_cache_n") or 0
+        client.answer({
+            "model": plan["model"],
+            "answers": said,
+            "usage": {"input_tokens": read + reused, "output_tokens": wrote},
+            "router": {"backend": be["name"], "read": read, "reused": reused,
+                       "took": round(time.time() - began, 2),
+                       "questions": steps},
+        })
 
     def run(self, ask, client):
         pool = self.pool
@@ -107,6 +130,9 @@ class Turn:
             return client.fail(503, "no backend is up yet")
 
         conv, conv_source = name_conversation(ask)
+        work = "typed" if ask.plan else None
+        # The backend has never heard of the router's typed path.
+        up_path = SYSTEMONE_UP if ask.plan else ask.path
         short = short_key(conv) if conv else None
         capture(pool.capture_dir, conv, ask.body, pool.tuning.capture_keep)
         # This model's template refuses a late system message.
@@ -124,7 +150,7 @@ class Turn:
 
         ticket = pool.begin_wait(conv, tokens, images, image_charge)
         try:
-            mine = pool.claim_turn(conv, ticket, client.alive)
+            mine = pool.claim_turn(conv, ticket, client.alive, work)
             be = pool.acquire(conv, tokens, client.alive) if mine else None
         finally:
             pool.end_wait(ticket)
@@ -138,6 +164,8 @@ class Turn:
             client.settle()
             return client.fail(503, "no backend can serve this request")
         serving = be
+        # The word the flow board puts on this turn. A typed question
+        # writes one token where a prompt writes a reply.
         left = False                           # the client gave up mid-read
         read_stats = {}
         recalled = loaded = warm = False
@@ -153,7 +181,7 @@ class Turn:
                 client.settle()
                 client.fail(503, f"no slot is free on {be['name']}")
                 return
-            pool.note_stage(conv, "prefill", be["name"], slot)
+            pool.note_stage(conv, "prefill", be["name"], slot, work)
             pool.ensure_parked(be, conv)
             if pool.forget_stale_park(conv, cuts):
                 pool.events.write("start_over", conv=short, reason="stale_copy",
@@ -168,21 +196,28 @@ class Turn:
             messages = system = tools = None
             if asked is not None:
                 # `asked` is reused: a second parse of this body is megabytes.
-                answer = pool.link.read(be, ask.path,
+                answer = pool.link.read(be, up_path,
                                         dict(asked, id_slot=slot),
                                         client.alive, pool.tuning.read_timeout)
                 timing = (answer or {}).get("timings") or {}
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
                               "read_cache_n": timing.get("cache_n")}
                 pool.note_slot(conv, slot)
-                serving = pool.hand_off(conv, be, tokens, alive=client.alive)
+                serving = pool.hand_off(conv, be, tokens,
+                                        alive=client.alive,
+                                        migrate=not ask.plan)
                 if serving is None:
                     raise Gone("after its prompt was parked")
             if serving is be:
                 # Nothing was carried. hand_off already noted a carried turn.
-                pool.note_stage(conv, "generate", be["name"], slot)
+                pool.note_stage(conv, "generate", be["name"], slot, work)
             client.settle()
-            client.relay(serving, body, conv)
+            if ask.plan:
+                self.say_answers(ask.plan, serving,
+                                 slot if serving is be else None,
+                                 client, start, read_stats)
+            else:
+                client.relay(serving, body, conv)
         except Gone as gone:
             # Nobody to answer. What the read got through is parked below.
             print(f"[router] {short} left {gone}, {time.time() - start:.0f}s "

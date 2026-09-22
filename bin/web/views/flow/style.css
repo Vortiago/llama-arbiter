@@ -108,6 +108,9 @@
     border-color: color-mix(in oklch, var(--bad), var(--hairline) 40%);
     background: color-mix(in oklch, var(--surface), var(--f-ground) 65%); }
   .f-node[data-stuck]              { color: var(--bad);  border-color: color-mix(in oklch, var(--bad), var(--hairline) 35%); }
+  /* A typed question keeps the phase colour and takes a violet tab across the
+     top, so the card reads as a different kind of work before any word does. */
+  .f-node[data-kind] { border-top: 3px solid var(--typed); padding-top: calc(.5rem - 2px); }
   .f-node[data-holds] { box-shadow: 0 3px 0 -0.5px var(--f-live), 0 0 20px -12px currentColor; }
   .f-node.paired { outline: 2px solid var(--accent); outline-offset: 2px; }
   .f-node::before, .f-node::after {
@@ -131,12 +134,20 @@
   .f-gate-first::before { display: none; }
   .f-gate::after  { right: -3.5px; }
   .f-node-head, .f-node-foot { margin: 0; display: flex; gap: .4rem; align-items: baseline; }
+  /* The head carries a name, a conversation, a kind and a phase. At the 13rem
+     the readers column can shrink to, that is wider than the card. */
+  .f-node-head { flex-wrap: wrap; row-gap: .25rem; }
   .f-name { font-family: var(--mono); font-size: .92rem; font-weight: 600; color: var(--text); letter-spacing: -.01em; }
   .f-conv { font-family: var(--mono); font-size: .68rem; padding: .02rem .35rem; border-radius: 1rem;
     background: color-mix(in oklch, currentColor, transparent 86%);
     box-shadow: inset 0 0 0 1px color-mix(in oklch, currentColor, transparent 70%); color: var(--text); }
   .f-conv[hidden] { display: none; }
   .f-phase { font-size: .7rem; margin-inline-start: auto; display: inline-flex; gap: .25rem; align-items: baseline; }
+  .f-kind { font-size: .64rem; display: inline-flex; gap: .22rem; align-items: baseline;
+    padding: .02rem .38rem; border-radius: 1rem; color: var(--typed);
+    background: color-mix(in oklch, var(--typed), transparent 88%);
+    box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--typed), transparent 62%); }
+  .f-kind[hidden] { display: none; }
   .f-ico { font-style: normal; font-family: initial; font-size: .74rem; line-height: 1; }
   .f-node-foot { font-size: .7rem; color: var(--text-dim); font-family: var(--mono); gap: .7rem; }
   /* the prompt: reused, read, still to read. A 2px gap separates the bands. */

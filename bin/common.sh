@@ -95,11 +95,17 @@ COMMON=(
   # rewound without one at or below the point where a prompt stops matching.
   # At the default 8192, a 49,533 token prompt held four, the lowest at 17,271.
   # A turn sharing 17,270 tokens found none below it and re-read all 49,533.
-  # At 2048 it re-reads at most 2048. One checkpoint costs 115 MiB plus
-  # 1.9 KiB a token: 24 across a 50,000 token prompt is about 4 GiB.
+  # At 2048 it re-reads at most 2048.
   --checkpoint-min-step 2048
-  --ctx-checkpoints 64   # room for a long prompt at 2048 apart without
-                         # evicting the earliest one.
+  # Keep the list short, because llama.cpp only applies the spacing above when
+  # the list is full (server-context.cpp, create_checkpoint). Held at 64 it
+  # never filled, so nothing was ever spaced: every prompt leaves a pair 4 and
+  # 4 + n_ubatch from its end, and they piled up. Measured on this model, one
+  # checkpoint is about 113 MiB whatever it covers, so 60 of them made 6.8 GiB
+  # of a 12 GiB saved slot, all inside one kilotoken.
+  # 23,713 restores in the logs: 99.6% took the 3rd checkpoint or newer, and
+  # the deepest walk went back 2,552 tokens. Eight at 2048 apart spans 16k.
+  --ctx-checkpoints 8
   --no-cache-idle-slots  # Otherwise llama.cpp copies every idle slot into its
                          # RAM cache when a task starts and, under --kv-unified,
                          # CLEARS the slot the router has just restored.

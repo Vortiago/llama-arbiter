@@ -64,6 +64,12 @@ class Link:
 
     # -- work
 
+    def ask(self, be, path, payload, timeout=None):
+        """Post one request and give back the whole reply. For a caller that
+        gathers the answer rather than streaming it on."""
+        return http_post(be["url"], path, payload,
+                         self.post_timeout if timeout is None else timeout)
+
     def render(self, be, route, payload, timeout=None):
         """What the backend's own template makes of these messages."""
         return http_post(be["url"], route, payload,

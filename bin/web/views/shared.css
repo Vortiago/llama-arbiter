@@ -31,10 +31,28 @@
   .phase.down, .phase.stalled { background: var(--bad); color: #fff; }
   .phase.idle { background: color-mix(in oklch, var(--text-dim), transparent 80%); }
   .phase.draining { background: transparent; color: var(--busy); border: 1px solid var(--busy); }
+  button.small {
+    font: inherit; font-size: .78rem; color: var(--text-dim); background: transparent;
+    border: 1px solid var(--hairline); border-radius: var(--r); padding: .05rem .5rem; cursor: pointer;
+  }
+  button.small:hover { color: var(--text); }
+  button.small:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
   .pill {
     font-size: .72rem; padding: .02rem .4rem; border-radius: 1rem;
     border: 1px solid var(--hairline); color: var(--text-dim); white-space: nowrap;
   }
+
+  /* A kind of work, worn beside the phase. The phase says what a slot is
+     doing; this says what sort of turn it is doing it for. */
+  .kind {
+    font-size: .72rem; padding: .02rem .45rem; border-radius: 1rem;
+    white-space: nowrap; display: inline-flex; gap: .25rem; align-items: baseline;
+    color: var(--typed); background: color-mix(in oklch, var(--typed), transparent 88%);
+    box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--typed), transparent 60%);
+  }
+  .kind[hidden] { display: none; }
+  .kind i { font-style: normal; }
 
   .bar {
     display: inline-block; width: 7rem; height: .7rem; border-radius: 1rem;

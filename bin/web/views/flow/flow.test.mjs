@@ -130,6 +130,17 @@ test("a node carries the conversation the flow says is in its slot", () => {
   assert.deepEqual(n.bands, { total: 118109, reused: 7821, read: 87836, left: 22452 });
 });
 
+test("a node carries the router's label for the turn in its slot", () => {
+  /** @param {string | null} kind */
+  const status = (kind) => ({
+    backends: [backend({ name: "cpu0_0", slots_detail: [slot({ phase: /** @type {const} */ ("reading") })] })],
+    flow: { live: [{ conv: "f37a52af/230358", stage: /** @type {const} */ ("prefill"),
+                     backend: "cpu0_0", slot: 0, since: 1, changed: 1, kind }], log: [] },
+  });
+  assert.equal(nodesOf(status("typed"), never)[0].kind, "typed");
+  assert.equal(nodesOf(status(null), never)[0].kind, null, "an ordinary turn wears no label");
+});
+
 test("the arrivals say what each turn is waiting for", () => {
   const rows = arrivalsOf({ waiting_detail: [
     { conv: "a", since: 0, waited: 4695.6, tokens: 70989, waiting_on: "turn", backend: null },
@@ -328,20 +339,20 @@ test("a copy is as wide as its real share of the budget", () => {
 });
 
 test("the strip is ordered the way the budget sweeps, and marks what goes next", () => {
-  // The sweep keeps the newest parked copies and drops the oldest, so newest
-  // sits left and the tail of the filled run is what the next park sweeps away.
-  const f = (conv, bytes, parked_at) => ({ name: conv, kind: "copy", conv, bytes, parked_at, backend: "x" });
+  // The sweep keeps the copies worth the most and drops the rest, so the
+  // best earner sits left and the tail of the filled run goes next.
+  const f = (conv, bytes, worth) => ({ name: conv, kind: "copy", conv, bytes, worth, backend: "x" });
   const status = { backends: [], disk: { copies: { count: 3, bytes: 3, budget: 100 },
     bases: { count: 0 }, deeps: { count: 0 },
-    files: [f("old", 40, 10), f("new", 40, 30), f("mid", 40, 20)] } };
+    files: [f("once", 40, 1), f("daily", 40, 30), f("weekly", 40, 20)] } };
   const { blocks } = blocksOf(status, 900);
-  assert.deepEqual(blocks.map((b) => b.conv), ["new", "mid", "old"], "newest parked first");
+  assert.deepEqual(blocks.map((b) => b.conv), ["daily", "weekly", "once"], "worth the most first");
   assert.deepEqual(blocks.map((b) => b.doomed), [false, false, true],
-    "40 + 40 fits in 100, the third does not, so the oldest is what goes");
+    "40 + 40 fits in 100, the third does not, so the one nobody returns to goes");
   const huge = { ...status, disk: { ...status.disk,
     files: [f("only", 400, 30)] } };
   assert.deepEqual(blocksOf(huge, 900).blocks.map((b) => b.doomed), [false],
-    "the newest copy is never swept however large - dropping what was just written is the bug that wrote one file 1,456 times");
+    "the copy just written is never swept however large - dropping what was just written is the bug that wrote one file 1,456 times");
 });
 
 test("a name only goes inside a block that can hold it", () => {

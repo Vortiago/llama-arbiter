@@ -19,7 +19,7 @@ import {
   MARK_PERIOD, READ_RATE, PHASE, nodesOf, arrivalsOf, residency, holderOf, transferOf,
   since, tapeOf, skipped, shelvesOf, blocksOf, loadOf, parkedOf,
 } from "./flow-model.js";
-import { backendsOf, reuseShare } from "../status.js";
+import { backendsOf, reuseShare, workLabel } from "../status.js";
 
 /** @typedef {import("../status.js").Status} Status */
 /** @typedef {import("./flow-model.js").SlotNode} SlotNode */
@@ -162,6 +162,19 @@ export default {
       const conv = pick(node, "conv");
       conv.hidden = !n.conv;
       conv.textContent = n.conv ? n.conv.split("/")[0] : "";
+
+      // A kind of work is not a phase: the card keeps its reading or
+      // generating colour and wears the label beside it.
+      const work = workLabel(n.kind);
+      const kind = pick(node, "kind");
+      kind.hidden = !work;
+      if (work) {
+        slot(node, { kindIcon: work.icon, kindWord: work.word });
+        kind.title = work.why;
+      }
+      // Deleted, not blanked: `[data-kind]` would match an empty attribute.
+      if (n.kind) node.dataset.kind = n.kind;
+      else delete node.dataset.kind;
 
       const b = n.bands;
       const reused = pick(node, "reused"), read = pick(node, "read");

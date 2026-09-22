@@ -60,6 +60,14 @@ class Tuning:
     # 36.6 KiB a token: 0.2 to 5.4 GiB at ctx 150000. Size it to the disk RUN
     # is on. Too low displaces a copy still in use, which costs a full re-read.
     park_budget: int = 256 * 1024 ** 3
+    # A prompt shorter than this is read again rather than copied to disk. A
+    # copy costs about the same whatever little it holds, and a prompt this
+    # short is back in seconds. Measured over 3,806 turns: a floor halves the
+    # saves, 496 a day to 229, and costs 75 turns a day a re-read, median
+    # 2.4 s and worst 40 s. Sizes come in two clumps, one-shot questions near
+    # 300 tokens and sessions at 57,000 and up, so anything from 512 to 4096
+    # does the same thing. 0 turns the floor off and copies everything.
+    park_min_tokens: int = 1024
     # Disk for the saved openings, in bytes. One block is 0.6 to 3.7 GB. Least
     # recently used goes first. Size it to the disk the blocks are on.
     block_budget: int = 64 * 1024 ** 3
@@ -102,6 +110,7 @@ class Tuning:
         env = os.environ if env is None else env
         return cls(
             park_budget=int(float(env.get("PARK_BUDGET_GB") or 256) * 1024 ** 3),
+            park_min_tokens=int(env.get("PARK_MIN_TOKENS") or 1024),
             block_budget=int(float(env.get("BLOCK_BUDGET_GB") or 64) * 1024 ** 3),
             handoff=handoff_on(env),
             cache_log=env.get("CACHE_LOG", "1") == "1")

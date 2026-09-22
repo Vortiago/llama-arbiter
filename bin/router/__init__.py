@@ -29,8 +29,8 @@ The modules, in the order a turn meets them:
 from .backends import (DEFAULT_BACKENDS, by_place, generates, prefills,
                        read_backend_table)
 from .identity import (SHELF_MARKS, client_kind, conversation_id,
-                       copy_is_current, file_safe, prompt_key,
-                       session_key, short_key)
+                       copy_is_current, copy_worth, file_safe, prompt_key,
+                       session_key, short_key, worth_keeping)
 from .backend.poll import (RATE_FLOOR, counters, per_second, slot_state,
                           stats)
 from .pool.machine import (GPU_CMD, Flow, History, Machine,
@@ -45,6 +45,12 @@ from .protocol.body import (IGNORED_KEYS, SYSTEM_ROLES, closes, common_prefix,
                             wants_stream, without_ignored)
 from .protocol.splice import (AnthropicSplice, OaiUsageSplice, wants_usage,
                               with_usage)
+from .protocol.systemone import (SYSTEMONE, SYSTEMONE_LETTERS,
+                                 SYSTEMONE_RUBRIC, SYSTEMONE_UP,
+                                 Refused, noul_criteria,
+                                 systemone_body, systemone_options,
+                                 systemone_plan, systemone_read,
+                                 systemone_says)
 from .protocol.sse import (ANTHROPIC_PING, PING, anthropic, opening_event,
                            ping_for, read_event, sse_event, wants_ping)
 from .settings import Tuning
@@ -64,20 +70,24 @@ __all__ = ["ANTHROPIC_PING", "AnthropicSplice", "Ask", "CONFIG_FILES",
     "CacheWatch", "DEFAULT_BACKENDS", "DROP_HEADERS", "EventLog", "Flow",
     "GPU_CMD", "Gone", "HEADER_B64", "Handler", "History", "IGNORED_KEYS",
     "INFERENCE", "MIME", "Machine", "OaiUsageSplice", "PASSED", "PING",
-    "Pool", "RATE_FLOOR", "SHELF_MARKS", "SYSTEM_ROLES", "Server", "Stamped",
-    "Store", "Tuning", "Turn", "VISION", "WEB", "adopt_files", "anthropic",
-    "by_place", "cache_event", "capture", "client_config", "client_kind",
-    "closes", "common_prefix", "conversation_id", "copy_is_current",
-    "counters", "cpu_times", "deepest_shared", "default_provider",
-    "disk_summary", "file_safe", "generates", "gpu_query", "hoist_system",
-    "host_only", "how_started", "http_post", "http_post_watched",
-    "image_size", "image_tokens", "images_in", "leading_system",
-    "message_shape", "name_conversation", "node_busy", "node_meminfo",
+    "Pool", "RATE_FLOOR", "Refused", "SHELF_MARKS", "SYSTEMONE",
+    "SYSTEMONE_LETTERS", "SYSTEMONE_RUBRIC", "SYSTEMONE_UP", "SYSTEM_ROLES",
+    "Server", "Stamped", "Store", "Tuning", "Turn", "VISION", "WEB",
+    "adopt_files", "anthropic", "by_place", "cache_event", "capture",
+    "client_config", "client_kind", "closes", "common_prefix",
+    "conversation_id", "copy_is_current", "copy_worth", "counters",
+    "cpu_times", "deepest_shared", "default_provider", "disk_summary",
+    "file_safe", "generates", "gpu_query", "hoist_system", "host_only",
+    "how_started", "http_post", "http_post_watched", "image_size",
+    "image_tokens", "images_in", "leading_system", "message_shape",
+    "name_conversation", "node_busy", "node_meminfo", "noul_criteria",
     "on_the_page", "opening_event", "opening_key", "parse_cpulist",
     "passed_paths", "per_second", "ping_for", "prefills", "prompt_cuts",
     "prompt_key", "read_backend_table", "read_config", "read_event",
     "read_nodes", "read_only", "read_vision", "request_cost", "request_shape",
     "resident_bytes", "said", "said_in", "session_key", "shelf_of",
-    "short_key", "slot_state", "sse_event", "stats", "template_route",
-    "text_of", "token_estimate", "trim_openings", "wants_ping",
-    "wants_stream", "wants_usage", "with_usage", "without_ignored"]
+    "short_key", "slot_state", "sse_event", "stats", "systemone_body",
+    "systemone_options", "systemone_plan", "systemone_read", "systemone_says",
+    "template_route", "text_of", "token_estimate", "trim_openings",
+    "wants_ping", "wants_stream", "wants_usage", "with_usage",
+    "without_ignored", "worth_keeping"]

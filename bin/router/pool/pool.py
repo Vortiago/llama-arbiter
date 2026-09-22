@@ -3,7 +3,7 @@
 import queue, threading, time
 from collections import OrderedDict, deque
 from ..backends import by_place, generates, prefills
-from ..identity import copy_is_current, short_key
+from ..identity import copy_is_current, copy_worth, short_key, worth_keeping
 from ..protocol.body import common_prefix, deepest_shared, template_route
 from ..settings import Tuning
 from ..sizing import VISION
@@ -173,10 +173,10 @@ class Pool:
                                 "backend": be["name"], "slot": slot,
                                 "bytes": size})
 
-    def note_stage(self, conv, stage, backend=None, slot=None):
+    def note_stage(self, conv, stage, backend=None, slot=None, kind=None):
         """Move a turn along its stages, for the flow dashboard."""
         with self.cv:
-            self.flow.note(conv, stage, backend, slot)
+            self.flow.note(conv, stage, backend, slot, kind)
 
     def begin_wait(self, conv, tokens, images=0, image_tokens_=0):
         """Count a request as waiting until end_wait. Returns its ticket."""
@@ -194,7 +194,7 @@ class Pool:
             self.waiters.pop(ticket, None)
             self.waiting = len(self.waiters)
 
-    def claim_turn(self, conv, ticket, alive=None):
+    def claim_turn(self, conv, ticket, alive=None, kind=None):
         """Hold this conversation until finish_turn. One turn of it at a time.
 
         Returns True when the turn holds it. False means the client left and
@@ -211,7 +211,9 @@ class Pool:
             self.turns[conv] = ticket
             # Noted here, not in begin_wait: a waiting turn must not move the
             # row of the turn ahead, which is keyed by conversation too.
-            self.flow.note(conv, "queued")
+            # `kind` rides along, or a queue of typed questions shows as
+            # a queue of unlabelled rows until each one starts reading.
+            self.flow.note(conv, "queued", kind=kind)
         if began is not None:
             print(f"[router] {short_key(conv)} waited "
                   f"{time.time() - began:.0f}s for the turn ahead of it",
@@ -685,7 +687,8 @@ class Pool:
                            and conv not in tried
                            and not p["inflight"]
                            and p["slot"] is not None
-                           and not copy_is_current(p)]
+                           and not copy_is_current(p)
+                           and worth_keeping(p, self.tuning)]
                 if not at_risk:
                     return
                 conv, record = min(at_risk, key=lambda item: item[1]["last"])
@@ -766,17 +769,24 @@ class Pool:
                 if lost and mine:
                     # The slot holds someone else.
                     record["slot"] = None
-            # Keep the newest copies that fit the budget, and the newest even
-            # if it fills the budget alone. Newest by parked_at, not pin order:
-            # by pin order a full budget dropped the copy just written, and
-            # cpu1_0 wrote the same 9.45 GiB copy 1,456 times in 4.5 hours.
+            # Keep the copies worth the most that fit the budget. Ordered by
+            # write time instead, a question asked once outlived a
+            # conversation of 80,000 tokens that had run for days: 90 of 127
+            # copies held under 2,048 tokens each and a sixth of the disk.
+            # The copy just written is counted first and never swept. Dropping
+            # it only has it written again: cpu1_0 wrote the same 9.45 GiB
+            # copy 1,456 times in four and a half hours that way.
             held = sorted((c for c, p in self.pins.items() if p.get("parked")),
-                          key=lambda c: self.pins[c].get("parked_at") or 0)
+                          key=lambda c: copy_worth(self.pins[c]))
+            held.reverse()                 # worth the most first
+            if conv in held:
+                held.remove(conv)
+                held.insert(0, conv)
             spent, total = [], 0
-            for age, name_held in enumerate(reversed(held)):
+            for name_held in held:
                 older = self.pins[name_held]
                 total += older.get("bytes") or 0
-                if age and total > self.tuning.park_budget:
+                if total > self.tuning.park_budget and name_held != conv:
                     spent.append(older["parked"])
                     older["parked"] = None
             self.cv.notify_all()
@@ -970,7 +980,8 @@ class Pool:
                             and conv not in tried
                             and record["slot"] is not None
                             and not record["inflight"]
-                            and not copy_is_current(record)]
+                            and not copy_is_current(record)
+                            and worth_keeping(record, self.tuning)]
                     if not live:
                         break
                     # The per-save timeout is capped by what is left of the
@@ -1012,7 +1023,8 @@ class Pool:
         self.store.write_pins(kept)
         return len(kept)
 
-    def hand_off(self, conv, source, tokens, remove=None, alive=None):
+    def hand_off(self, conv, source, tokens, remove=None, alive=None,
+                 migrate=True):
         """Move a conversation to the backend it generates on.
 
         The prefiller is released before the wait to generate. The other
@@ -1027,10 +1039,17 @@ class Pool:
           Gone      the client left before any of that. Nothing is parked,
                     the caller still holds `source`, and its ending is the
                     one that releases it and parks what the read got through
+
+        `migrate` false asks for a turn that is not worth carrying: a park and
+        a recall of the whole slot, to write one token. A source that may not
+        generate is carried anyway. Which instances answer is the operator's
+        to say, not this turn's.
         """
         remove = remove or self.store.drop
         if not self.tuning.handoff:
             return self._stay(source, "the handoff is turned off")
+        if not migrate and generates(source):
+            return self._stay(source, "this turn is not worth carrying")
         target = self.generator(tokens)
         while target is None and not generates(source):
             # Nothing to carry this to, and the instance holding it does
@@ -1163,6 +1182,8 @@ class Pool:
             record = self.pins.get(conv) if conv else None
             if not record or record["slot"] is None:
                 return False
+            if not worth_keeping(record, self.tuning):
+                return False          # shorter to read again than to copy
             if record["inflight"]:
                 return False               # a save is running: two of them
                                            # write the same file at once
@@ -1411,7 +1432,8 @@ class Pool:
             # caches in one slot. `parked_at` is the park_budget sweep order.
             copies = [{"name": p["parked"], "kind": "copy", "conv": short_key(conv),
                        "bytes": p.get("bytes") or 0, "backend": p["backend"],
-                       "slot": p.get("slot"), "parked_at": p.get("parked_at")}
+                       "slot": p.get("slot"), "parked_at": p.get("parked_at"),
+                       "worth": copy_worth(p)}
                       for conv, p in self.pins.items() if p.get("parked")]
             disk = disk_summary(self.pins, self.openings,
                                 self.opening_bytes, self.tuning)

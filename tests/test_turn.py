@@ -66,6 +66,10 @@ class FakeClient:
         self.did.append("relay")
         self.sent = body               # the body the backend was asked with
 
+    def answer(self, payload):
+        self.answered = payload
+        self.did.append("answer")
+
     def fail(self, code, message):
         self.failed.append((code, message))
         self.did.append("fail")

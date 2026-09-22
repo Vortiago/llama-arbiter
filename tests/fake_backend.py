@@ -17,6 +17,7 @@ Every slow step is measured in milliseconds and can be set.
 """
 import http.server
 import json
+import math
 import select
 import socket
 import sys
@@ -133,6 +134,31 @@ def is_probe(body):
     No tokens at all, and a report of the slot that served it. No client asks
     for either, so nothing else can be mistaken for it."""
     return bool(body.get("verbose")) and want_tokens(body) == 0
+
+
+def grammar_letters(body):
+    """The letters a one-token grammar allows, in the order it lists them.
+
+    `root ::= "A" | "B"` is the only shape the router sends, so the quoted
+    parts are the whole grammar."""
+    quoted = (body.get("grammar") or "").split('"')[1::2]
+    return [part for part in quoted if len(part) == 1]
+
+
+def token_probs(letters):
+    """A distribution over those letters, plus one token outside them.
+
+    The **last** letter wins. A double that always picked the first would
+    pass a router that never mapped a letter back to its answer. The stray
+    token is there to be dropped: the router keeps only what it asked for."""
+    weights = {letter: 1.0 / (rank + 1)
+               for rank, letter in enumerate(reversed(letters))}
+    total = sum(weights.values()) + 0.25
+    rows = [{"token": letter, "logprob": math.log(weight / total)}
+            for letter, weight in weights.items()]
+    rows.append({"token": "7", "logprob": math.log(0.25 / total)})
+    rows.sort(key=lambda row: -row["logprob"])
+    return letters[-1], rows
 
 
 def reusable(held, coming, checkpointed):
@@ -722,17 +748,30 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         with be.lock:
             be.chats.append({"slot": slot.id, "cached": cached, "read": read,
                              "key": body.get("prompt_cache_key"),
+                             # Whether the caller said which slot to use, or
+                             # left this backend to find the state by prefix.
+                             "named": body.get("id_slot") is not None,
                              # A read pass asks for one token and for the slot
                              # id. A turn that answers a client asks for
                              # neither, so the two are never confused.
                              "probe": is_probe(body)})
+        # A grammar of single letters, one token, and logprobs: a typed
+        # question. llama.cpp answers one of those letters and the
+        # probabilities behind it.
+        letters = grammar_letters(body)
+        wrote, probs = "ok", None
+        if letters and body.get("logprobs"):
+            wrote, probs = token_probs(letters)
         reply = {
             "id": f"chat-{slot.task}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": be.model,
             "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": "ok"}}],
+                         "message": {"role": "assistant", "content": wrote},
+                         **({"logprobs": {"content": [
+                             {"token": wrote, "top_logprobs": probs}]}}
+                            if probs else {})}],
             "usage": {"prompt_tokens": cached + read, "completion_tokens": 1,
                       "total_tokens": cached + read + 1},
             # llama.cpp attaches the timings to a chat reply as well as to a

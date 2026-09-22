@@ -48,7 +48,7 @@
  *             copied?: number | null, held: number }} CacheChoice */
 /** @typedef {{ name: string, file?: string, kind: string, bytes?: number, loads?: number,
  *              conv?: string, backend?: string, slot?: number | null,
- *              parked_at?: number | null }} DiskFile */
+ *              parked_at?: number | null, worth?: number | null }} DiskFile */
 /** @typedef {{ bases: DiskFile[], deeps: DiskFile[] }} Openings */
 /** @typedef {{ count: number, bytes?: number, budget?: number }} Budget */
 /** `openings` is one budget over both shelves. `bases` and `deeps` are usage of it, not caps.
@@ -56,8 +56,11 @@
  *             files?: DiskFile[],
  *             mounts?: { path: string, total: number, free: number }[] }} Disk */
 /** @typedef {"queued" | "prefill" | "generate-queue" | "generate" | "done"} Stage */
-/** @typedef {{ conv: string, stage: Stage, backend: string | null, slot: number | null,
- *              since: number | null, changed: number | null, at?: number }} FlowRow */
+/** `kind` is the router's word for the work this turn is. Absent, or null, on
+ * an ordinary turn. An older router sends no field at all.
+ * @typedef {{ conv: string, stage: Stage, backend: string | null, slot: number | null,
+ *              since: number | null, changed: number | null, at?: number,
+ *              kind?: string | null }} FlowRow */
 /** @typedef {{ live: FlowRow[], log: FlowRow[] }} Flow */
 /** @typedef {{ backends?: Backend[], waiting?: number, waiting_to_generate?: number,
  *              waiting_detail?: Waiter[], flow?: Flow,
@@ -83,6 +86,47 @@ export const backendsOf = (status) => status.backends || [];
 
 /** @param {Backend} be */
 export const slotsOf = (be) => be.slots_detail || [];
+
+/** Every slot key on the page is built here, so keys from any source read alike.
+ * @param {{ backend: string | null, slot: number | null }} r */
+export const slotKey = (r) => (r.backend ? `${r.backend}:${r.slot ?? 0}` : "");
+
+/** A word and a glyph for each work label the router sends. A turn with no
+ * label is an ordinary prompt and wears nothing.
+ * @type {Record<string, { icon: string, word: string, why: string }>} */
+export const WORK = {
+  typed: {
+    // Neutral in every system font and on both themes. A question mark glyph
+    // renders red, and red on this page is a fault.
+    icon: "🎲",
+    word: "typed question",
+    why: "A typed question, POST /v1/systemone: a yes/no, a choice or a score. "
+      + "The model writes one token and the router answers with the "
+      + "probabilities behind it, so the turn is short where a reply is long.",
+  },
+};
+
+/** The word and the glyph for one label, or a plain fallback for a label this
+ * page has never heard of. Null for an unlabelled turn, which shows nothing.
+ * @param {string | null | undefined} kind
+ * @returns {{ icon: string, word: string, why: string } | null} */
+export function workLabel(kind) {
+  if (!kind) return null;
+  // A newer router may send a label this page predates. Say the word it sent.
+  return WORK[kind] || { icon: "◆", word: kind, why: "" };
+}
+
+/** What the router labelled the turn in each slot, keyed as `slotKey` builds it.
+ * Live rows only: a finished turn has left its slot. A row with no backend is
+ * queued and stands on no slot yet.
+ * @param {Status} status @returns {Map<string, string>} */
+export function workBySlot(status) {
+  /** @type {Map<string, string>} */ const by = new Map();
+  for (const r of status.flow?.live || []) {
+    if (r.kind && r.backend) by.set(slotKey(r), r.kind);
+  }
+  return by;
+}
 
 /** A slot on the same backend that is reading a prompt, or null.
  * @param {Backend} be @param {Slot} slot @returns {Slot | null} */
