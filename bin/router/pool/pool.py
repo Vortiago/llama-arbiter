@@ -12,8 +12,9 @@ from ..store.events import EventLog
 from ..store.files import adopt_files, opening_key, shelf_of, trim_openings
 from ..transport import Gone
 from ..backend.link import Link
+from ..backend.poll import counters, slot_state, stats
 from .turn import Turn
-from .machine import Flow, History, Machine, per_second
+from .machine import Flow, History, Machine
 
 def disk_summary(pins, openings, opening_bytes, tuning):
     """What the two slot directories hold against their budgets.
@@ -354,48 +355,9 @@ class Pool:
         text = self.link.metrics(be)
         if text is None:
             return
-        value = {}
-        for line in text.splitlines():
-            if line.startswith("#") or "{" in line:
-                continue           # comment, or a metric with labels
-            name, _, number = line.partition(" ")
-            try:
-                value[name.split(":", 1)[-1]] = float(number)
-            except ValueError:
-                pass
-
+        value = counters(text)
         be["counters"] = dict(value)      # raw, so a reset can mark this point
-        value = self.since_reset(be, value)
-
-        def rate(tokens, seconds):
-            # Lifetime. The *_tokens_seconds gauges read zero when idle.
-            return per_second(value.get(tokens, 0), value.get(seconds, 0))
-
-        # prompt_tokens_total excludes cached tokens.
-        processed = value.get("prompt_tokens_total", 0)
-        cached = value.get("prompt_tokens_cached_total", 0)
-        drafted = value.get("spec_decode_num_draft_tokens_total", 0)
-
-        # tokens_predicted_seconds_total sums per-request time. Concurrent
-        # slots overlap. These rates are per request.
-        busy_per_decode = value.get("n_busy_slots_per_decode", 1) or 1
-        be["stats"] = {
-            "busy_per_decode": round(busy_per_decode, 2),
-            "pp_rate": rate("prompt_tokens_total", "prompt_seconds_total"),
-            "tg_rate": rate("tokens_predicted_total", "tokens_predicted_seconds_total"),
-            "accept": round(100 * value.get("spec_decode_num_accepted_tokens_total", 0)
-                            / drafted, 1) if drafted else 0,
-            "cached": round(100 * cached / (cached + processed), 1) if cached + processed else 0,
-            "longest": int(value.get("n_tokens_max", 0)),
-            "generated": int(value.get("tokens_predicted_total", 0)),
-            "read_s": round(value.get("prompt_seconds_total", 0), 1),
-            "gen_s": round(value.get("tokens_predicted_seconds_total", 0), 1),
-            "prompt_tokens": int(processed),
-            "cached_tokens": int(cached),
-        }
-        st = be["stats"]
-        st["pp_total"] = round(st["pp_rate"] * busy_per_decode, 1)
-        st["tg_total"] = round(st["tg_rate"] * busy_per_decode, 1)
+        be["stats"] = stats(self.since_reset(be, value))
 
     def _read_slots(self, be, raw=None):
         """Per-slot state, so a 3-slot backend is not a single average. `raw`
@@ -404,86 +366,13 @@ class Pool:
             raw = self.link.slots(be)
             if raw is None:
                 return
-        # /slots reports counters, not rates.
-        now = time.time()
-        previous = be.get("slot_prev") or {}
-        current, detail = {}, []
-        for slot in raw if isinstance(raw, list) else []:
-            # A one-element array. Older builds sent a bare object.
-            token = slot.get("next_token") or {}
-            if isinstance(token, list):
-                token = token[0] if token else {}
-            cached = slot.get("n_prompt_tokens_cache", 0)
-            sid = slot.get("id")
-            task = slot.get("id_task")
-            decoded = token.get("n_decoded", 0)
-            processed = slot.get("n_prompt_tokens_processed", 0)
-
-            # Measured over rate_window, not between polls: a slot at 0.03
-            # tokens/s does not move in two seconds.
-            was = previous.get(sid) or {"task": None, "decoded": 0, "processed": 0,
-                                        "done_d": 0.0, "done_p": 0.0, "since": now,
-                                        "pp_rate": 0.0, "tg_rate": 0.0,
-                                        # False until a window has resolved.
-                                        "measured": False}
-            # A new task restarts the counters at zero.
-            if was["task"] is None:
-                grew_d = grew_p = 0        # first sight: take a baseline
-            elif was["task"] == task:
-                grew_d = max(0, decoded - was["decoded"])
-                grew_p = max(0, processed - was["processed"])
-            else:
-                grew_d, grew_p = decoded, processed
-            done_d = was["done_d"] + grew_d
-            done_p = was["done_p"] + grew_p
-
-            gap = now - was["since"]
-            measured = was["measured"]
-            if gap >= self.tuning.rate_window:
-                pp_rate, tg_rate = done_p / gap, done_d / gap
-                done_d = done_p = 0.0
-                since = now
-                measured = True
-            else:
-                pp_rate, tg_rate = was["pp_rate"], was["tg_rate"]
-                since = was["since"]
-
-            current[sid] = {"task": task, "decoded": decoded, "processed": processed,
-                            "done_d": done_d, "done_p": done_p, "since": since,
-                            "pp_rate": pp_rate, "tg_rate": tg_rate,
-                            "measured": measured}
-
-            # n_prompt_tokens_total is the prompt the task arrived with, from
-            # patches/slots-report-the-prompt-size.patch. n_prompt_tokens
-            # grows while the prompt is read and with every token generated:
-            # a slot 98% served from cache reported "512 / 89,848 read".
-            # Without the patch the old arithmetic is the fallback.
-            busy = bool(slot.get("is_processing"))
-            whole = slot.get("n_prompt_tokens_total")
-            if whole is None:
-                whole = max(0, slot.get("n_prompt_tokens", 0) - decoded)
-                to_read = max(0, whole - cached)
-            else:
-                to_read = max(0, whole - cached - processed)
-            detail.append({
-                "id": sid,
-                "busy": busy,
-                "phase": "idle" if not busy else ("generating" if decoded else "reading"),
-                "prompt": to_read,
-                "done": processed,
-                "cached": cached,
-                "decoded": decoded,
-                # null, not 0.0, until a window has resolved.
-                "pp_rate": round(pp_rate, 1) if measured else None,
-                "tg_rate": round(tg_rate, 1) if measured else None,
-            })
-        be["slot_prev"] = current
+        be["slot_prev"], detail = slot_state(
+            raw, be.get("slot_prev") or {}, self.tuning.rate_window, time.time())
         be["slots_detail"] = detail
         # The sum of the slots, not /metrics' lifetime average.
-        stats = be.setdefault("stats", {})
-        stats["pp_live"] = round(sum(d["pp_rate"] or 0 for d in detail), 1)
-        stats["tg_live"] = round(sum(d["tg_rate"] or 0 for d in detail), 1)
-
+        stat = be.setdefault("stats", {})
+        stat["pp_live"] = round(sum(d["pp_rate"] or 0 for d in detail), 1)
+        stat["tg_live"] = round(sum(d["tg_rate"] or 0 for d in detail), 1)
 
     def _watch(self):
         """Check each backend. Read its slot count, context size and

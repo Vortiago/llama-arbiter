@@ -5,14 +5,6 @@ from pathlib import Path
 from collections import deque
 from ..identity import short_key
 
-RATE_FLOOR = 1.0     # seconds. Under this a count is not a rate.
-
-
-def per_second(tokens, seconds):
-    """A rate, or zero when there is not enough time to divide by."""
-    return round(tokens / seconds, 1) if seconds and seconds >= RATE_FLOOR else 0
-
-
 class History:
     """Slot-seconds by phase, per history bucket. Between two polls a slot
     stays in the phase the earlier poll reported. A bucket edge inside the

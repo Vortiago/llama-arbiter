@@ -31,10 +31,11 @@ from .backends import (DEFAULT_BACKENDS, by_place, generates, prefills,
 from .identity import (SHELF_MARKS, client_kind, conversation_id,
                        copy_is_current, file_safe, prompt_key,
                        session_key, short_key)
-from .pool.machine import (GPU_CMD, RATE_FLOOR, Flow, History, Machine,
+from .backend.poll import (RATE_FLOOR, counters, per_second, slot_state,
+                          stats)
+from .pool.machine import (GPU_CMD, Flow, History, Machine,
                            cpu_times, gpu_query, node_busy, node_meminfo,
-                           parse_cpulist, per_second, read_nodes,
-                           resident_bytes)
+                           parse_cpulist, read_nodes, resident_bytes)
 from .pool.pool import Pool, disk_summary
 from .pool.turn import Ask, Turn, capture, how_started, name_conversation
 from .protocol.body import (IGNORED_KEYS, SYSTEM_ROLES, closes, common_prefix,
@@ -67,16 +68,16 @@ __all__ = ["ANTHROPIC_PING", "AnthropicSplice", "Ask", "CONFIG_FILES",
     "Store", "Tuning", "Turn", "VISION", "WEB", "adopt_files", "anthropic",
     "by_place", "cache_event", "capture", "client_config", "client_kind",
     "closes", "common_prefix", "conversation_id", "copy_is_current",
-    "cpu_times", "deepest_shared", "default_provider", "disk_summary",
-    "file_safe", "generates", "gpu_query", "hoist_system", "host_only",
-    "how_started", "http_post", "http_post_watched", "image_size",
-    "image_tokens", "images_in", "leading_system",
+    "counters", "cpu_times", "deepest_shared", "default_provider",
+    "disk_summary", "file_safe", "generates", "gpu_query", "hoist_system",
+    "host_only", "how_started", "http_post", "http_post_watched",
+    "image_size", "image_tokens", "images_in", "leading_system",
     "message_shape", "name_conversation", "node_busy", "node_meminfo",
     "on_the_page", "opening_event", "opening_key", "parse_cpulist",
     "passed_paths", "per_second", "ping_for", "prefills", "prompt_cuts",
     "prompt_key", "read_backend_table", "read_config", "read_event",
     "read_nodes", "read_only", "read_vision", "request_cost", "request_shape",
     "resident_bytes", "said", "said_in", "session_key", "shelf_of",
-    "short_key", "sse_event", "template_route", "text_of", "token_estimate",
-    "trim_openings", "wants_ping", "wants_stream", "wants_usage",
-    "with_usage", "without_ignored"]
+    "short_key", "slot_state", "sse_event", "stats", "template_route",
+    "text_of", "token_estimate", "trim_openings", "wants_ping",
+    "wants_stream", "wants_usage", "with_usage", "without_ignored"]
