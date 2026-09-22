@@ -48,7 +48,7 @@
  *             copied?: number | null, held: number }} CacheChoice */
 /** @typedef {{ name: string, file?: string, kind: string, bytes?: number, loads?: number,
  *              conv?: string, backend?: string, slot?: number | null,
- *              parked_at?: number | null, worth?: number | null }} DiskFile */
+ *              parked_at?: number | null, used?: number | null }} DiskFile */
 /** @typedef {{ bases: DiskFile[], deeps: DiskFile[] }} Openings */
 /** @typedef {{ count: number, bytes?: number, budget?: number }} Budget */
 /** `openings` is one budget over both shelves. `bases` and `deeps` are usage of it, not caps.

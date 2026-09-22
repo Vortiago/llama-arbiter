@@ -3,7 +3,7 @@
 import queue, threading, time
 from collections import OrderedDict, deque
 from ..backends import by_place, generates, prefills
-from ..identity import copy_is_current, copy_worth, short_key, worth_keeping
+from ..identity import copy_is_current, last_used, short_key, worth_keeping
 from ..protocol.body import common_prefix, deepest_shared, template_route
 from ..settings import Tuning
 from ..sizing import VISION
@@ -152,7 +152,11 @@ class Pool:
                     # Not a live name, so recall restores the copy first.
                     "backend": "(before the restart)",
                     "slot": None, "tokens": row.get("tokens", 0),
-                    "last": time.time(), "inflight": False,
+                    # When it last ran, not now: the sweep drops what has
+                    # gone longest without a turn, and `now` for every copy
+                    # hides exactly that.
+                    "last": row.get("last") or self.store.mtime(name),
+                    "inflight": False,
                     "turns": row.get("turns", 1), "parked": name,
                     "bytes": row.get("bytes", 0),
                     # Without it every copy reads as age zero.
@@ -769,16 +773,17 @@ class Pool:
                 if lost and mine:
                     # The slot holds someone else.
                     record["slot"] = None
-            # Keep the copies worth the most that fit the budget. Ordered by
-            # write time instead, a question asked once outlived a
-            # conversation of 80,000 tokens that had run for days: 90 of 127
-            # copies held under 2,048 tokens each and a sixth of the disk.
-            # The copy just written is counted first and never swept. Dropping
-            # it only has it written again: cpu1_0 wrote the same 9.45 GiB
-            # copy 1,456 times in four and a half hours that way.
+            # Keep the copies used most recently that fit the budget.
+            # Ordered by write time instead, a copy the migration had just
+            # rewritten looked fresh though nobody had asked for it, and a
+            # conversation somebody was working in was dropped for a question
+            # answered days ago. The copy just written is counted first and
+            # never swept: dropping it only has it written again, and cpu1_0
+            # wrote the same 9.45 GiB copy 1,456 times in four and a half
+            # hours that way.
             held = sorted((c for c, p in self.pins.items() if p.get("parked")),
-                          key=lambda c: copy_worth(self.pins[c]))
-            held.reverse()                 # worth the most first
+                          key=lambda c: last_used(self.pins[c]))
+            held.reverse()                 # used most recently first
             if conv in held:
                 held.remove(conv)
                 held.insert(0, conv)
@@ -1017,7 +1022,12 @@ class Pool:
                      "tokens": record.get("tokens", 0),
                      "bytes": record.get("bytes", 0),
                      "turns": record.get("turns", 1),
-                     # The budget sweep orders by this.
+                     # What the budget sweep orders by, so it has to outlive
+                     # the process: restored as `now`, every copy reads as
+                     # freshly used and the first sweep after a restart has
+                     # nothing to tell them apart by.
+                     "last": record.get("last"),
+                     # For adopt, which dates a file the last run vouched for.
                      "parked_at": record.get("parked_at")}
                     for conv, record in self.pins.items() if record.get("parked")]
         self.store.write_pins(kept)
@@ -1433,7 +1443,7 @@ class Pool:
             copies = [{"name": p["parked"], "kind": "copy", "conv": short_key(conv),
                        "bytes": p.get("bytes") or 0, "backend": p["backend"],
                        "slot": p.get("slot"), "parked_at": p.get("parked_at"),
-                       "worth": copy_worth(p)}
+                       "used": last_used(p)}
                       for conv, p in self.pins.items() if p.get("parked")]
             disk = disk_summary(self.pins, self.openings,
                                 self.opening_bytes, self.tuning)

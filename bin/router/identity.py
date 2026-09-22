@@ -50,16 +50,17 @@ def copy_is_current(record):
     return bool(record.get("parked")) and record.get("parked_turn") == record.get("turns")
 
 
-def copy_worth(record):
-    """What a copy on disk earns, against what it costs to hold.
+def last_used(record):
+    """When this conversation last ran. park_budget keeps the copies used
+    most recently, so what goes is what nobody has come back to.
 
-    The tokens it saves reading again, times the turns that have asked for
-    them, over the bytes it takes. A question asked once and never returned
-    to earns almost nothing however recently it was written; a conversation
-    in daily use earns its size many times over. park_budget spends on this
-    order, so the copies that go are the ones nobody comes back for."""
-    return ((record.get("tokens") or 0) * (record.get("turns") or 1)
-            / max(1, record.get("bytes") or 0))
+    Size is deliberately not in it. Measured over 131 real copies at a
+    64 GiB budget: ranking a copy by the tokens it holds against its bytes
+    kept 19 of them but only 7 of the 16 conversations in use that week,
+    because the big copies of finished work outranked the small ones
+    somebody was still typing into. Ranking by when each was last used kept
+    18, and all 16."""
+    return record.get("last") or 0
 
 
 def worth_keeping(record, tuning):

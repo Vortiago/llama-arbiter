@@ -393,11 +393,21 @@ const _reconcileKey = new WeakMap();
  * @param {(item: T) => Element} create - build a node for a not-yet-present key
  * @param {(node: Element, item: T) => void} [update] - update an existing node in place */
 export function reconcileList(host, items, keyOf, create, update) {
-  /** @type {Map<string, Element>} */
+  // A queue per key, not one node per key. Two items CAN carry the same key:
+  // a caller derives one from a truncated id, two ids agree in that prefix,
+  // and the list now holds the key twice. Kept in a plain Map of node, the
+  // second child under a key was invisible here - the item loop built a fresh
+  // node for it every pass, and the sweep below could not drop the one it
+  // replaced, because only the last child of that key was ever in the map.
+  // On an SSE feed that leaked a few children a tick for as long as the page
+  // stayed open. Measured at 900+ on the flow strip's copies.
+  /** @type {Map<string, Element[]>} */
   const prev = new Map();
   for (const n of host.children) {
     const k = _reconcileKey.get(n);
-    if (k !== undefined) prev.set(k, n);
+    if (k === undefined) continue;
+    const same = prev.get(k);
+    if (same) same.push(n); else prev.set(k, [n]);
   }
   // moveBefore (Chromium 133+) repositions a node without resetting its state;
   // cast it on once (lib.dom may not declare it), else fall back to insertBefore.
@@ -405,9 +415,10 @@ export function reconcileList(host, items, keyOf, create, update) {
   let cursor = host.firstElementChild;
   for (const item of items) {
     const k = String(keyOf(item));
-    let node = prev.get(k);
+    const same = prev.get(k) ?? [];
+    let node = same.shift();
     if (node) {
-      prev.delete(k);
+      if (!same.length) prev.delete(k);   // that key's children are all claimed
       if (update) update(node, item);
     } else {
       node = create(item);
@@ -421,7 +432,9 @@ export function reconcileList(host, items, keyOf, create, update) {
       host.insertBefore(node, cursor); // new node, or no moveBefore: plain insert
     }
   }
-  for (const n of prev.values()) n.remove(); // drop keys no longer present
+  // Every node left over: keys no longer present, and the spare children of a
+  // key the list now carries fewer times than the host does.
+  for (const same of prev.values()) for (const n of same) n.remove();
 }
 
 /** Animate a DISCRETE, user-initiated DOM change with a View Transition instead
