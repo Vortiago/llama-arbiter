@@ -227,6 +227,11 @@ lists what those tests found.
 
 - A conversation has one pin, one slot and one copy on disk. One turn runs at a
   time, and the next turn waits, because two turns move the same three things.
+- The copies share one budget. When it is full, the ones that go are the ones
+  earning least: the tokens a copy saves reading again, times the turns that
+  have asked for them, over its size. A question asked once and never returned
+  to goes before a conversation in daily use, however recently it was written.
+  The copy just written is never the one dropped.
 - A read sends nothing for tens of minutes. The router holds the stream open
   with the keep-alive of that protocol: a comment for OpenAI, a `ping` event
   for anthropic.

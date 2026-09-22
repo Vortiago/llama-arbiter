@@ -696,6 +696,18 @@ def copy_is_current(record):
     return bool(record.get("parked")) and record.get("parked_turn") == record.get("turns")
 
 
+def copy_worth(record):
+    """What a copy on disk earns, against what it costs to hold.
+
+    The tokens it saves reading again, times the turns that have asked for
+    them, over the bytes it takes. A question asked once and never returned
+    to earns almost nothing however recently it was written; a conversation
+    in daily use earns its size many times over. PARK_BUDGET spends on this
+    order, so the copies that go are the ones nobody comes back for."""
+    return ((record.get("tokens") or 0) * (record.get("turns") or 1)
+            / max(1, record.get("bytes") or 0))
+
+
 def file_safe(key):
     """A conversation key that also works as a file name.
 
@@ -2816,17 +2828,24 @@ class Pool:
                 if lost and mine:
                     # The slot holds someone else.
                     record["slot"] = None
-            # Keep the newest copies that fit the budget, and the newest even
-            # if it fills the budget alone. Newest by parked_at, not pin order:
-            # by pin order a full budget dropped the copy just written, and
-            # cpu1_0 wrote the same 9.45 GiB copy 1,456 times in 4.5 hours.
+            # Keep the copies worth the most that fit the budget. Ordered by
+            # write time instead, a question asked once outlived a
+            # conversation of 80,000 tokens that had run for days: 90 of 127
+            # copies held under 2,048 tokens each and a sixth of the disk.
+            # The copy just written is counted first and never swept. Dropping
+            # it only has it written again: cpu1_0 wrote the same 9.45 GiB
+            # copy 1,456 times in four and a half hours that way.
             held = sorted((c for c, p in self.pins.items() if p.get("parked")),
-                          key=lambda c: self.pins[c].get("parked_at") or 0)
+                          key=lambda c: copy_worth(self.pins[c]))
+            held.reverse()                 # worth the most first
+            if conv in held:
+                held.remove(conv)
+                held.insert(0, conv)
             spent, total = [], 0
-            for age, name_held in enumerate(reversed(held)):
+            for name_held in held:
                 older = self.pins[name_held]
                 total += older.get("bytes") or 0
-                if age and total > PARK_BUDGET:
+                if total > PARK_BUDGET and name_held != conv:
                     spent.append(older["parked"])
                     older["parked"] = None
             self.cv.notify_all()
@@ -3119,7 +3138,9 @@ class Pool:
                      "tokens": record.get("tokens", 0),
                      "bytes": record.get("bytes", 0),
                      "turns": record.get("turns", 1),
-                     # The budget sweep orders by this.
+                     # `tokens`, `turns` and `bytes` above are what the budget
+                     # sweep orders by. This is for adopt, which dates a file
+                     # the last run vouched for.
                      "parked_at": record.get("parked_at")}
                     for conv, record in self.pins.items() if record.get("parked")]
         write_rows(pins_file(), kept)
@@ -3511,10 +3532,11 @@ class Pool:
                                   for key, want in self.wants.items()]}
             # `slot` is set only while the slot still holds the cache, or
             # three copies naming one single-slot backend look like three
-            # caches in one slot. `parked_at` is the PARK_BUDGET sweep order.
+            # caches in one slot. `worth` is the PARK_BUDGET sweep order.
             copies = [{"name": p["parked"], "kind": "copy", "conv": short_key(conv),
                        "bytes": p.get("bytes") or 0, "backend": p["backend"],
-                       "slot": p.get("slot"), "parked_at": p.get("parked_at")}
+                       "slot": p.get("slot"), "parked_at": p.get("parked_at"),
+                       "worth": copy_worth(p)}
                       for conv, p in self.pins.items() if p.get("parked")]
             disk = disk_summary(self.pins, self.openings, self.opening_bytes,
                                 self.wants)

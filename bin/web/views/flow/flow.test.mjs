@@ -339,20 +339,20 @@ test("a copy is as wide as its real share of the budget", () => {
 });
 
 test("the strip is ordered the way the budget sweeps, and marks what goes next", () => {
-  // The sweep keeps the newest parked copies and drops the oldest, so newest
-  // sits left and the tail of the filled run is what the next park sweeps away.
-  const f = (conv, bytes, parked_at) => ({ name: conv, kind: "copy", conv, bytes, parked_at, backend: "x" });
+  // The sweep keeps the copies worth the most and drops the rest, so the
+  // best earner sits left and the tail of the filled run goes next.
+  const f = (conv, bytes, worth) => ({ name: conv, kind: "copy", conv, bytes, worth, backend: "x" });
   const status = { backends: [], disk: { copies: { count: 3, bytes: 3, budget: 100 },
     bases: { count: 0 }, deeps: { count: 0 }, wants: { count: 0 },
-    files: [f("old", 40, 10), f("new", 40, 30), f("mid", 40, 20)] } };
+    files: [f("once", 40, 1), f("daily", 40, 30), f("weekly", 40, 20)] } };
   const { blocks } = blocksOf(status, 900);
-  assert.deepEqual(blocks.map((b) => b.conv), ["new", "mid", "old"], "newest parked first");
+  assert.deepEqual(blocks.map((b) => b.conv), ["daily", "weekly", "once"], "worth the most first");
   assert.deepEqual(blocks.map((b) => b.doomed), [false, false, true],
-    "40 + 40 fits in 100, the third does not, so the oldest is what goes");
+    "40 + 40 fits in 100, the third does not, so the one nobody returns to goes");
   const huge = { ...status, disk: { ...status.disk,
     files: [f("only", 400, 30)] } };
   assert.deepEqual(blocksOf(huge, 900).blocks.map((b) => b.doomed), [false],
-    "the newest copy is never swept however large - dropping what was just written is the bug that wrote one file 1,456 times");
+    "the copy just written is never swept however large - dropping what was just written is the bug that wrote one file 1,456 times");
 });
 
 test("a name only goes inside a block that can hold it", () => {

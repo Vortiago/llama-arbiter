@@ -1365,10 +1365,11 @@ class ParkBeforeAdmitting(SlotDirCase):
         self.assertEqual(self.pool.pins["old"]["bytes"], 200_000_000)
 
     def test_the_copy_just_written_is_the_one_that_stays(self):
-        """Newest means most recently written, not the oldest pin.
+        """Whatever it is worth, and whatever it cost.
 
-        The conversation parked here was pinned first, so by pin order it is
-        the oldest and the budget drops it the moment it lands."""
+        The copy written here is the larger of the two, so by worth alone it
+        goes first and the budget drops it the moment it lands. The sweep
+        counts it before anything else instead."""
         removed = []
         half = router.PARK_BUDGET // 2
         self.pool.pins["early"] = pin("cpu", slot=0, last=1.0, inflight=True)
@@ -1393,7 +1394,8 @@ class ParkBeforeAdmitting(SlotDirCase):
         self.assertEqual(written.count("stuck.park"), 1)
 
     def test_keeps_the_copies_that_fit_the_budget(self):
-        """Copies run oldest first. The oldest go when the budget is spent."""
+        """Two copies that earn the same are separated by nothing else, so
+        the older one goes. The budget still has to stop somewhere."""
         removed = []
         half = router.PARK_BUDGET // 2
         self.hold("old", half, last=1.0)
@@ -1413,6 +1415,47 @@ class ParkBeforeAdmitting(SlotDirCase):
                              remove=removed.append)
         self.assertEqual(removed, [])
         self.assertEqual(self.pool.pins["new"]["parked"], "new.park")
+
+    def test_the_copy_nobody_returns_to_goes_before_one_in_daily_use(self):
+        """Ordered by write time this was backwards. A run of one-shot
+        questions filled the disk with copies of 36 tokens each, and the
+        sweep dropped the conversations they displaced because those had
+        been written earlier. Both copies here are the same size, so only
+        the tokens they hold and the turns that asked for them separate
+        them."""
+        removed = []
+        half = router.PARK_BUDGET // 2
+        asked_once = pin("cpu", slot=0, last=99.0, tokens=36, turns=1,
+                         parked="asked_once.park")
+        asked_once["bytes"] = half
+        long_running = pin("cpu", slot=0, last=1.0, tokens=80_000, turns=40,
+                           parked="long_running.park")
+        long_running["bytes"] = half
+        # Written most recently, so by the old order it outlived the other.
+        self.pool.pins["asked_once"] = asked_once
+        self.pool.pins["long_running"] = long_running
+        self.pool.pins["new"] = pin("cpu", slot=0, last=0.0, inflight=True)
+        self.pool._save_park("new", self.cpu, 0, self.saver(written=half),
+                             remove=removed.append)
+        self.assertEqual(removed, ["asked_once.park"])
+        self.assertEqual(self.pool.pins["long_running"]["parked"],
+                         "long_running.park")
+
+    def test_a_copy_earns_by_what_it_holds_and_how_often_it_is_asked_for(self):
+        """The three numbers the sweep spends on, one at a time."""
+        same = {"bytes": 1000, "tokens": 1000, "turns": 1}
+        self.assertGreater(router.copy_worth({**same, "tokens": 2000}),
+                           router.copy_worth(same), "more tokens saved")
+        self.assertGreater(router.copy_worth({**same, "turns": 2}),
+                           router.copy_worth(same), "asked for more often")
+        self.assertGreater(router.copy_worth(same),
+                           router.copy_worth({**same, "bytes": 2000}),
+                           "the same for fewer bytes")
+
+    def test_a_copy_of_nothing_is_worth_nothing(self):
+        """A pin the router adopted at startup knows neither number yet."""
+        self.assertEqual(router.copy_worth({}), 0)
+        self.assertEqual(router.copy_worth({"bytes": 0, "tokens": 0}), 0)
 
 
 class Recall(unittest.TestCase):
