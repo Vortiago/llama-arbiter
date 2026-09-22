@@ -1,6 +1,7 @@
 """What names a conversation, and what its files are called."""
 
 import hashlib, json
+from .protocol.body import text_of
 
 def conversation_id(body):
     """Identify a conversation by its opening: the system messages and the
@@ -25,8 +26,10 @@ def conversation_id(body):
                 break                      # the reply
             text = message.get("content")
             if isinstance(text, list):     # multimodal message
-                text = "".join(part.get("text", "") for part in text
-                               if isinstance(part, dict))
+                # The same reading prompt_cuts gives a message, so that the
+                # name of a conversation and the names of its cuts cannot
+                # come to disagree about what a content block says.
+                text = text_of(text)
             opening.append(f"{role}:{text}")
             if role == "user":
                 break                      # the first user message
@@ -98,10 +101,17 @@ def short_key(conv):
     return conv[:8] if len(conv) <= 36 else f"{conv[:8]}/{conv[-6:]}"
 
 
+def _lower(headers):
+    """One header map, keyed the way this module asks for them. Written twice,
+    the two readers drifted apart the first time either was taught a shape the
+    other did not know."""
+    return {str(name).lower(): value for name, value in dict(headers).items()}
+
+
 def session_key(headers):
     """Name the conversation from Claude Code's session headers, or None. A
     subagent runs its own prompt, so it is a separate conversation."""
-    lower = {str(name).lower(): value for name, value in dict(headers).items()}
+    lower = _lower(headers)
     session = (lower.get("x-claude-code-session-id") or "").strip()
     if not session:
         return None
@@ -112,8 +122,7 @@ def session_key(headers):
 
 def client_kind(headers):
     """Which client sent this, by its user agent, or None."""
-    lower = {str(name).lower(): value for name, value in dict(headers).items()}
-    agent = (lower.get("user-agent") or "").lower()
+    agent = (_lower(headers).get("user-agent") or "").lower()
     if "claude" in agent:
         return "claude-code"
     if "opencode" in agent:

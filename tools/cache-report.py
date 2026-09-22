@@ -2,8 +2,8 @@
 """What the cache did, read from its own event log.
 
 The dashboard shows the present; this answers questions about the past, from
-run/cache-events-*.jsonl: which openings paid for themselves, how long they
-starved, how much of every read the prompt cache skipped, what the forks did.
+run/cache-events-*.jsonl: which openings paid for themselves, how much of every
+read the prompt cache skipped, what the forks did.
 
     python3 tools/cache-report.py [--dir run] [--since-hours 24]
 

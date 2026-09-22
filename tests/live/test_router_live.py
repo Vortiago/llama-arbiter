@@ -52,7 +52,10 @@ def make_pool(backends, **kw):
     return router.Pool(backends, **kw)
 
 
-POOL_LOOPS = ("_watch", "_builder")
+# The daemon loops a Pool starts, by the name each thread carries. `_builder`
+# was here until the opening builder went, and matched nothing after that. The
+# park worker is not in this list: stop_parks below ends it outright.
+POOL_LOOPS = ("_watch",)
 
 # How long a test waits for another thread. Only reached when it is about to
 # fail anyway, so it can afford to be generous.
@@ -224,6 +227,11 @@ class LiveRouter(LiveCase):
             server.server_close()
             thread.join(PATIENCE)
         for pool in self.pools:
+            # The park worker waits on its queue rather than on the condition,
+            # so the bomb below never reaches it. Ended here, past the turns
+            # that could start it again and past the backends it would write
+            # to, so what is left on its queue is dropped rather than saved.
+            pool.stop_parks()
             # The pool took its tuning when it was built, so shortening the
             # sandbox's reaches no running loop. Shorten each pool's own, and
             # do it before the bombs go in.

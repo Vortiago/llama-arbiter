@@ -56,10 +56,15 @@ class AnthropicSplice(Splice):
             return b""
         if name == "message_delta" and self.usage is not None:
             # The backend's own generation figures win.
-            data["usage"] = merged = dict(self.usage, **(data.get("usage") or {}))
-            self.reported.update(merged)
+            merged = dict(self.usage, **(data.get("usage") or {}))
             self.usage = {}
-            return sse_event(name, data)
+            # Only when there is something to say. An empty `usage` written
+            # onto a delta that carried none is not what an anthropic parser
+            # reads there: it wants output_tokens.
+            if merged:
+                data["usage"] = merged
+                self.reported.update(merged)
+                return sse_event(name, data)
         return raw
 
 

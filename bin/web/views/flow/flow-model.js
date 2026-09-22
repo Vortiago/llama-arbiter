@@ -29,17 +29,24 @@ export const MARK_CAP = 24;
  * overview reads the same keys out of the same payload. */
 export { slotKey };
 
-/** The rate a reading slot moves at. A slot's own `pp_rate` is 0 until the
- * router's 10 second window closes, so 0 is silence, not a stall. Fall back
+/** The rate a reading slot moves at. A slot's own `pp_rate` is null until the
+ * router's 10 second window closes, so null is silence, not a stall. Fall back
  * to the backend average, then to READ_RATE.
+ * `||`, not `??`, on purpose here: this number is a divisor, in `stuck` below
+ * and in the eta, and a measured zero would make both infinite. A read that
+ * has genuinely stopped is caught by its `done` counter standing still, not by
+ * this rate. `genRate` is the opposite case and uses `??`.
  * @param {Backend} be @param {Slot} sl @returns {number} */
 export const readRate = (be, sl) => sl.pp_rate || be.stats?.pp_rate || READ_RATE;
 
 /** The rate a generating slot moves at, or null when nothing knows yet.
- * `tg_rate` stays 0 for up to 10 seconds after the first token, which reads
- * as under STALL_RATE. Null, not a floor: a stall is what this number is read for.
+ * `tg_rate` is null until a window has resolved, and a real figure after.
+ * Null, not a floor: a stall is what this number is read for.
+ * `??`, not `||`: a stalled slot reports 0.0 (measured 0.02 to 0.06 tokens/s,
+ * rounded to one place), and `||` replaced exactly that with the backend's
+ * healthy lifetime average, so `stuck` never fired for the case it is for.
  * @param {Backend} be @param {Slot} sl @returns {number | null} */
-export const genRate = (be, sl) => sl.tg_rate || be.stats?.tg_rate || null;
+export const genRate = (be, sl) => sl.tg_rate ?? be.stats?.tg_rate ?? null;
 
 /** What flows on the wire into or out of this slot, and how fast.
  * @param {Backend} be @param {Slot} sl

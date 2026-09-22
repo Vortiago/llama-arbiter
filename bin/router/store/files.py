@@ -78,8 +78,17 @@ class Store:
         if not self.slots.is_dir():
             return []
         names = []
-        for found in sorted(self.slots.glob("*.park"),
-                            key=lambda f: f.lstat().st_mtime):
+
+        def when(path):
+            """A file deleted between the glob and here sorts first and is
+            dropped by the loop below. Unguarded, one unlinked copy raised
+            FileNotFoundError out of the whole startup adoption."""
+            try:
+                return path.lstat().st_mtime
+            except OSError:
+                return 0
+
+        for found in sorted(self.slots.glob("*.park"), key=when):
             if found.exists():
                 names.append(found.name)
             else:
@@ -117,7 +126,14 @@ class Store:
         spare = path.with_suffix(".json.new")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            spare.write_text(json.dumps(rows, indent=1))
+            # Written and forced down before the rename, or the rename can
+            # become durable while the bytes are not: an empty pins.json is a
+            # delete-everything order, and adopt would drop every copy on
+            # disk. The rename alone only rules out reading half of one.
+            with open(spare, "w") as handle:
+                handle.write(json.dumps(rows, indent=1))
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(spare, path)
             return True
         except OSError as err:
@@ -167,7 +183,13 @@ def adopt_files(names, vouched=(), size=None, store=None, *, tuning):
     opening is named after its contents. A conversation's copy is good only
     if the pin file vouches for it. The pin file is asked first, because a
     client can make a key look like an opening."""
-    size = size or store.size
+    # Said here rather than deep in the loop: the old signature fell back to a
+    # module function, and this one has nothing to fall back to. Called with
+    # neither, it raised AttributeError on None one screen further down.
+    if size is None:
+        if store is None:
+            raise TypeError("adopt_files needs a size function or a store")
+        size = store.size
     openings, bytes_ = OrderedDict(), {}
     parked, spent = [], []
     for name in names:

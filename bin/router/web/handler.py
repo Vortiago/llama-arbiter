@@ -238,7 +238,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(200, json.dumps(slots).encode())
 
         props = link.props(live[0], timeout=5)
-        if props is None:
+        # Not `is None`: a proxy in front of a backend answers 200 with a list,
+        # and subscripting that raised out of do_GET with no status line sent,
+        # so the client saw a reset instead of this 502.
+        if not isinstance(props, dict):
             return self._error(502, f"{live[0]['name']} did not answer /props")
         props["total_slots"] = sum(be["slots"] for be in live)
         return self._send(200, json.dumps(props).encode())
@@ -296,16 +299,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # first question, so that both phases send the same prompt. Reading
         # the state alone cost the first question a full re-read on
         # production: 351 tokens of a state of 348.
-        plan = None
+        plan, sent = None, None
         if path == SYSTEMONE:
             try:
                 plan = systemone_plan(body)
+                # What the client sent, kept for the capture: the body below
+                # is rebuilt from the plan, and this one cannot be.
+                sent = body
                 body = json.dumps(
                     systemone_body(plan, plan["questions"][0])).encode()
             except Refused as err:
                 return self._error(400, str(err))
         self.server.pool.turn(
-            Ask(path, body, session_key(self.headers), plan), self)
+            Ask(path, body, session_key(self.headers), plan, sent), self)
 
     # -- the client a turn answers. See pool/turn.py for what each one owes.
 
@@ -496,9 +502,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             def put(data):
                 if length:
                     self.wfile.write(data)
+                    self.wfile.flush()
                 else:
-                    self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
-                self.wfile.flush()
+                    self._chunk(data)      # one place frames a chunk
                 last[0] = time.monotonic()
 
             def keep_alive():

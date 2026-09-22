@@ -215,6 +215,15 @@ class Machine:
             if proc.poll() is None:
                 if now - (self.gpu_at or now) > 3 * self.gpu_poll:
                     proc.kill()            # wedged. Try again next time.
+                    # Reaped, and its pipe closed. Dropped without these, a
+                    # wedged driver left one zombie and one descriptor every
+                    # 40 seconds for the life of the router.
+                    if proc.stdout:
+                        proc.stdout.close()
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass               # it will be reaped at exit
                     self.gpu_proc = None
                 return
             out = proc.stdout.read().decode(errors="replace") if proc.stdout else ""

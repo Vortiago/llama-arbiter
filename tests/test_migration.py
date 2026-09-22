@@ -1346,9 +1346,19 @@ class TheSuiteCannotTouchARunningRouter(unittest.TestCase):
     quiet."""
 
     def test_the_slot_directory_is_not_the_one_a_router_uses(self):
-        checkout = Path(router.__file__).resolve().parent.parent / "run"
+        # The checkout, not bin/: router.__file__ is bin/router/__init__.py now
+        # that the router is a package, so the parents this counts must match
+        # __main__.build(), which takes parents[2] of bin/router/__main__.py.
+        # Counted from the wrong depth this compared against bin/run, a
+        # directory no router writes to, and could no longer fail.
+        checkout = Path(router.__file__).resolve().parents[2] / "run"
         self.assertNotEqual(SANDBOX.store.run.resolve(), checkout,
                             "STORE points at a live router's files")
+        # Both directories, as the guard this replaced covered both SLOT_DIR
+        # and BLOCK_DIR. A store that kept its copies elsewhere but put its
+        # openings in the live blocks directory passed the first line alone.
+        self.assertNotEqual(SANDBOX.store.blocks.resolve(), checkout / "blocks",
+                            "STORE points its openings at a live router's files")
 
     def test_the_files_that_are_instructions_land_in_the_sandbox(self):
         for path in (SANDBOX.store.slots / "pins.json",
@@ -4319,6 +4329,11 @@ class WhatTheCachesDecided(unittest.TestCase):
         self.pool.openings["k1"] = "base-k1.park"
         self.pool.holds[("cpu1_1", 0)] = {"k1", "k2"}
         self.pool.pins["new"] = pin("cpu1_1", slot=None, inflight=True)
+        # The plan here is "load", which restores through the link. Without a
+        # stand-in that is a real POST to http://cpu, swallowed by
+        # _load_prefix's except, so the case passed while asking a live
+        # backend to overwrite one of its slots.
+        linked(self.pool, FakeLink())
         self.pool.warm_prefix("new", [(0, "k1"), (1, "k2")], [{}, {}], "", [],
                               self.cpu, 1, "/v1/chat/completions")
         self.assertEqual(self.pool.choices["new"]["shared"], 1)

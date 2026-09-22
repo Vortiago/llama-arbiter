@@ -54,8 +54,11 @@ start_backend() { # start_backend <name> <port> <script> [VAR=value ...]
 start_router() {
   keep_log router
   # -m router, not a file: bin/router is a package now. PYTHONPATH names the
-  # directory it sits in.
-  PYTHONPATH="$ROOT/bin" nohup python3 -m router --host "${ROUTER_HOST:-::}" \
+  # directory it sits in, in front of whatever the operator already set:
+  # `python3 bin/router.py` inherited that, and overwriting it here took it
+  # away from the router alone, while the backends kept it.
+  PYTHONPATH="$ROOT/bin${PYTHONPATH:+:$PYTHONPATH}" \
+        nohup python3 -m router --host "${ROUTER_HOST:-::}" \
         --port "$ROUTER_PORT" > "$RUN/router.log" 2>&1 &
   echo $! > "$RUN/router.pid"
   wait_for "$ROUTER_PORT" router 60 /router/json

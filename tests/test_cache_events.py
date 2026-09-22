@@ -165,17 +165,18 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.log = router.EventLog(directory=self.dir, on=True)
         self.old = SANDBOX.events
         SANDBOX.events = self.log
+        # Each put back as a cleanup, beside the line that took it: a tearDown
+        # does not run when setUp throws, so the two lines below used to leave
+        # every later case in this file writing into a deleted directory.
+        self.addCleanup(setattr, SANDBOX, "events", self.old)
         # Linking and deleting slot files must not touch the real run dir.
         self.old_store = SANDBOX.store
         SANDBOX.store = router.Store(self.dir)
+        self.addCleanup(setattr, SANDBOX, "store", self.old_store)
         SANDBOX.store.slots.mkdir(parents=True, exist_ok=True)
         self.pool = make_pool([{"name": "cpu", "url": "http://cpu",
                                   "pref": 0}],
                                 store=SANDBOX.store, watch=False)
-
-    def tearDown(self):
-        SANDBOX.events = self.old
-        SANDBOX.store = self.old_store
 
     def test_an_unshared_deep_cut_is_written_as_a_fork_of_its_holder(self):
         self.pool.openings["k1"] = "base-k1.park"

@@ -16,15 +16,16 @@ def http_post(url, path, payload, timeout=300.0):
 
 
 def said(err):
-    """The reason a backend gave, out of the body of its error reply."""
+    """The reason a backend gave, out of the body of its error reply.
+
+    The same envelope said_in reads, so that one of them decoding it is the
+    whole answer: the two paths reported different things when only one was
+    taught a new shape."""
     try:
-        body = json.loads(err.read().decode("utf-8", "replace"))
+        body = err.read()
     except Exception:
         return err.reason
-    trouble = body.get("error") if isinstance(body, dict) else None
-    if isinstance(trouble, dict):
-        return trouble.get("message") or err.reason
-    return trouble or err.reason
+    return said_in(body) or err.reason
 
 
 class Gone(Exception):

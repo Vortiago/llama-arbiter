@@ -27,11 +27,13 @@ POST_TIMEOUT = 300.0
 class Link:
     """The production link: HTTP to a llama-server.
 
-    Every method answers None when the backend cannot be reached, because a
-    backend that is down is a state the router expects rather than an error
-    it reports. The exception is `read`, which raises Gone when the client
-    stopped waiting, and `open`, which hands back the live response for the
-    caller to stream.
+    Two conventions, by what the caller can do about it. The three read-only
+    endpoints answer None when the backend cannot be reached, because a
+    backend that is down is a state the router expects rather than an error it
+    reports. Everything that asks a backend to do work raises instead: OSError
+    when it refused or could not be reached, and from `read` also Gone, when
+    the client stopped waiting. `open` hands back the live response for the
+    caller to stream, including one the backend meant as an error.
     """
 
     def __init__(self, look_timeout=LOOK_TIMEOUT, post_timeout=POST_TIMEOUT):
@@ -53,35 +55,31 @@ class Link:
     # -- the slot files
 
     def save(self, be, slot, name, timeout=None):
-        return http_post(be["url"], f"/slots/{slot}?action=save",
-                         {"filename": name},
-                         self.post_timeout if timeout is None else timeout)
+        return self._post(be, f"/slots/{slot}?action=save",
+                          {"filename": name}, timeout)
 
     def restore(self, be, slot, name, timeout=None):
-        return http_post(be["url"], f"/slots/{slot}?action=restore",
-                         {"filename": name},
-                         self.post_timeout if timeout is None else timeout)
+        return self._post(be, f"/slots/{slot}?action=restore",
+                          {"filename": name}, timeout)
 
     # -- work
 
     def ask(self, be, path, payload, timeout=None):
         """Post one request and give back the whole reply. For a caller that
-        gathers the answer rather than streaming it on."""
-        return http_post(be["url"], path, payload,
-                         self.post_timeout if timeout is None else timeout)
+        gathers the answer rather than streaming it on. `render` asks what the
+        backend's own template makes of a body, which is the same call."""
+        return self._post(be, path, payload, timeout)
 
-    def render(self, be, route, payload, timeout=None):
-        """What the backend's own template makes of these messages."""
-        return http_post(be["url"], route, payload,
-                         self.post_timeout if timeout is None else timeout)
+    # What the backend's own template makes of these messages. The same call,
+    # under the name its one caller reads it by.
+    render = ask
 
     def prefill(self, be, block, slot, timeout=None):
         """Read a block into a slot and generate nothing. The reply's timings
         say how much was processed and how much came from the cache."""
-        return http_post(be["url"], "/completion",
-                         {"prompt": block, "n_predict": 0,
-                          "cache_prompt": True, "id_slot": slot},
-                         self.post_timeout if timeout is None else timeout)
+        return self._post(be, "/completion",
+                          {"prompt": block, "n_predict": 0,
+                           "cache_prompt": True, "id_slot": slot}, timeout)
 
     def read(self, be, path, payload, alive, timeout):
         """Read a prompt and stop when the client stops waiting. Raises Gone."""
@@ -98,11 +96,19 @@ class Link:
         except urllib.error.HTTPError as answered:
             return answered
 
-    # -- one way in for the three read-only endpoints
+    # -- one way in for each convention
+
+    def _post(self, be, path, payload, timeout):
+        """Every call that asks a backend to do work. One place decides what
+        an unsaid timeout means, so five methods cannot drift apart."""
+        return http_post(be["url"], path, payload,
+                         self.post_timeout if timeout is None else timeout)
 
     def _get(self, url, timeout, raw=False):
+        # `is None`, not falsy: a caller that asks for no wait at all means 0.
         try:
-            with urllib.request.urlopen(url, timeout=timeout or self.look_timeout) as r:
+            with urllib.request.urlopen(
+                    url, timeout=self.look_timeout if timeout is None else timeout) as r:
                 body = r.read()
                 return body.decode(errors="replace") if raw else json.loads(body)
         except Exception:

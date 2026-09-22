@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  READ_RATE, MARK_CAP, slotKey, readRate, currentOf, markRate, stuck, historyOf,
+  READ_RATE, MARK_CAP, slotKey, readRate, genRate, currentOf, markRate, stuck, historyOf,
   nodesOf, arrivalsOf, residency, transferOf, since, turnOf, tapeOf, skipped,
   shelvesOf, blocksOf, widest, loadOf, parkedOf,
 } from "./flow-model.js";
@@ -56,6 +56,18 @@ test("a generating slot starved by a prefill beside it is stalled", () => {
   assert.equal(stuck(be, slot({ phase: "generating", tg_rate: 0.05 }), 0), true);
   assert.equal(stuck(be, slot({ phase: "generating", tg_rate: 6.3 }), 0), false);
   assert.equal(stuck(be, slot({ phase: "idle" }), 99999), false, "an idle slot is not stuck");
+});
+
+test("a generating rate the router rounded to zero is the stall itself", () => {
+  // The router sends null while its ten second window is open and a rounded
+  // figure after it. A stall measures 0.02 to 0.06 tokens a second, which
+  // rounds to 0.0 - so the one number that names the fault is the one a
+  // falsy-zero fallback replaced with the backend's healthy average.
+  const be = backend({ name: "gpu0_0", prefill: false, stats: { tg_rate: 6.3 } });
+  assert.equal(genRate(be, slot({ phase: "generating", tg_rate: 0 })), 0);
+  assert.equal(stuck(be, slot({ phase: "generating", tg_rate: 0 }), 0), true);
+  assert.equal(genRate(be, slot({ phase: "generating", tg_rate: null })), 6.3,
+    "the backend's average answers only when the slot has no figure yet");
 });
 
 test("the last ten minutes stack up the bucket without overflowing it", () => {

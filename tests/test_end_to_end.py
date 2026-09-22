@@ -69,7 +69,11 @@ PATIENCE = 10.0
 # faster than the router looks would prove nothing about production.
 READ_MS = 150
 
-POOL_LOOPS = ("_watch", "_builder")
+# The daemon loops a Pool starts, by the name each thread carries. `_builder`
+# was here until the opening builder went, and matched nothing after that.
+# The park worker is not in this list: it is stopped outright below, by
+# stop_parks, rather than left to a bomb it cannot meet.
+POOL_LOOPS = ("_watch",)
 
 
 class Bomb:
@@ -271,6 +275,11 @@ class EndToEnd(unittest.TestCase):
         # A loop only meets its bomb when it comes round, so shorten the
         # wait whatever the test had set it to.
         for pool in self.pools:
+            # The park worker waits on its queue rather than on the condition,
+            # so the bomb below never reaches it. Ended here, past the turns
+            # that could start it again and past the backends it would write
+            # to, so what is left on its queue is dropped rather than saved.
+            pool.stop_parks()
             # The pool took its tuning when it was built, so shortening the
             # sandbox's reaches no running loop. Shorten each pool's own, and
             # do it before the bombs go in.

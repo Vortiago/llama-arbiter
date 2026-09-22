@@ -497,7 +497,12 @@ class Pool:
         with self.cv:
             record = self.pins.get(conv) if conv else None
             if (record and record["backend"] == be["name"]
-                    and record["slot"] is not None):
+                    and record["slot"] is not None
+                    # Not while a save is reading it, even though the cache in
+                    # it is this conversation's own: the read would write into
+                    # the slot the copy is being taken from. ensure_parked can
+                    # have started one between this turn's release and now.
+                    and record["slot"] not in be["saving"]):
                 # `taken` below is built from `using`. Without this a
                 # second request could be handed this warm slot.
                 record["using"] = record["slot"]
@@ -707,12 +712,19 @@ class Pool:
                 record["slot"] = slot
 
     def _free_slot(self, be):
-        """A slot id on this backend that is not working, or None."""
+        """A slot id on this backend that is not working, or None.
+
+        A slot a save is reading is not free either, as pick_slot says for the
+        read path: a restore into it lands under the copy being written. The
+        generator's own slot is saved by park_later, which only queues on a
+        backend that cannot read, so this is the path that meets it."""
+        saving = be["saving"]
         detail = be.get("slots_detail") or []
         if not detail:
-            return 0                      # nothing reported yet, so slot 0
+            # Nothing reported yet, so slot 0 unless it is being saved.
+            return None if 0 in saving else 0
         for slot in detail:
-            if not slot["busy"]:
+            if not slot["busy"] and slot["id"] not in saving:
                 return slot["id"]
         return None
 
@@ -1226,11 +1238,27 @@ class Pool:
         self.park_jobs.put((conv, be, slot, remove, ticket))
         return True
 
+    def stop_parks(self):
+        """End the park worker once the copies it has are written.
+
+        The loop below blocks on its queue, not on the condition, so the way
+        every other loop is stopped cannot reach it. A router exits without
+        this; a test that leaves it running holds its pool, its store and its
+        directory for the rest of the process."""
+        parker, self.parker = self.parker, None
+        if parker is None:
+            return
+        self.park_jobs.put(None)          # after the jobs already queued
+        parker.join(30)
+
     def _run_parks(self):
         """Write the queued copies. One worker: two multi-gigabyte writes at
         once only divide the same disk."""
         while True:
             job = self.park_jobs.get()
+            if job is None:               # stop_parks, once the queue is dry
+                self.park_jobs.task_done()
+                return
             conv, be, slot, remove, ticket = job
             try:
                 self._save_park(conv, be, slot, remove)
@@ -1314,6 +1342,10 @@ class Pool:
         print(f"[router] {short_key(conv)} starts differently now, so its "
               f"copy is no use: reading from the opening instead", flush=True)
         remove(name)
+        # Or the map goes on vouching for a file this run has deleted, until
+        # whenever a turn next happens to park. Outside the lock, as the
+        # delete above is: _park writes the map the same way.
+        self.save_pins()
         return True
 
     def _load_prefix(self, key, name, be, slot):
@@ -1433,6 +1465,11 @@ class Pool:
         something else talks to the backends, or after a router restart."""
         now = time.time()
         mounts = self._read_mounts(now)
+        # Before the lock: read_settings stats a backend's log, and reads it
+        # when it has changed. This runs on every /router/json and once a
+        # second for each open dashboard, and the condition below is the one
+        # every turn's claim, acquire and release waits on.
+        configs = {be["name"]: self.read_settings(be) for be in self.backends}
         with self.cv:
             keys = ("name", "url", "model", "slots", "n_ctx", "busy", "up", "served",
                     "stats", "slots_detail", "cache", "draining")
@@ -1442,7 +1479,7 @@ class Pool:
                 row["prefill"] = prefills(be)
                 row["generate"] = generates(be)
                 row["node"] = be.get("node")
-                row["config"] = self.read_settings(be)
+                row["config"] = configs.get(be["name"]) or {}
                 detail = be.get("slots_detail") or []
                 row["active"] = (sum(1 for s in detail if s["busy"]) if detail
                                  else be["busy"])

@@ -91,6 +91,10 @@ class Ask:
     # handler plans it: a body it cannot plan is a 400 the public port owes
     # the client.
     plan: dict | None = None
+    # What the client posted, when `body` is not it. A typed question's body
+    # is rebuilt from the plan, and what came in is not: a capture of the
+    # rebuilt one says nothing about the client. None means `body` is it.
+    sent: bytes | None = None
 
 
 class Turn:
@@ -134,9 +138,14 @@ class Turn:
         # The backend has never heard of the router's typed path.
         up_path = SYSTEMONE_UP if ask.plan else ask.path
         short = short_key(conv) if conv else None
-        capture(pool.capture_dir, conv, ask.body, pool.tuning.capture_keep)
-        # This model's template refuses a late system message.
-        body = hoist_system(ask.body)
+        # What came in, not what the router rebuilt from it: a capture of the
+        # router's own body is the one thing it cannot be read back for.
+        capture(pool.capture_dir, conv, ask.sent or ask.body,
+                pool.tuning.capture_keep)
+        # This model's template refuses a late system message. A typed body is
+        # built by the handler, and always in order, so asking would parse the
+        # whole state again to learn nothing.
+        body = ask.body if ask.plan else hoist_system(ask.body)
         if body is not ask.body:
             print(f"[router] a late system message became a user message "
                   f"for {ask.path}", flush=True)
