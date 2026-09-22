@@ -2314,6 +2314,32 @@ class ShutDownCleanly(unittest.TestCase):
         self.assertEqual(kept[0]["file"], "a.park")
         self.assertEqual(kept[0]["tokens"], 4321)
 
+    def test_adopting_more_copies_than_the_budget_holds_trims_them(self):
+        """The budget was spent only where a copy is written, so lowering it
+        did nothing until the next turn parked - and on a quiet router that
+        is never. Seen live: 251 GiB of copies under a 64 GiB budget, one
+        conversation in a slot and nothing writing.
+
+        Least recently used goes, as it does after a park."""
+        removed = []
+        third = router.PARK_BUDGET // 3
+        rows = []
+        for name, last in (("stale", 100.0), ("older", 200.0), ("newest", 300.0)):
+            (self.root / f"{name}.park").write_bytes(b"x")
+            rows.append({"conv": name, "file": f"{name}.park", "tokens": 9999,
+                         "bytes": third + 1, "turns": 1, "last": last,
+                         "parked_at": last})
+        router.write_rows(router.pins_file(), rows)
+
+        fresh = router.Pool([{"name": "cpu", "url": "http://cpu"}], watch=False)
+        fresh.adopt([f"{n}.park" for n in ("stale", "older", "newest")],
+                    remove=removed.append)
+        self.assertEqual(removed, ["stale.park"],
+                         "three copies of a third of the budget each, plus "
+                         "one byte, do not fit")
+        self.assertIsNone(fresh.pins["stale"]["parked"])
+        self.assertEqual(fresh.pins["newest"]["parked"], "newest.park")
+
     def test_when_a_conversation_last_ran_survives_the_restart(self):
         """The budget sweep drops whatever has gone longest without a turn,
         so that time has to outlive the process. Restored as `now` instead,

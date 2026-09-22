@@ -2108,6 +2108,11 @@ class Pool:
                     "bytes": row.get("bytes", 0),
                     # Without it every copy reads as age zero.
                     "parked_at": row.get("parked_at") or file_mtime(name)}
+            # The budget is spent here too, not only where a copy is written.
+            # Lowering it otherwise did nothing until the next turn parked,
+            # and on a quiet router that is never: 251 GiB of copies sat
+            # under a 64 GiB budget with one conversation in a slot.
+            spent += self._trim_copies()
         for name in spent:
             remove(name)
         self.save_openings()      # trimmed, so write it
@@ -2855,27 +2860,7 @@ class Pool:
                 if lost and mine:
                     # The slot holds someone else.
                     record["slot"] = None
-            # Keep the copies used most recently that fit the budget. Ordered
-            # by write time instead, a copy the migration had just rewritten
-            # looked fresh though nobody had asked for it, and a conversation
-            # somebody was working in was dropped for a question answered
-            # days ago.
-            # The copy just written is counted first and never swept. Dropping
-            # it only has it written again: cpu1_0 wrote the same 9.45 GiB
-            # copy 1,456 times in four and a half hours that way.
-            held = sorted((c for c, p in self.pins.items() if p.get("parked")),
-                          key=lambda c: last_used(self.pins[c]))
-            held.reverse()                 # used most recently first
-            if conv in held:
-                held.remove(conv)
-                held.insert(0, conv)
-            spent, total = [], 0
-            for name_held in held:
-                older = self.pins[name_held]
-                total += older.get("bytes") or 0
-                if total > PARK_BUDGET and name_held != conv:
-                    spent.append(older["parked"])
-                    older["parked"] = None
+            spent = self._trim_copies(keep=conv)
             self.cv.notify_all()
         for gone in spent:
             remove(gone)
@@ -2890,6 +2875,34 @@ class Pool:
         if kept:
             print(f"[router] parked {short} from {be['name']} slot {slot}", flush=True)
         return kept
+
+    def _trim_copies(self, keep=None):
+        """Drop copies until they fit PARK_BUDGET, least recently used first.
+        Returns the file names to delete. Held under the lock.
+
+        `keep` names one copy that stays whatever its age: the one just
+        written. Dropping that only has it written again, which is how
+        cpu1_0 wrote the same 9.45 GiB copy 1,456 times in four and a half
+        hours.
+
+        Ordered by write time instead, a copy the migration had just
+        rewritten looked fresh though nobody had asked for it, and a
+        conversation somebody was working in was dropped for a question
+        answered days ago."""
+        held = sorted((c for c, p in self.pins.items() if p.get("parked")),
+                      key=lambda c: last_used(self.pins[c]))
+        held.reverse()                     # used most recently first
+        if keep in held:
+            held.remove(keep)
+            held.insert(0, keep)
+        spent, total = [], 0
+        for name in held:
+            record = self.pins[name]
+            total += record.get("bytes") or 0
+            if total > PARK_BUDGET and name != keep:
+                spent.append(record["parked"])
+                record["parked"] = None
+        return spent
 
     def recall(self, conv, be, slot, post):
         """Put a parked cache back on the backend about to serve it. Returns
