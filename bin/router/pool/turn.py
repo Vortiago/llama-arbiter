@@ -147,6 +147,12 @@ class Turn:
         try:
             warm = bool(conv) and pool.holds_slot(conv)
             slot = pool.pick_slot(be, conv)
+            if slot is None:
+                # Every slot here is being saved. acquire counts those, so
+                # this is the window between its answer and this line.
+                client.settle()
+                client.fail(503, f"no slot is free on {be['name']}")
+                return
             pool.note_stage(conv, "prefill", be["name"], slot)
             pool.ensure_parked(be, conv)
             if pool.forget_stale_park(conv, cuts):

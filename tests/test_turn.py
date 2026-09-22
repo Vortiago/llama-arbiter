@@ -449,6 +449,29 @@ class TheHandOffOutlivesItsGenerator(unittest.TestCase):
         self.assertEqual(cpu["busy"], 0)
 
 
+class ATurnWithNoFreeSlotIsRefused(unittest.TestCase):
+    """acquire counts the slots a save is reading, so it normally waits. The
+    window it cannot close is between its own answer and pick_slot: the turn
+    ahead releases the backend, this one acquires it, and only then does the
+    turn ahead start parking its cache out of the slot.
+
+    Unslotted, the read goes to the backend with `id_slot: null`."""
+
+    def test_the_turn_is_refused_rather_than_read_without_a_slot(self):
+        pool = one_backend()
+        pool.backends[0].update(slots=1,
+                                slots_detail=[{"id": 0, "busy": False}])
+        pool.pins["first"] = parked_copy()
+        pool.pins["first"].update(slot=0, using=0, inflight=True)
+        client = FakeClient()
+
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"), client)
+
+        self.assertEqual([code for code, _ in client.failed], [503])
+        self.assertEqual(pool.link.ops(), [])
+        self.assertEqual(pool.backends[0]["busy"], 0)
+
+
 class ACacheIsWrittenToDiskOnce(unittest.TestCase):
     """Two saves of one conversation write the same file name from the same
     slot. The prefill slot is released before the partial copy is parked, so

@@ -336,6 +336,81 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
                         "the second one waited for a build that had failed")
 
 
+class HeldSave:
+    """A link whose save stops until the test lets it finish, so a case can
+    look at the pool while a copy is in flight."""
+
+    def __init__(self):
+        self.began = threading.Event()
+        self.may_finish = threading.Event()
+
+    def save(self, be, slot, name, timeout=None):
+        self.began.set()
+        self.may_finish.wait(10)
+        return {"n_written": 1 << 30}
+
+
+class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
+    """A save reads the slot it copies. A restore into that slot while the save
+    runs writes one conversation's cache to disk under another's name, and the
+    first conversation then re-reads its whole prompt.
+
+    pick_slot works out which slots are taken and then falls through to ids[0]
+    regardless, so on a one-slot backend it always answers 0."""
+
+    def setUp(self):
+        self.link = HeldSave()
+        self.pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                              link=self.link, watch=False)
+        self.be = self.pool.backends[0]
+        self.be.update(up=True, n_ctx=150000, slots=1,
+                       slots_detail=[{"id": 0, "busy": False}])
+
+    def saving(self, conv):
+        """Run one turn of `conv`, then leave its copy mid-save."""
+        self.pool._take(self.be, conv, tokens=10)
+        self.pool.pick_slot(self.be, conv)
+        self.pool.release(self.be, conv)       # the client has its reply
+        saver = threading.Thread(target=self.pool.park_partial,
+                                 args=(conv, self.be, 0), daemon=True)
+        saver.start()
+        self.addCleanup(saver.join, 10)
+        self.addCleanup(self.link.may_finish.set)
+        self.assertTrue(self.link.began.wait(10), "the save never began")
+
+    def test_the_only_slot_is_refused_while_its_cache_is_saved(self):
+        self.saving("first")
+        self.assertIsNone(self.pool.pick_slot(self.be, "second"))
+
+    def test_acquire_counts_the_slot_the_save_is_reading(self):
+        """pick_slot answering None is the last line, not the plan. acquire
+        already waits for a slot, already watches the client, and already
+        ranks the other backends, so it is the one that has to know."""
+        self.saving("first")
+        self.assertIsNone(self.pool.acquire("second", 10, wanted=lambda: False))
+
+    def test_the_save_is_claimed_by_save_park_and_not_its_callers(self):
+        """Five callers reach _save_park. A claim each one has to remember is
+        a claim one of them forgets."""
+        self.saving("first")
+        self.assertEqual(self.pool.backends[0]["saving"], {0})
+        self.link.may_finish.set()
+        for _ in range(100):
+            if not self.pool.backends[0]["saving"]:
+                return
+            time.sleep(0.05)
+        self.fail("the claim was never given back")
+
+    def test_the_slot_comes_back_once_the_save_lands(self):
+        self.saving("first")
+        self.link.may_finish.set()
+        for _ in range(100):
+            if self.pool.pick_slot(self.be, "second") == 0:
+                return
+            time.sleep(0.05)
+        self.fail("the slot never came back")
+
+
 class TwoRequestsNeverShareASlot(unittest.TestCase):
     """A slot holds one thing, so two requests cannot both be given it.
 

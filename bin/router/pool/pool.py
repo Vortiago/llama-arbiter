@@ -66,7 +66,8 @@ class Pool:
         self.link = link or Link(post_timeout=self.tuning.post_timeout)
         self.backends = [dict(b, slots=1, n_ctx=0, busy=0, up=False, served=0, model="",
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
-                              cache={}, idle_runs={}, draining=False)
+                              cache={}, idle_runs={}, draining=False,
+                              saving=set())
                          for b in backends]
         # Each backend reports prompt cache evictions only in its own log.
         self.cache_watch = {be["name"]: CacheWatch(
@@ -585,11 +586,15 @@ class Pool:
             ids = [s["id"] for s in detail] or list(
                 range(max(1, be.get("slots", 1))))
             working = {s["id"] for s in detail if s.get("busy")}
+            taken |= set(be.get("saving") or ())
             # Free by both accounts first. Then merely not handed out: the
             # poll is the older of the two.
+            # None rather than ids[0]: a slot a save is still reading must
+            # not be handed out, or the copy lands under the wrong
+            # conversation's name. acquire treats the backend as full.
             slot = next((i for i in ids if i not in taken and i not in working),
-                        next((i for i in ids if i not in taken), ids[0]))
-            if record is not None:
+                        next((i for i in ids if i not in taken), None))
+            if slot is not None and record is not None:
                 record["using"] = slot
             return slot
 
@@ -610,9 +615,13 @@ class Pool:
         return (on_node, reads(be), -be["pref"], be["busy"])
 
     def _usable(self, be, tokens):
-        """True if this backend is up, has a free slot, and is big enough."""
+        """True if this backend is up, has a free slot, and is big enough.
+
+        A slot a save is reading counts as busy. `busy` does not say so:
+        the turn that filled it has its reply and has been released."""
+        held = be["busy"] + len(be.get("saving") or ())
         return (be["up"] and not be.get("draining")
-                and be["busy"] < be["slots"] and tokens <= be["n_ctx"])
+                and held < be["slots"] and tokens <= be["n_ctx"])
 
     def drain(self, name, deadline=None):
         """Take a backend out of service so it can be restarted. Requests wait
@@ -835,6 +844,17 @@ class Pool:
     def _save_park(self, conv, be, slot, remove=None, timeout=None):
         """Write one cache to disk. Mark the pin only if it holds one."""
         remove = remove or self.store.drop
+        with self.cv:
+            be["saving"].add(slot)
+        try:
+            return self._park(conv, be, slot, remove, timeout)
+        finally:
+            with self.cv:
+                be["saving"].discard(slot)
+                self.cv.notify_all()
+
+    def _park(self, conv, be, slot, remove, timeout):
+        """The save itself. _save_park owns the claim on the slot."""
         name = conv + ".park"
         short = short_key(conv)
         kept = False
