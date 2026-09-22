@@ -87,6 +87,15 @@ PARK_FLOOR       = 64 * 1024 * 1024   # a real state file is about 112 MiB.
 # 36.6 KiB a token: 0.2 to 5.4 GiB at ctx 150000. Size it to the disk RUN
 # is on. Too low displaces a copy still in use, which costs a full re-read.
 PARK_BUDGET = int(float(os.environ.get("PARK_BUDGET_GB") or 256) * 1024 ** 3)
+# A prompt shorter than this is read again rather than copied to disk. A copy
+# costs about the same whatever little it holds, and a prompt this short is
+# back in seconds. Measured over 3,806 turns here: a floor halves the saves,
+# 496 a day to 229, and costs 75 turns a day a re-read, median 2.4 s and
+# worst 40 s. Prompt sizes are in two clumps - one-shot questions near 300
+# tokens, sessions at 57,000 and up - so anything from 512 to 4096 does the
+# same thing, and 8192 starts cutting into the sessions: the worst re-read
+# there is 556 s. 0 turns the floor off and copies everything.
+PARK_MIN_TOKENS = int(os.environ.get("PARK_MIN_TOKENS") or 1024)
 # A restored slot needs its context checkpoints in the state file, which
 # needs patches/slot-state-carries-checkpoints.patch. Without the patch a
 # move is followed by a full re-read: set HANDOFF=0.
@@ -706,6 +715,18 @@ def copy_worth(record):
     order, so the copies that go are the ones nobody comes back for."""
     return ((record.get("tokens") or 0) * (record.get("turns") or 1)
             / max(1, record.get("bytes") or 0))
+
+
+def worth_keeping(record):
+    """Whether a copy of this conversation earns a place on disk.
+
+    Only about storing one. A copy written to carry a turn to another
+    instance is transport, and travels whatever it holds; so is the one that
+    salvages a read the client gave up on, where the alternative is reading
+    an hour of prompt again from nothing."""
+    if not PARK_MIN_TOKENS:
+        return True
+    return (record.get("tokens") or 0) - REPLY_TOKENS >= PARK_MIN_TOKENS
 
 
 def file_safe(key):
@@ -2758,7 +2779,8 @@ class Pool:
                            and conv not in tried
                            and not p["inflight"]
                            and p["slot"] is not None
-                           and not copy_is_current(p)]
+                           and not copy_is_current(p)
+                           and worth_keeping(p)]
                 if not at_risk:
                     return
                 conv, record = min(at_risk, key=lambda item: item[1]["last"])
@@ -3100,7 +3122,8 @@ class Pool:
                             and conv not in tried
                             and record["slot"] is not None
                             and not record["inflight"]
-                            and not copy_is_current(record)]
+                            and not copy_is_current(record)
+                            and worth_keeping(record)]
                     if not live:
                         break
                     # The per-save timeout is capped by what is left of the
@@ -3292,6 +3315,8 @@ class Pool:
             record = self.pins.get(conv) if conv else None
             if not record or record["slot"] is None:
                 return False
+            if not worth_keeping(record):
+                return False          # shorter to read again than to copy
             slot = record["slot"]
             record["inflight"] = True      # hold it still while it copies
             if self.parker is None:

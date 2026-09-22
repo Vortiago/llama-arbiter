@@ -129,10 +129,14 @@ class EndToEnd(unittest.TestCase):
         self.kept = {name: getattr(router, name) for name in
                      ("SLOT_DIR", "BLOCK_DIR", "RUN_DIR", "POLL",
                       "BUILD_POLL", "PIN_PATIENCE", "PARK_ALL_TIMEOUT",
-                      "HANDOFF_ON", "PING_EVERY")}
+                      "HANDOFF_ON", "PING_EVERY", "PARK_MIN_TOKENS")}
         # These tests are about the move, so they turn it on whatever the
         # shipped default is.
         router.HANDOFF_ON = True
+        # The prompts here are a few hundred bytes, so the floor would refuse
+        # every copy and these tests would watch nothing happen. They are
+        # about the machinery; TheFloorOnShortPrompts is about the floor.
+        router.PARK_MIN_TOKENS = 0
         self.had_pool = getattr(router, "POOL", None)
         router.SLOT_DIR = self.root / "slots"
         router.BLOCK_DIR = self.root / "blocks"
@@ -371,6 +375,41 @@ class ParkBeforeTheNewcomer(EndToEnd):
         self.assertIsNone(pool.pins["resident"]["parked"])
         self.assertIsNone(pool.pins["resident"]["slot"])
         self.assertFalse((router.SLOT_DIR / "resident.park").exists())
+
+
+class TheFloorOnShortPrompts(EndToEnd):
+    """A prompt too short to be worth a copy is read again instead.
+
+    A copy costs the same few hundred megabytes whatever it holds. Measured
+    on this machine over 3,806 turns, a recall of a prompt under 1,024
+    tokens carried 36 of them: seconds of reading, for a file that displaces
+    a conversation worth keeping."""
+
+    def test_a_short_prompt_leaves_no_copy_behind(self):
+        router.PARK_MIN_TOKENS = 1024
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool)
+        self.turn(url, "brief")
+        self.turn(url, "newcomer")
+
+        paths = [row["path"] + row["query"] for row in self.cpu.requests]
+        self.assertNotIn("/slots/0?action=save", paths)
+        self.assertIsNone(pool.pins["brief"]["parked"])
+        self.assertFalse((router.SLOT_DIR / "brief.park").exists())
+
+    def test_a_long_prompt_is_copied_as_before(self):
+        """The same two turns, with a prompt over the floor."""
+        router.PARK_MIN_TOKENS = 1024
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool)
+        # CHARS_PER_TOK is 4, so this clears the floor by the router's own
+        # estimate without the stub having to tokenise anything.
+        long_enough = "word " * 2000
+        self.turn(url, "wordy", text=long_enough)
+        self.turn(url, "newcomer")
+
+        self.assertEqual(pool.pins["wordy"]["parked"], "wordy.park")
+        self.assertTrue((router.SLOT_DIR / "wordy.park").exists())
 
 
 class DrainUnderLoad(EndToEnd):

@@ -227,6 +227,10 @@ lists what those tests found.
 
 - A conversation has one pin, one slot and one copy on disk. One turn runs at a
   time, and the next turn waits, because two turns move the same three things.
+- A prompt under `PARK_MIN_TOKENS` is read again rather than copied. A copy
+  costs about the same however little it holds, so a short one buys seconds
+  and spends hundreds of megabytes. A copy still carries a turn to the
+  instance that generates it, whatever its size: that copy is transport.
 - The copies share one budget. When it is full, the ones that go are the ones
   earning least: the tokens a copy saves reading again, times the turns that
   have asked for them, over its size. A question asked once and never returned

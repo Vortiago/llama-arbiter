@@ -44,9 +44,11 @@ def backend(name, pref, slots=1, busy=0, n_ctx=150000, up=True):
             "n_ctx": n_ctx, "up": up}
 
 
-def pin(backend_name, slot=0, tokens=1000, last=0.0, inflight=False,
-        turns=1,
+def pin(backend_name, slot=0, tokens=router.REPLY_TOKENS + 8192, last=0.0,
+        inflight=False, turns=1,
         moved=None, parked=None, parked_turn=None):
+    # `tokens` clears PARK_MIN_TOKENS by default, or no test about parking
+    # would park anything. A test about the floor names its own number.
     # A copy is of one turn. `parked_turn` defaults to the turn this pin is on,
     # so `parked=` alone means the copy is current; pass an earlier number for
     # a copy the slot has run past.
@@ -1456,6 +1458,42 @@ class ParkBeforeAdmitting(SlotDirCase):
         """A pin the router adopted at startup knows neither number yet."""
         self.assertEqual(router.copy_worth({}), 0)
         self.assertEqual(router.copy_worth({"bytes": 0, "tokens": 0}), 0)
+
+    def test_a_short_prompt_is_read_again_rather_than_copied(self):
+        """A copy costs the same few hundred megabytes whatever it holds.
+        Measured here, a recall under 1,024 tokens carried 36 of them."""
+        short = pin("cpu", slot=0, last=1.0,
+                    tokens=router.PARK_MIN_TOKENS - 1 + router.REPLY_TOKENS)
+        self.pool.pins["short"] = short
+        post = self.saver()
+        self.pool.ensure_parked(self.cpu, "new", post)
+        self.assertEqual(post.calls, [], "a short prompt was copied to disk")
+        self.assertFalse(short["inflight"], "the turn was left reserved")
+
+    def test_a_long_prompt_still_is_copied(self):
+        self.pool.pins["long"] = pin(
+            "cpu", slot=0, last=1.0,
+            tokens=router.PARK_MIN_TOKENS + router.REPLY_TOKENS)
+        post = self.saver()
+        self.pool.ensure_parked(self.cpu, "new", post)
+        self.assertIn("action=save", post.calls[0][1])
+
+    def test_the_floor_is_read_in_prompt_tokens_not_the_estimate(self):
+        """`tokens` on a pin carries REPLY_TOKENS of room for the reply. A
+        floor spent against that number would be REPLY_TOKENS lower than it
+        reads."""
+        at_the_floor = {"tokens": router.PARK_MIN_TOKENS + router.REPLY_TOKENS}
+        self.assertTrue(router.worth_keeping(at_the_floor))
+        self.assertFalse(router.worth_keeping(
+            {"tokens": at_the_floor["tokens"] - 1}))
+
+    def test_nothing_is_refused_when_the_floor_is_off(self):
+        floor = router.PARK_MIN_TOKENS
+        router.PARK_MIN_TOKENS = 0
+        try:
+            self.assertTrue(router.worth_keeping({"tokens": 0}))
+        finally:
+            router.PARK_MIN_TOKENS = floor
 
 
 class Recall(unittest.TestCase):
@@ -3704,6 +3742,16 @@ class HandOff(unittest.TestCase):
         self.go(self.mover())
         self.assertEqual(self.pool.pins["a"]["backend"], "gpu")
         self.assertEqual(self.pool.pins["a"]["slot"], 0)
+
+    def test_a_short_prompt_is_carried_like_any_other(self):
+        """PARK_MIN_TOKENS refuses to *store* a copy of a short prompt. This
+        copy is transport: without it the turn cannot reach the instance that
+        generates, and the prompt would be read there from nothing."""
+        self.pool.pins["a"]["tokens"] = 1
+        self.assertFalse(router.worth_keeping(self.pool.pins["a"]))
+        post = self.mover()
+        self.assertIs(self.go(post), self.gpu)
+        self.assertIn("action=save", post.calls[0][1])
 
     def test_the_slot_moves_from_one_backend_to_the_other(self):
         self.go(self.mover())
