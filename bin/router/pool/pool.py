@@ -15,7 +15,7 @@ from ..backend.link import Link
 from .turn import Turn
 from .machine import Flow, History, Machine, per_second
 
-def disk_summary(pins, openings, opening_bytes, wants, tuning):
+def disk_summary(pins, openings, opening_bytes, tuning):
     """What the two slot directories hold against their budgets.
 
     `tuning` has no default. Two of the three budgets below are the
@@ -31,8 +31,7 @@ def disk_summary(pins, openings, opening_bytes, wants, tuning):
                          "bytes": sum(opening_bytes.values()),
                          "budget": tuning.block_budget},
             "bases": {"count": kinds.count("base")},
-            "deeps": {"count": kinds.count("deep")},
-            "wants": {"count": len(wants), "keep": tuning.want_keep}}
+            "deeps": {"count": kinds.count("deep")}}
 
 
 class Pool:
@@ -66,7 +65,7 @@ class Pool:
         self.link = link or Link(post_timeout=self.tuning.post_timeout)
         self.backends = [dict(b, slots=1, n_ctx=0, busy=0, up=False, served=0, model="",
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
-                              cache={}, idle_runs={}, draining=False,
+                              cache={}, draining=False,
                               saving=set())
                          for b in backends]
         # Each backend reports prompt cache evictions only in its own log.
@@ -95,8 +94,6 @@ class Pool:
         # Counters at the last reset, per backend.
         self.rates_from = {}
         self.rates_since = None
-        # Opening key -> what it takes to read one, newest last.
-        self.wants = OrderedDict()
         # Openings being read now. A session that needs one waits for it.
         self.building = {}
         self.waiting = 0          # requests with no free slot yet
@@ -120,7 +117,6 @@ class Pool:
         self.parker = None
         if watch:
             threading.Thread(target=self._watch, daemon=True).start()
-            threading.Thread(target=self._builder, daemon=True).start()
 
     def turn(self, ask, client):
         """Run one turn of one conversation. See pool/turn.py."""
@@ -483,19 +479,11 @@ class Pool:
             })
         be["slot_prev"] = current
         be["slots_detail"] = detail
-        self._note_idle(be, detail)
         # The sum of the slots, not /metrics' lifetime average.
         stats = be.setdefault("stats", {})
         stats["pp_live"] = round(sum(d["pp_rate"] or 0 for d in detail), 1)
         stats["tg_live"] = round(sum(d["tg_rate"] or 0 for d in detail), 1)
 
-    @staticmethod
-    def _note_idle(be, detail):
-        """Count the polls in a row each slot has looked idle. One poll
-        cannot tell a free slot from one between two turns."""
-        was = be.get("idle_runs") or {}
-        be["idle_runs"] = {s["id"]: 0 if s["busy"] else was.get(s["id"], 0) + 1
-                           for s in detail}
 
     def _watch(self):
         """Check each backend. Read its slot count, context size and
@@ -783,29 +771,6 @@ class Pool:
             if record:
                 record["slot"] = slot
 
-    def _builder(self):
-        """Read one wanted opening while a backend is idle, off the request
-        path."""
-        while True:
-            time.sleep(self.tuning.build_poll)
-            try:
-                self.build_once()
-            except Exception as err:
-                print(f"[router] opening pass failed: {err}", flush=True)
-
-    def _idle_slot(self, be):
-        """A slot the builder may read into, or None. Stricter than
-        _free_slot: the backend is up, the router's own count leaves room,
-        and the poll has found the slot idle idle_polls times."""
-        # A draining backend is about to be stopped.
-        if not be["up"] or be.get("draining") or be["busy"] >= be["slots"]:
-            return None
-        runs = be.get("idle_runs") or {}
-        for slot in be.get("slots_detail") or []:
-            if not slot["busy"] and runs.get(slot["id"], 0) >= self.tuning.idle_polls:
-                return slot["id"]
-        return None
-
     def _free_slot(self, be):
         """A slot id on this backend that is not working, or None."""
         detail = be.get("slots_detail") or []
@@ -1006,18 +971,10 @@ class Pool:
                     plan = ("wait", base[1], None, None)
                 else:
                     plan = ("read", base[1], None, slot)
-            # Every new session wants the base, unless it is being read now.
-            if unsaved and plan is None:
-                self.note_want(base, "base-", system, tools,
-                               messages[:base[0] + 1], path)
-            # Deeper only past what is saved, where a slot holds it.
+            # How deep a fork could have started. Measurement only: the
+            # router reads an opening for itself and builds none ahead.
             seen = set().union(*self.holds.values()) if self.holds else set()
             shared = deepest_shared(cuts, seen)
-            if (self.tuning.deep_openings and shared and shared[1] != base[1]
-                    and shared[1] not in saved
-                    and (stored is None or shared[0] > stored[0])):
-                self.note_want(shared, "deep-", system, tools,
-                               messages[:shared[0] + 1], path)
 
             # Measurement only: what a fork could have started from. `shared`
             # needs the parent to hold a slot, so the fork rate it shows is a
@@ -1107,61 +1064,6 @@ class Pool:
             if not name:
                 return False        # it failed or timed out, so read it here
         return self._load_prefix(key, name, be, slot)
-
-    def note_want(self, cut, mark, system, tools, head, path):
-        """Write down an opening worth having, with what it takes to read it.
-        The request it came from is gone by the time the builder runs."""
-        with self.cv:
-            fresh = cut[1] not in self.wants
-            self.wants[cut[1]] = {"cut": cut, "mark": mark, "system": system,
-                                  "tools": tools, "head": list(head),
-                                  "path": path, "at": time.time()}
-            self.wants.move_to_end(cut[1])
-            while len(self.wants) > self.tuning.want_keep:
-                old, gone = self.wants.popitem(last=False)
-                self.events.write("want", key=short_key(old), shelf=mark_shelf(gone),
-                             action="dropped",
-                             age=round(time.time() - gone.get("at", 0), 1))
-            if fresh:
-                self.events.write("want", key=short_key(cut[1]), shelf=mark_shelf(mark),
-                             action="added")
-
-    def build_once(self, remove=None):
-        """Read one wanted opening into an idle slot. Return its key, or None.
-        The slot is held for the read."""
-        remove = remove or self.store.drop
-        with self.cv:
-            if not self.wants:
-                return None
-            idle = [(b, self._idle_slot(b)) for b in self.backends
-                    if prefills(b)]
-            idle = [pair for pair in idle if pair[1] is not None]
-            if not idle:
-                return None
-            be, slot = max(idle, key=lambda p: p[0]["slots"] - p[0]["busy"])
-            key, want = next(reversed(self.wants.items()))
-            be["busy"] += 1
-
-        try:
-            # The builder is the second way into a slot, so the caches on it
-            # go to disk first. Inside the try: the finally below is the
-            # only thing that gives the slot back and drops the want.
-            self.ensure_parked(be, None, remove)
-            began = time.time()
-            kept = self._read_prefix(want["cut"], want["head"], want["system"],
-                                     want.get("tools") or [], be, slot,
-                                     remove, want["mark"], want["path"])
-        finally:
-            with self.cv:
-                be["busy"] -= 1
-                # Dropped either way. A failed read fails again.
-                self.wants.pop(key, None)
-                self.cv.notify_all()
-        self.events.write("want", key=short_key(key), shelf=mark_shelf(want),
-                     action="built", backend=be["name"], slot=slot,
-                     ok=bool(kept), secs=round(time.time() - began, 1),
-                     age=round(began - want.get("at", began), 1))
-        return key if kept else None
 
     def park_all(self, timeout=None, only=None, budget=None):
         """Copy live caches to disk, so a stop does not throw them away. `only`
@@ -1621,9 +1523,7 @@ class Pool:
                         for key, name in self.openings.items()
                         if shelf_of(name) == which]
             openings = {"bases": shelf("base", "system prompt"),
-                        "deeps": shelf("deep", "shared history"),
-                        "wants": [{"name": key[:8], "kind": want["mark"].rstrip("-")}
-                                  for key, want in self.wants.items()]}
+                        "deeps": shelf("deep", "shared history")}
             # `slot` is set only while the slot still holds the cache, or
             # three copies naming one single-slot backend look like three
             # caches in one slot. `parked_at` is the park_budget sweep order.
@@ -1631,8 +1531,8 @@ class Pool:
                        "bytes": p.get("bytes") or 0, "backend": p["backend"],
                        "slot": p.get("slot"), "parked_at": p.get("parked_at")}
                       for conv, p in self.pins.items() if p.get("parked")]
-            disk = disk_summary(self.pins, self.openings, self.opening_bytes,
-                                self.wants, self.tuning)
+            disk = disk_summary(self.pins, self.openings,
+                                self.opening_bytes, self.tuning)
             disk["files"] = openings["bases"] + openings["deeps"] + copies
             disk["mounts"] = mounts
             machine = self.machine.report(self.backends)

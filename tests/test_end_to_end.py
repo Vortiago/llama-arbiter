@@ -77,8 +77,7 @@ class Bomb:
 
     The loops run `while True` and have no off switch. A SystemExit raised
     inside one ends that thread quietly, and `except Exception` does not catch
-    it. Standing in for the condition variable stops _watch; standing in for
-    build_once stops the builder."""
+    it. Standing in for the condition variable stops _watch."""
 
     def __enter__(self):
         raise SystemExit
@@ -152,7 +151,7 @@ class EndToEnd(unittest.TestCase):
         # A pin worth 20 seconds in production is worth a fraction of one
         # here. handoff is on whatever the shipped default is, because these
         # tests are about the move.
-        SANDBOX.tuning = replace(SANDBOX.tuning, poll=0.05, build_poll=0.05,
+        SANDBOX.tuning = replace(SANDBOX.tuning, poll=0.05,
                                 pin_patience=0.3, park_all_timeout=5.0,
                                 handoff=True)
 
@@ -272,8 +271,7 @@ class EndToEnd(unittest.TestCase):
             # The pool took its tuning when it was built, so shortening the
             # sandbox's reaches no running loop. Shorten each pool's own, and
             # do it before the bombs go in.
-            pool.tuning = replace(pool.tuning, poll=0.02, build_poll=0.02)
-            pool.build_once = Bomb()
+            pool.tuning = replace(pool.tuning, poll=0.02)
             pool.cv = Bomb()
         alive = not wait_for(lambda: not pool_threads(), patience=5.0)
         for stub in self.stubs:
@@ -513,8 +511,6 @@ class TheFirstSessionSavesTheOpening(EndToEnd):
         self.assertTrue(pool.openings, "the opening was not kept")
         name = next(iter(pool.openings.values()))
         self.assertTrue(name.startswith("base-") and name.endswith(".park"))
-        self.assertEqual(pool.wants, {},
-                         "it read the opening, so nothing is left to build")
         # Two renderings, then the read of the opening itself.
         self.assertEqual(self.cpu.templates, 2)
         self.assertIn(name, self.cpu.saves)
@@ -612,25 +608,6 @@ class SessionsThatStartTogether(EndToEnd):
                                              for b in boxes), patience=40),
                         f"a session never finished: {boxes}")
         self.assertEqual([b for b in boxes if "error" in b], [])
-
-
-class BuilderInTheBackground(EndToEnd):
-    """The builder reads an opening only where a backend can spare a slot."""
-
-    def test_it_builds_nothing_while_every_slot_is_busy(self):
-        pool = self.pool([self.stub("cpu", 1, slots=1)])
-        self.serve(pool)
-        pool.wants["k1"] = {"cut": (-1, "k1"), "mark": "base-",
-                            "system": LONG_SYSTEM, "head": [],
-                            "path": "/v1/chat/completions"}
-        for slot in self.backend(pool, "cpu")["slots_detail"]:
-            slot["busy"] = True
-        self.backend(pool, "cpu")["busy"] = 1
-
-        time.sleep(0.5)               # several builder passes, all of them idle
-        self.assertEqual(len(pool.wants), 1, "it built with no slot to spare")
-        self.assertEqual(pool.openings, {})
-        self.assertEqual(self.cpu.completions, [])
 
 
 class TheDeliberateCost(EndToEnd):

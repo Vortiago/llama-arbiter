@@ -195,46 +195,6 @@ class TheLogFollowsWhatThePoolDecided(unittest.TestCase):
         self.assertEqual(choice["plan"], "load")
         self.assertEqual(choice["shelf"], "base")
 
-    def test_a_want_says_added_while_it_waits_and_built_when_it_lands(self):
-        self.pool.note_want((0, "k9"), "base-", "", [], [], "/completion")
-        self.log.flush()
-        added = [r for r in rows_of(self.dir)
-                 if r["event"] == "want" and r["action"] == "added"][-1]
-        self.assertEqual(added["shelf"], "base")
-        self.assertEqual(self.pool.wants["k9"]["cut"][1], "k9")
-
-        class Reads(QuietLink):
-            def prefill(inner, be, block, slot, timeout=None):
-                return {"timings": {"prompt_n": 4200, "cache_n": 0}}
-
-        post = Reads(SANDBOX.tuning.park_floor + 1)
-        self.pool._render_block = lambda *a, **k: "rendered"
-        # The builder only reads into a slot the poll has found idle twice,
-        # so the backend is given a slots_detail that says exactly that.
-        self.pool.backends[0].update(
-            up=True, busy=0, slots=1,
-            slots_detail=[{"id": 0, "busy": False}],
-            idle_runs={0: SANDBOX.tuning.idle_polls})
-        self.pool.wants["k9"]["at"] = time.time() - 30
-        self.pool.link = post
-        self.pool.build_once(remove=lambda name: None)
-        self.log.flush()
-        built = [r for r in rows_of(self.dir)
-                 if r["event"] == "want" and r["action"] == "built"][-1]
-        self.assertTrue(built["ok"])
-        self.assertGreaterEqual(built["age"], 30)
-        build = [r for r in rows_of(self.dir) if r["event"] == "build"][-1]
-        self.assertTrue(build["ok"])
-        self.assertEqual(build["prompt_n"], 4200)
-
-    def test_a_dropped_want_says_how_long_it_waited_unbuilt(self):
-        for i in range(SANDBOX.tuning.want_keep + 1):
-            self.pool.note_want((0, f"k{i}"), "deep-", "", [], [], "/completion")
-        self.log.flush()
-        dropped = [r for r in rows_of(self.dir)
-                   if r["event"] == "want" and r["action"] == "dropped"]
-        self.assertEqual(len(dropped), 1)
-
     def test_a_load_says_which_shelf_and_how_long_the_read_took(self):
         self.pool.openings["k1"] = "base-k1.park"
         self.pool.link = QuietLink()

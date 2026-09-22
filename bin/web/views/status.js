@@ -49,10 +49,10 @@
 /** @typedef {{ name: string, file?: string, kind: string, bytes?: number, loads?: number,
  *              conv?: string, backend?: string, slot?: number | null,
  *              parked_at?: number | null }} DiskFile */
-/** @typedef {{ bases: DiskFile[], deeps: DiskFile[], wants: { name: string, kind: string }[] }} Openings */
+/** @typedef {{ bases: DiskFile[], deeps: DiskFile[] }} Openings */
 /** @typedef {{ count: number, bytes?: number, budget?: number, keep?: number }} Budget */
 /** `openings` is one budget over both shelves. `bases` and `deeps` are usage of it, not caps.
- * @typedef {{ copies: Budget, openings: Budget, bases: Budget, deeps: Budget, wants: Budget,
+ * @typedef {{ copies: Budget, openings: Budget, bases: Budget, deeps: Budget,
  *             files?: DiskFile[],
  *             mounts?: { path: string, total: number, free: number }[] }} Disk */
 /** @typedef {"queued" | "prefill" | "generate-queue" | "generate" | "done"} Stage */

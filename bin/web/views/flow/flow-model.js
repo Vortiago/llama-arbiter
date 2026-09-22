@@ -342,7 +342,7 @@ export function skipped(status) {
  * that tells one hash from another: 3.4 GiB costs eleven times what 357 MiB does to read.
  * @param {Status} status @returns {Shelf[]} */
 export function shelvesOf(status) {
-  const o = status.openings || { bases: [], deeps: [], wants: [] };
+  const o = status.openings || { bases: [], deeps: [] };
   /** @param {DiskFile[]} files */
   const bySize = (files) => files.slice().sort((a, b) => (b.bytes || 0) - (a.bytes || 0));
   return [

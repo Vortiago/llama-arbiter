@@ -175,12 +175,12 @@ def adopt_files(names, vouched=(), size=None, store=None, *, tuning):
             parked.append(name)
             continue
         key = opening_key(name)
-        if key and (tuning.deep_openings or shelf_of(name) == "base"):
+        if key and shelf_of(name) == "base":
             openings[key] = name
             bytes_[key] = size(name)
         else:
-            spent.append(name)      # unvouched copy, or a deep opening
-                                    # with deep_openings off
+            spent.append(name)      # an unvouched copy, or a deep cut:
+                                    # nothing reads one
     spent += trim_openings(openings, bytes_, budget=tuning.block_budget)
     return openings, bytes_, parked, spent
 

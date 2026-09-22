@@ -85,10 +85,6 @@ A point in a prompt where a shared prefix can end. The router can park an
 opening there.
 _Avoid_: split, boundary, checkpoint
 
-**Want**:
-An opening the router has found a use for but has not built yet.
-_Avoid_: pending, todo, backlog
-
 **Hold**:
 What a slot has in it now, named by the cuts it covers.
 _Avoid_: contents, state

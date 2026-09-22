@@ -162,7 +162,7 @@ test("a parked turn carries the file it is waiting behind", () => {
       { conv: "b/2", stage: /** @type {const} */ ("generate-queue"), backend: null, slot: null, since: 100, changed: 110 },
       { conv: "c/3", stage: /** @type {const} */ ("prefill"), backend: "cpu", slot: 0, since: 100, changed: 100 },
     ], log: [] },
-    disk: { copies: { count: 2 }, bases: { count: 0 }, deeps: { count: 0 }, wants: { count: 0 },
+    disk: { copies: { count: 2 }, bases: { count: 0 }, deeps: { count: 0 },
       files: [{ name: "x", kind: "copy", conv: "a/1", bytes: 9e9 }] },
   };
   const q = parkedOf(status, 200);
@@ -299,9 +299,9 @@ test("the hours saved come from the backends' own counters", () => {
 
 test("the two shelves are not one rack", () => {
   const shelves = shelvesOf({
-    openings: { bases: [{ name: "a", kind: "system prompt" }], deeps: [], wants: [] },
+    openings: { bases: [{ name: "a", kind: "system prompt" }], deeps: [] },
     disk: { copies: { count: 0 }, openings: { count: 1, bytes: 9, budget: 10 },
-            bases: { count: 1 }, deeps: { count: 0 }, wants: { count: 0 } },
+            bases: { count: 1 }, deeps: { count: 0 } },
   });
   // Kinds stay apart on the page even though one budget covers both: they are
   // dropped in a different order and serve different requests.
@@ -312,7 +312,7 @@ test("a copy is as wide as its real share of the budget", () => {
   const status = {
     backends: [backend({ name: "gpu0_0", prefill: false })],
     disk: { copies: { count: 2, bytes: 3, budget: 100 },
-            bases: { count: 0 }, deeps: { count: 0 }, wants: { count: 0 },
+            bases: { count: 0 }, deeps: { count: 0 },
             files: [
               { name: "a", kind: "copy", conv: "one", backend: "gpu0_0", slot: 0, bytes: 25 },
               { name: "b", kind: "copy", conv: "two", backend: "(before the restart)", bytes: 50 },
@@ -332,7 +332,7 @@ test("the strip is ordered the way the budget sweeps, and marks what goes next",
   // sits left and the tail of the filled run is what the next park sweeps away.
   const f = (conv, bytes, parked_at) => ({ name: conv, kind: "copy", conv, bytes, parked_at, backend: "x" });
   const status = { backends: [], disk: { copies: { count: 3, bytes: 3, budget: 100 },
-    bases: { count: 0 }, deeps: { count: 0 }, wants: { count: 0 },
+    bases: { count: 0 }, deeps: { count: 0 },
     files: [f("old", 40, 10), f("new", 40, 30), f("mid", 40, 20)] } };
   const { blocks } = blocksOf(status, 900);
   assert.deepEqual(blocks.map((b) => b.conv), ["new", "mid", "old"], "newest parked first");
@@ -354,8 +354,8 @@ test("a name only goes inside a block that can hold it", () => {
 
 test("the stores say how full they are and what has gone unused", () => {
   const l = loadOf({
-    openings: { bases: [{ name: "a", kind: "k", loads: 0 }, { name: "b", kind: "k", loads: 3 }], deeps: [], wants: [] },
-    disk: { copies: { count: 1, bytes: 5, budget: 10 }, bases: { count: 2 }, deeps: { count: 0 }, wants: { count: 0 } },
+    openings: { bases: [{ name: "a", kind: "k", loads: 0 }, { name: "b", kind: "k", loads: 3 }], deeps: [] },
+    disk: { copies: { count: 1, bytes: 5, budget: 10 }, bases: { count: 2 }, deeps: { count: 0 } },
   });
   assert.deepEqual([l.openings, l.unloaded], [2, 1],
     "loads is in-memory in the router, so a zero means not since it started");

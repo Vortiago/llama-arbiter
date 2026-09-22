@@ -125,7 +125,7 @@ class LiveRouter(LiveCase):
         SANDBOX.store.slots.mkdir(parents=True, exist_ok=True)
         # pin_patience is worth 20 seconds in production.
         SANDBOX.tuning = replace(SANDBOX.tuning, handoff=self.HANDOFF,
-                                poll=0.2, build_poll=0.3, idle_polls=1,
+                                poll=0.2,
                                 pin_patience=1.0, park_all_timeout=30.0)
         # "A real state is at least this big". The figure in the router is for
         # the production model's fixed recurrent state; the test model's
@@ -149,17 +149,6 @@ class LiveRouter(LiveCase):
         kw.setdefault("ctx", self.CTX)
         kw.setdefault("extra", list(self.KEEPS_ITS_SLOTS))
         return super().start(name, **kw)
-
-    @staticmethod
-    def hush_builder(pool):
-        """Stop the opening builder reading into these backends.
-
-        It runs on its own thread and takes a slot when one is idle, so in a
-        test with one slot an instance it lands in the middle of whatever is
-        being measured. The loop still comes round, so the teardown can still
-        stop it."""
-        pool.build_once = lambda **kw: None
-        return pool
 
     def pool(self, specs):
         made = make_pool(specs, store=SANDBOX.store, watch=True)
@@ -238,8 +227,7 @@ class LiveRouter(LiveCase):
             # The pool took its tuning when it was built, so shortening the
             # sandbox's reaches no running loop. Shorten each pool's own, and
             # do it before the bombs go in.
-            pool.tuning = replace(pool.tuning, poll=0.02, build_poll=0.02)
-            pool.build_once = Bomb()
+            pool.tuning = replace(pool.tuning, poll=0.02)
             pool.cv = Bomb()
         alive = not wait_for(lambda: not pool_threads(), patience=10.0)
         for name, value in self.kept.items():
@@ -308,9 +296,9 @@ class WithTheHandOffOn(LiveRouter):
         super().setUp()
         self.gen = self.start("gpu0_0", slots=1)
         self.read = self.start("cpu1_0", slots=2)
-        self.pool_ = self.hush_builder(
-            self.pool([self.spec(self.gen, 0, prefill=False, node=0),
-                       self.spec(self.read, 1, prefill=True, node=1)]))
+        self.pool_ = self.pool(
+            [self.spec(self.gen, 0, prefill=False, node=0),
+             self.spec(self.read, 1, prefill=True, node=1)])
         self.url = self.serve(self.pool_)
         self.messages = self.opening("cost") + [{"role": "user", "content": "Hello."}]
 
@@ -423,9 +411,9 @@ class ParkedCachesComeBack(LiveRouter):
         # one's slot rather than sitting beside it.
         self.one = self.start("cpu1_0", slots=1)
         self.two = self.start("cpu1_1", slots=1)
-        self.pool_ = self.hush_builder(
-            self.pool([self.spec(self.one, 0, prefill=True, node=1),
-                       self.spec(self.two, 1, prefill=True, node=1)]))
+        self.pool_ = self.pool(
+            [self.spec(self.one, 0, prefill=True, node=1),
+             self.spec(self.two, 1, prefill=True, node=1)])
         self.url = self.serve(self.pool_)
         self.head = self.opening("parked")
 
@@ -543,9 +531,9 @@ class DrainUnderLoad(LiveRouter):
         super().setUp()
         self.one = self.start("cpu1_0", slots=1)
         self.two = self.start("cpu1_1", slots=1)
-        self.pool_ = self.hush_builder(
-            self.pool([self.spec(self.one, 0, prefill=True, node=1),
-                       self.spec(self.two, 1, prefill=True, node=1)]))
+        self.pool_ = self.pool(
+            [self.spec(self.one, 0, prefill=True, node=1),
+             self.spec(self.two, 1, prefill=True, node=1)])
         self.url = self.serve(self.pool_)
         self.head = self.opening("drain")
 
@@ -573,37 +561,6 @@ class DrainUnderLoad(LiveRouter):
                              "a drained instance served a request")
         finally:
             self.pool_.resume("cpu1_0")
-
-    def test_the_opening_builder_leaves_a_drained_instance_alone(self):
-        """Two ways in, and both must refuse it.
-
-        `_usable` refuses a draining backend, so no request reaches one. The
-        builder asks `_idle_slot` instead, which once checked only that the
-        backend was up and had a slot spare -- so a drain reported an instance
-        quiet, parked its caches, and the builder then read a whole opening into
-        it: work a restart was about to throw away, on an instance somebody was
-        waiting to stop. `_idle_slot` now looks at `draining` as well.
-
-        The want is noted here rather than left over from a turn. A turn reads
-        its own base opening inline in warm_prefix, so it leaves nothing
-        wanted, and the only want a turn can leave is a deep one, which needs
-        DEEP_OPENINGS. tests/test_migration.py notes wants the same way."""
-        self.pool_.note_want((0, "wanted-by-the-builder"), "base-",
-                             self.head[0]["content"], [], self.head[:1],
-                             "/v1/chat/completions")
-        self.assertTrue(self.pool_.wants, "nothing was wanted, so nothing is proved")
-        for name in ("cpu1_0", "cpu1_1"):
-            self.pool_.drain(name, deadline=PATIENCE)
-        try:
-            before = [(s, s.mark()) for s in (self.one, self.two)]
-            built = router.Pool.build_once(self.pool_)
-            read = sum(read_tokens(s.since(m)) for s, m in before)
-            self.assertIsNone(built, "an opening was read into a drained instance")
-            self.assertEqual(read, 0, f"a drained instance read {read} tokens "
-                                      f"for the opening builder")
-        finally:
-            for name in ("cpu1_0", "cpu1_1"):
-                self.pool_.resume(name)
 
     def test_a_drain_copies_the_caches_out_before_the_instance_stops(self):
         self.turn(self.url, "living", self.head + [{"role": "user", "content": "Hello."}])

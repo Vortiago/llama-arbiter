@@ -73,16 +73,10 @@ class Tuning:
                                       # to read, a fifth of a second to load.
     build_patience: float = 1800.0    # longest a request waits for another to
                                       # save the opening they share
-    build_poll: float = 10.0          # seconds between builder passes
-    idle_polls: int = 2               # polls a slot must look idle before the
-                                      # builder reads into it. One poll can be
-                                      # two seconds old.
-    want_keep: int = 8                # openings noted as missing, not built yet
-    # Deeper openings: a cut where two conversations diverge. Off by default:
-    # over two days of real traffic it was built 0 times and loaded 0 times.
-    # The detection still runs, and the `choice` event records how deep a fork
-    # could have started. tools/cache-report.py reads it.
-    deep_openings: bool = False
+    # A deeper cut, where two conversations diverge, is detected and
+    # recorded in the `choice` event but never saved: over two days of real
+    # traffic one was built 0 times and loaded 0 times.
+    # tools/cache-report.py reads that event.
 
     # -- moving a turn
     # A restored slot needs its context checkpoints in the state file, which
@@ -114,5 +108,4 @@ class Tuning:
             park_budget=int(float(env.get("PARK_BUDGET_GB") or 256) * 1024 ** 3),
             block_budget=int(float(env.get("BLOCK_BUDGET_GB") or 64) * 1024 ** 3),
             handoff=handoff_on(env),
-            deep_openings=env.get("DEEP_OPENINGS", "0") == "1",
             cache_log=env.get("CACHE_LOG", "1") == "1")
