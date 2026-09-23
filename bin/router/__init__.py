@@ -47,9 +47,8 @@ from .protocol.body import (IGNORED_KEYS, SYSTEM_ROLES, closes,
 from .protocol.splice import (AnthropicSplice, OaiUsageSplice, wants_usage,
                               with_usage)
 from .protocol.systemone import (SYSTEMONE, SYSTEMONE_LETTERS,
-                                 answers,
                                  SYSTEMONE_RUBRIC, SYSTEMONE_UP,
-                                 Refused, noul_criteria,
+                                 Refused, answers, noul_criteria,
                                  systemone_body, systemone_options,
                                  systemone_plan, systemone_read,
                                  systemone_says)

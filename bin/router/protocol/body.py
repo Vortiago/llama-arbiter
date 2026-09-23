@@ -17,20 +17,30 @@ def text_of(value):
 def content_size(value):
     """How many characters of a message a backend will read.
 
-    Not text_of: that reads the words a content block says at its top level,
-    and names a conversation by them. A tool_result carries its words under
-    its own `content`, so every turn of an agentic client measured zero, no
-    message reached the bar and a conversation of any length named no cut.
-    Kept apart from text_of on purpose: changing that one renames every
-    conversation on disk."""
+    Every string it holds, at any depth, because each shape of block keeps
+    its words under a different key: `text` on a text part, `content` on a
+    tool_result, `input` on a tool call. Naming the keys instead measured the
+    two that were named and zero for the rest, so an agentic conversation
+    reached no bar and named no cut.
+
+    Base64 image data is left out, for the reason request_cost leaves it out:
+    it is hundreds of times longer than what the vision encoder charges for
+    it, and one screenshot would carry the bar for a whole conversation.
+
+    Not text_of, which reads the top level of a block and is what names a
+    conversation. Changing that one renames every copy on disk."""
     if isinstance(value, str):
-        return len(value)
+        return 0 if value.startswith("data:image/") else len(value)
     if isinstance(value, list):
         return sum(content_size(part) for part in value)
     if isinstance(value, dict):
-        for key in ("text", "content"):
-            if key in value:
-                return content_size(value[key])
+        size = 0
+        for key, part in value.items():
+            if (key == "source" and isinstance(part, dict)
+                    and str(part.get("media_type", "")).startswith("image/")):
+                continue                   # base64, charged by the encoder
+            size += content_size(part)
+        return size
     return 0
 
 

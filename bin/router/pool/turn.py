@@ -164,12 +164,16 @@ class Turn:
             mine = pool.claim_turn(conv, ticket, client.alive, work)
             be = pool.acquire(conv, tokens, client.alive) if mine else None
         except BaseException:
-            # The try below is what gives the claim back on every planned way
-            # out, and it starts two statements from here. claim_turn has no
-            # deadline, so a claim left behind stops the conversation for the
-            # life of the process.
+            # The same ending as the branch below, for a way out nobody
+            # planned. finish_turn matches on the ticket, so it is a no-op
+            # unless this turn held the claim; "done" is guarded, because one
+            # for a turn that never claimed deletes the row of the one
+            # running. settle() stops a keep-alive `open` may already have
+            # started: it runs before the claim is taken.
             if mine:
-                pool.finish_turn(conv, ticket)
+                pool.note_stage(conv, "done")
+            pool.finish_turn(conv, ticket)
+            client.settle()
             raise
         finally:
             pool.end_wait(ticket)

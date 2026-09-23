@@ -64,15 +64,13 @@ class Link:
 
     # -- work
 
-    def ask(self, be, path, payload, timeout=None):
-        """Post one request and give back the whole reply. For a caller that
-        gathers the answer rather than streaming it on. `render` asks what the
-        backend's own template makes of a body, which is the same call."""
-        return self._post(be, path, payload, timeout)
+    def render(self, be, path, payload, timeout=None):
+        """What the backend's own template makes of these messages.
 
-    # What the backend's own template makes of these messages. The same call,
-    # under the name its one caller reads it by.
-    render = ask
+        Nothing waits on this: it is the router asking a question of its own,
+        between a client's turns. A call a client is waiting for goes through
+        `read`, which stops when the client does."""
+        return self._post(be, path, payload, timeout)
 
     def prefill(self, be, block, slot, timeout=None):
         """Read a block into a slot and generate nothing. The reply's timings

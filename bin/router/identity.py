@@ -26,9 +26,12 @@ def conversation_id(body):
                 break                      # the reply
             text = message.get("content")
             if isinstance(text, list):     # multimodal message
-                # The same reading prompt_cuts gives a message, so that the
-                # name of a conversation and the names of its cuts cannot
-                # come to disagree about what a content block says.
+                # The top level of a block, which is what this hash has
+                # always read. Every conversation key on disk was made this
+                # way, so a different reading here renames every parked copy
+                # and orphans it. prompt_cuts sizes a message with
+                # content_size instead: a name must never change, and a
+                # measure has to be right.
                 text = text_of(text)
             opening.append(f"{role}:{text}")
             if role == "user":

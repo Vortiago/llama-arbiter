@@ -558,5 +558,45 @@ class TheReadNamesTheSlotTheTurnPicked(unittest.TestCase):
         self.assertIs(pool.link.asked()["stream"], False)
 
 
+class AClaimIsNeverLeftBehind(unittest.TestCase):
+    """claim_turn has no deadline, so a claim a turn does not give back stops
+    that conversation for good. Every way out of a turn has to reach
+    finish_turn, including a way out nobody planned."""
+
+    def test_a_failure_while_taking_a_backend_gives_the_claim_back(self):
+        pool = one_backend()
+
+        def boom(*a, **kw):
+            raise RuntimeError("the pool fell over")
+
+        pool.acquire = boom
+        with self.assertRaises(RuntimeError):
+            pool.turn(router.Ask("/v1/chat/completions",
+                                 prompt(10),
+                                 "c1"), FakeClient())
+
+        self.assertNotIn("c1", pool.turns,
+                         "the conversation is claimed by a turn that is gone")
+
+    def test_a_stream_already_open_is_stopped_on_the_way_out(self):
+        """open() starts the keep-alive before the claim is taken, so a way
+        out that skips settle() leaves the ping thread with nothing to stop
+        it, and the flow board keeps a row the turn never finished."""
+        pool = one_backend()
+
+        def boom(*a, **kw):
+            raise RuntimeError("the pool fell over")
+
+        pool.acquire = boom
+        client = FakeClient()
+        with self.assertRaises(RuntimeError):
+            pool.turn(router.Ask("/v1/chat/completions",
+                                 prompt(10, stream=True), "c1"), client)
+
+        self.assertIn("settle", client.did, "the keep-alive was left running")
+        self.assertNotIn("c1", pool.flow.live,
+                         "the board still shows a turn that is gone")
+
+
 if __name__ == "__main__":
     unittest.main()

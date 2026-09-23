@@ -2122,12 +2122,12 @@ class PromptCuts(unittest.TestCase):
         cuts, _, _, _ = router.prompt_cuts(self.body(*messages, **kw))
         return [key for _, key in cuts]
 
-    def tool_result(self, words):
+    def tool_result(self, content):
         """One agentic turn as the router's own client sends it: the words
         sit under the block's own `content`, not at the top level."""
         return {"role": "user",
                 "content": [{"type": "tool_result", "tool_use_id": "t1",
-                             "content": [{"type": "text", "text": words}]}]}
+                             "content": content}]}
 
     def test_an_agentic_conversation_names_its_cuts(self):
         """Every turn of the router's own client is a tool_result. Measured by
@@ -2135,19 +2135,41 @@ class PromptCuts(unittest.TestCase):
         reached the bar and a conversation of any length named no cut."""
         got = self.keys({"role": "user", "content": "hello"},
                         {"role": "assistant", "content": "hi"},
-                        self.tool_result(LONG),
+                        self.tool_result([{"type": "text", "text": LONG}]),
                         {"role": "assistant", "content": "ok"},
-                        self.tool_result(LONG))
+                        self.tool_result([{"type": "text", "text": LONG}]))
         self.assertEqual(len(got), 3, "no cut was named in a 24,000 "
                                       "character conversation")
 
+    def test_the_call_an_assistant_makes_is_measured_too(self):
+        """A tool_use carries the arguments under `input`, and the template
+        writes them into the prompt. Measured by two key names it counted
+        zero, so the assistant half of every agentic turn was invisible.
+
+        The cut lands on the message that answers the call, not on the call:
+        a template cannot end a prompt on one. What matters is that it lands
+        at all."""
+        call = {"role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Write",
+                             "input": {"file_path": "/a.py", "content": LONG}}]}
+        got = self.keys({"role": "user", "content": "hello"}, call,
+                        {"role": "user", "content": "go on"})
+        self.assertEqual(len(got), 1, "an assistant turn of 12,000 "
+                                      "characters named no cut")
+
+    def test_a_base64_image_is_not_counted_as_words(self):
+        """It is hundreds of times longer than what the vision encoder
+        charges, which is why request_cost leaves it out as well."""
+        shot = [{"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png",
+                            "data": "A" * 40000}}]
+        self.assertLess(router.content_size(shot), 200)
+
     def test_a_tool_result_that_carries_its_words_directly_counts_too(self):
         """The same block with a string where the list would be."""
-        tool = {"role": "user",
-                "content": [{"type": "tool_result", "tool_use_id": "t1",
-                             "content": LONG}]}
         got = self.keys({"role": "user", "content": "hello"},
-                        {"role": "assistant", "content": "hi"}, tool)
+                        {"role": "assistant", "content": "hi"},
+                        self.tool_result(LONG))
         self.assertEqual(len(got), 1)
 
     def test_names_a_cut_after_each_message(self):
