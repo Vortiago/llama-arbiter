@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  READ_RATE, MARK_CAP, slotKey, readRate, currentOf, markRate, stuck, historyOf,
+  READ_RATE, MARK_CAP, slotKey, readRate, genRate, currentOf, markRate, stuck, historyOf,
   nodesOf, arrivalsOf, residency, transferOf, since, turnOf, tapeOf, skipped,
   shelvesOf, blocksOf, widest, loadOf, parkedOf,
 } from "./flow-model.js";
@@ -56,6 +56,18 @@ test("a generating slot starved by a prefill beside it is stalled", () => {
   assert.equal(stuck(be, slot({ phase: "generating", tg_rate: 0.05 }), 0), true);
   assert.equal(stuck(be, slot({ phase: "generating", tg_rate: 6.3 }), 0), false);
   assert.equal(stuck(be, slot({ phase: "idle" }), 99999), false, "an idle slot is not stuck");
+});
+
+test("a generating rate the router rounded to zero is the stall itself", () => {
+  // The router sends null while its ten second window is open and a rounded
+  // figure after it. A stall measures 0.02 to 0.06 tokens a second, which
+  // rounds to 0.0 - so the one number that names the fault is the one a
+  // falsy-zero fallback replaced with the backend's healthy average.
+  const be = backend({ name: "gpu0_0", prefill: false, stats: { tg_rate: 6.3 } });
+  assert.equal(genRate(be, slot({ phase: "generating", tg_rate: 0 })), 0);
+  assert.equal(stuck(be, slot({ phase: "generating", tg_rate: 0 }), 0), true);
+  assert.equal(genRate(be, slot({ phase: "generating", tg_rate: null })), 6.3,
+    "the backend's average answers only when the slot has no figure yet");
 });
 
 test("the last ten minutes stack up the bucket without overflowing it", () => {
@@ -143,8 +155,8 @@ test("a node carries the router's label for the turn in its slot", () => {
 
 test("the arrivals say what each turn is waiting for", () => {
   const rows = arrivalsOf({ waiting_detail: [
-    { conv: "a", since: 0, waited: 4695.6, tokens: 70989, wants: "turn", backend: null },
-    { conv: "b", since: 0, waited: 3, tokens: 10, wants: "pinned", backend: "gpu0_0" },
+    { conv: "a", since: 0, waited: 4695.6, tokens: 70989, waiting_on: "turn", backend: null },
+    { conv: "b", since: 0, waited: 3, tokens: 10, waiting_on: "pinned", backend: "gpu0_0" },
   ] });
   assert.equal(rows[0].kind, "turn");
   assert.equal(rows[0].why, "behind its own turn", "a card in a stack gets four words, not a sentence");
@@ -152,12 +164,12 @@ test("the arrivals say what each turn is waiting for", () => {
 });
 
 test("two turns of one conversation are two arrivals, not one twice", () => {
-  // `wants: "turn"` IS a turn queued behind another turn of the same
+  // `waiting_on: "turn"` IS a turn queued behind another turn of the same
   // conversation, so the conversation alone cannot key the list: keyed by it,
   // the second row is built fresh every push and the first is never dropped.
   const rows = arrivalsOf({ waiting_detail: [
-    { conv: "a", since: 10, waited: 4, tokens: 10, wants: "prefill", backend: null },
-    { conv: "a", since: 20, waited: 2, tokens: 10, wants: "turn", backend: null },
+    { conv: "a", since: 10, waited: 4, tokens: 10, waiting_on: "prefill", backend: null },
+    { conv: "a", since: 20, waited: 2, tokens: 10, waiting_on: "turn", backend: null },
   ] });
   assert.deepEqual(rows.map((r) => r.since), [10, 20]);
   assert.equal(new Set(rows.map((r) => `${r.conv}:${r.since}`)).size, 2);
@@ -173,7 +185,7 @@ test("a parked turn carries the file it is waiting behind", () => {
       { conv: "b/2", stage: /** @type {const} */ ("generate-queue"), backend: null, slot: null, since: 100, changed: 110 },
       { conv: "c/3", stage: /** @type {const} */ ("prefill"), backend: "cpu", slot: 0, since: 100, changed: 100 },
     ], log: [] },
-    disk: { copies: { count: 2 }, bases: { count: 0 }, deeps: { count: 0 }, wants: { count: 0 },
+    disk: { copies: { count: 2 }, bases: { count: 0 }, deeps: { count: 0 },
       files: [{ name: "x", kind: "copy", conv: "a/1", bytes: 9e9 }] },
   };
   const q = parkedOf(status, 200);
@@ -189,10 +201,10 @@ test("a request carrying pictures says so, and what they cost", () => {
   // of text are not the same kind of work - the vision encoder runs in RAM on
   // whichever backend serves it, gpu included.
   const [a] = arrivalsOf({ waiting_detail: [{ conv: "a", since: 0, waited: 3, tokens: 91401,
-    wants: "prefill", backend: null, images: 2, image_tokens: 4100 }] });
+    waiting_on: "prefill", backend: null, images: 2, image_tokens: 4100 }] });
   assert.deepEqual([a.images, a.imageTokens], [2, 4100]);
   const [plain] = arrivalsOf({ waiting_detail: [{ conv: "b", since: 0, waited: 1, tokens: 10,
-    wants: "prefill", backend: null }] });
+    waiting_on: "prefill", backend: null }] });
   assert.deepEqual([plain.images, plain.imageTokens], [0, 0], "a router that sends neither reads as none");
   const t2 = turnOf({ conv: "c", backend: "b", path: "/x", took: 10, waited: 0,
     started: "cold", tokens: 5000, at: 1, images: 1, image_tokens: 300 });
@@ -310,9 +322,9 @@ test("the hours saved come from the backends' own counters", () => {
 
 test("the two shelves are not one rack", () => {
   const shelves = shelvesOf({
-    openings: { bases: [{ name: "a", kind: "system prompt" }], deeps: [], wants: [] },
+    openings: { bases: [{ name: "a", kind: "system prompt" }], deeps: [] },
     disk: { copies: { count: 0 }, openings: { count: 1, bytes: 9, budget: 10 },
-            bases: { count: 1 }, deeps: { count: 0 }, wants: { count: 0 } },
+            bases: { count: 1 }, deeps: { count: 0 } },
   });
   // Kinds stay apart on the page even though one budget covers both: they are
   // dropped in a different order and serve different requests.
@@ -323,7 +335,7 @@ test("a copy is as wide as its real share of the budget", () => {
   const status = {
     backends: [backend({ name: "gpu0_0", prefill: false })],
     disk: { copies: { count: 2, bytes: 3, budget: 100 },
-            bases: { count: 0 }, deeps: { count: 0 }, wants: { count: 0 },
+            bases: { count: 0 }, deeps: { count: 0 },
             files: [
               { name: "a", kind: "copy", conv: "one", backend: "gpu0_0", slot: 0, bytes: 25 },
               { name: "b", kind: "copy", conv: "two", backend: "(before the restart)", bytes: 50 },
@@ -343,7 +355,7 @@ test("the strip is ordered the way the budget sweeps, and marks what goes next",
   // one touched last sits left and the tail of the filled run goes next.
   const f = (conv, bytes, used) => ({ name: conv, kind: "copy", conv, bytes, used, backend: "x" });
   const status = { backends: [], disk: { copies: { count: 3, bytes: 3, budget: 100 },
-    bases: { count: 0 }, deeps: { count: 0 }, wants: { count: 0 },
+    bases: { count: 0 }, deeps: { count: 0 },
     files: [f("stale", 40, 1), f("just now", 40, 30), f("earlier", 40, 20)] } };
   const { blocks } = blocksOf(status, 900);
   assert.deepEqual(blocks.map((b) => b.conv), ["just now", "earlier", "stale"], "used most recently first");
@@ -365,8 +377,8 @@ test("a name only goes inside a block that can hold it", () => {
 
 test("the stores say how full they are and what has gone unused", () => {
   const l = loadOf({
-    openings: { bases: [{ name: "a", kind: "k", loads: 0 }, { name: "b", kind: "k", loads: 3 }], deeps: [], wants: [] },
-    disk: { copies: { count: 1, bytes: 5, budget: 10 }, bases: { count: 2 }, deeps: { count: 0 }, wants: { count: 0 } },
+    openings: { bases: [{ name: "a", kind: "k", loads: 0 }, { name: "b", kind: "k", loads: 3 }], deeps: [] },
+    disk: { copies: { count: 1, bytes: 5, budget: 10 }, bases: { count: 2 }, deeps: { count: 0 } },
   });
   assert.deepEqual([l.openings, l.unloaded], [2, 1],
     "loads is in-memory in the router, so a zero means not since it started");

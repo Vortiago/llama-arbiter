@@ -138,12 +138,12 @@ test("reuse share leaves out a backend that does not read", () => {
 });
 
 test("a waiter's label is empty when it says what the queue already says", () => {
-  const reads = { conv: "a", since: 0, waited: 1, tokens: 10, wants: /** @type {const} */ ("prefill"), backend: null };
+  const reads = { conv: "a", since: 0, waited: 1, tokens: 10, waiting_on: /** @type {const} */ ("prefill"), backend: null };
   assert.equal(waitLabel(reads, "every slot on a backend that prefills is busy"), "");
   assert.equal(waitLabel(reads, "a slot is free"), "needs a backend that prefills");
-  assert.equal(waitLabel({ ...reads, wants: "pinned", backend: "cpu" }, "a slot is free"), "holds for cpu, its cache is there");
-  assert.equal(waitLabel({ ...reads, wants: "big" }, "a slot is free"), "too big for what is free");
-  assert.equal(waitLabel({ ...reads, wants: "turn" }, "a slot is free"),
+  assert.equal(waitLabel({ ...reads, waiting_on: "pinned", backend: "cpu" }, "a slot is free"), "holds for cpu, its cache is there");
+  assert.equal(waitLabel({ ...reads, waiting_on: "big" }, "a slot is free"), "too big for what is free");
+  assert.equal(waitLabel({ ...reads, waiting_on: "turn" }, "a slot is free"),
     "waits for the turn ahead of it in the same conversation");
 });
 

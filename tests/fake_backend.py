@@ -2,7 +2,7 @@
 
 It serves every endpoint the router reaches for, and answers honestly: a slot
 says it is processing while it really is, a save really writes a file into
-router.SLOT_DIR, and a restore really reads one back. Idle detection, park and
+the store it is given, and a restore really reads one back. Idle detection, park
 recall all read this state, so a stub that lied would prove nothing.
 
 The cache model is small but real. A slot holds the text its KV covers, a
@@ -208,7 +208,7 @@ class FakeBackend:
 
     def __init__(self, name="be", slots=1, n_ctx=150000, model="fake-model",
                  busy_ms=20, save_ms=0, restore_ms=0, save_bytes=None,
-                 queue_wait=20.0, gate_wait=30.0):
+                 queue_wait=20.0, gate_wait=30.0, store=None, park_floor=None):
         self.name = name
         self.n_ctx = n_ctx
         self.model = model
@@ -218,7 +218,12 @@ class FakeBackend:
         # A real state carries the recurrent state whatever the length, so the
         # default is above the floor the router treats as a real cache. A test
         # that wants the "nothing to park" path sets it below.
-        self.save_bytes = (router.PARK_FLOOR + 4096 if save_bytes is None
+        # The store it writes slot files into, and the size the router
+        # treats as a real cache. Handed in, because this double has no
+        # opinion about either.
+        self.store = store
+        park_floor = router.Tuning().park_floor if park_floor is None else park_floor
+        self.save_bytes = (park_floor + 4096 if save_bytes is None
                            else save_bytes)
         self.queue_wait = queue_wait      # longest wait for a slot to free
         self.gate_wait = gate_wait        # longest wait for a held turn
@@ -289,15 +294,15 @@ class FakeBackend:
 
     # ---- the slot machinery ----------------------------------------------
 
-    def take_slot(self, wanted=None):
+    def take_slot(self, asked=None):
         """Hold a slot for a turn. Waits for one, as a real backend queues."""
         stop = time.time() + self.queue_wait
         while True:
             with self.lock:
-                if wanted is None:
+                if asked is None:
                     choices = self.slots
-                elif 0 <= wanted < len(self.slots):
-                    choices = [self.slots[wanted]]
+                elif 0 <= asked < len(self.slots):
+                    choices = [self.slots[asked]]
                 else:
                     return None
                 for slot in choices:
@@ -397,13 +402,13 @@ class FakeBackend:
     # ---- the slot file ----------------------------------------------------
 
     def save(self, sid, filename):
-        """Write this slot's cache to a file under router.SLOT_DIR.
+        """Write this slot's cache to a file in the store's slot directory.
 
         The file is sparse: the size the router judges by is real, but the
         zeros behind the header cost no disk."""
         slot = self.wait_idle(sid)
         time.sleep(self.save_s)
-        path = Path(router.SLOT_DIR) / filename
+        path = self.store.slots / filename
         header = json.dumps({"held": slot.held,
                              "tokens": tokens_in(slot.held)}).encode() + b"\n"
         with open(path, "wb") as handle:
@@ -418,7 +423,7 @@ class FakeBackend:
 
     def restore(self, sid, filename):
         """Read a file back into this slot."""
-        path = Path(router.SLOT_DIR) / filename
+        path = self.store.slots / filename
         if not path.exists():
             raise FileNotFoundError(f"no such state file: {filename}")
         slot = self.wait_idle(sid)

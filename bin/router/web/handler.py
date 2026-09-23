@@ -1,0 +1,603 @@
+"""The public port: what it serves and what it refuses."""
+
+import http.client, http.server, json, os, select, socket, threading, time
+from pathlib import Path
+from ..identity import client_kind, session_key, short_key
+from ..pool.turn import Ask
+from ..protocol.body import request_shape
+from ..protocol.splice import AnthropicSplice, OaiUsageSplice, wants_usage, with_usage
+from ..protocol.sse import _say, anthropic, ping_for, sse_event, wants_ping
+from ..protocol.systemone import SYSTEMONE, Refused, systemone_body, systemone_plan
+from ..transport import said_in
+from .config import CONFIG_FILES, client_config, host_only
+
+def passed_paths(env=None):
+    """The paths a client may reach through the router, for this run.
+
+    PASS_THROUGH adds to the fixed list. The backends run with --agent, which
+    is shell and file access with no key, so a path not named here must never
+    be reachable from the public port.
+    """
+    env = os.environ if env is None else env
+    return PASSED | {p.strip() for p in env.get("PASS_THROUGH", "").split(",")
+                     if p.strip()}
+
+
+# Endpoints that use a slot.
+INFERENCE = {
+    "/completion", "/completions", "/v1/completions",
+    "/chat/completions", "/v1/chat/completions",
+    "/infill", "/v1/messages", "/responses", "/v1/responses",
+    "/embedding", "/embeddings", "/v1/embeddings",
+    SYSTEMONE,
+}
+
+
+# An allowlist. The backends run with --agent, which is shell and file
+# access with no key. A path not named here must never be reachable from
+# the public port. PASS_THROUGH adds to it, comma separated.
+PASSED = frozenset({
+    "/health", "/props", "/slots", "/models", "/v1/models",
+    "/tokenize", "/detokenize", "/apply-template",
+    "/v1/messages/count_tokens", "/v1/messages/apply-template",
+})
+
+
+DROP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "te", "trailers",
+                "transfer-encoding", "upgrade", "content-length", "host"}
+
+
+# The dashboard, a static app. bin/router/web/handler.py -> bin/web:
+# this package's own web/ is the port, that one is the page.
+WEB = Path(__file__).resolve().parents[2] / "web"
+
+
+MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",  ".json": "application/json",
+        ".svg": "image/svg+xml", ".ico": "image/x-icon", ".map": "application/json"}
+
+
+ON_THE_PAGE = ("lib", "views", "components")   # directories the browser needs
+
+
+PAGE_FILES = ("index.html", "shell.js", "shell.css")
+
+
+def on_the_page(rel):
+    """True for a path the browser needs. The web directory also holds
+    node_modules, 31 MB that must not go on the wire."""
+    rel = (rel or "").strip("/")
+    if not rel:
+        return True                       # a directory, answered by its index
+    head = rel.split("/", 1)[0]
+    return head in ON_THE_PAGE or rel in PAGE_FILES
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "qwen-router"
+
+    def log_message(self, fmt, *args):
+        pass                                   # the router prints its own line
+
+    def do_GET(self):
+        if self.path.rstrip("/") == "/router/json":
+            return self._send(200, json.dumps(self.server.pool.status(), indent=2).encode())
+        if self.command == "GET" and self.path.split("?")[0] in ("", "/", "/router"):
+            # The backends serve their own web ui at the root. /router needs
+            # the trailing slash so relative urls resolve under /router/.
+            # Exact matches only: /router/ must reach the static handler.
+            return self._redirect("/router/")
+        if self.path.startswith("/router/"):
+            rest = self.path[len("/router/"):].split("?")[0]
+            if rest == "events":
+                return self._events()
+            if rest.startswith("drain/") or rest.startswith("resume/"):
+                return self._service(*rest.split("/", 1))
+            if rest == "reset-rates":
+                if self.command != "POST":
+                    return self._error(405, "post to reset the rates")
+                self.server.pool.reset_rates(True)
+                return self._send(200, json.dumps(
+                    {"rates_since": self.server.pool.rates_since}).encode())
+            if rest.startswith("config/"):
+                return self._config(rest[len("config/"):])
+            return self._static(rest or "index.html")
+        self._route()
+
+    do_POST = do_DELETE = do_GET
+
+    def _service(self, what, name):
+        """Drain a backend, or put it back. POST only: both change the pool."""
+        if self.command != "POST":
+            return self._error(405, "post to drain or resume a backend")
+        if what == "resume":
+            done = self.server.pool.resume(name)
+            return (self._send(200, json.dumps({"backend": name, "serving": True}).encode())
+                    if done else self._error(404, f"no backend called {name}"))
+        report = self.server.pool.drain(name)
+        if report is None:
+            return self._error(404, f"no backend called {name}")
+        # A drain that gave up, or whose saves failed, left caches only in
+        # slots. Say so, or a script stops a backend that holds live caches.
+        ok = report["quiet"] and not report["left"]
+        return self._send(200 if ok else 409, json.dumps(report).encode())
+
+    def _redirect(self, where):
+        self.send_response(301)
+        self.send_header("Location", where)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _config(self, kind):
+        """Offer a ready client config, addressed to the host the reader used.
+        The Host header is checked: the reader keeps the file for months."""
+        host = host_only(self.headers.get("Host"))
+        if not host or kind not in CONFIG_FILES:
+            return self._error(404, "no such config")
+        with self.server.pool.cv:
+            up = [be for be in self.server.pool.backends if be["up"]]
+            model = next((be["model"] for be in up if be["model"]), "qwen")
+            n_ctx = min([be["n_ctx"] for be in up if be["n_ctx"]], default=150000)
+        config = client_config(kind, host, model, n_ctx,
+                               self.server.provider)
+        if config is None:
+            return self._error(404, "no such config")
+        payload = json.dumps(config, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{CONFIG_FILES[kind]}"')
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send(self, code, payload, content_type="application/json"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _error(self, code, message, say=None):
+        """Answer with an error, and log it."""
+        (say or _say)(f"[router] {code} on {self.command} "
+                      f"{self.path.split('?')[0]}: {message}")
+        self._send(code, json.dumps({"error": {"message": message}}).encode())
+
+    def _static(self, rel):
+        """Serve the dashboard from bin/web. Files are read per request, so
+        editing the page needs no restart."""
+        if not on_the_page(rel):
+            return self._error(404, f"no such file: {rel}")
+        base = WEB.resolve()
+        try:
+            target = (base / rel).resolve()
+            target.relative_to(base)              # no escaping the web dir
+        except (ValueError, OSError):
+            return self._error(403, "outside the web directory")
+        if target.is_dir():
+            target = target / "index.html"
+        if not target.is_file():
+            return self._error(404, f"no such file: {rel}")
+
+        stat = target.stat()
+        etag = f'"{int(stat.st_mtime)}-{stat.st_size}"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", MIME.get(target.suffix, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _events(self):
+        """Push the pool status when it changes. The client's EventSource
+        reconnects by itself."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        previous = None
+        try:
+            while True:
+                payload = json.dumps(self.server.pool.status())
+                if payload != previous:
+                    self.wfile.write(f"data: {payload}\n\n".encode())
+                    self.wfile.flush()
+                    previous = payload
+                time.sleep(1.0)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                                   # the viewer closed the tab
+
+    def _pool_props(self, path):
+        """Answer /props and /slots for the whole pool. One backend's answer
+        makes the router look like a one-slot server."""
+        live = [be for be in self.server.pool.backends if be["up"]]
+        if not live:
+            return self._error(503, "no backend is up")
+
+        link = self.server.pool.link
+        if path == "/slots":
+            slots = []
+            for be in live:
+                part = link.slots(be, timeout=5)
+                # Each row as well as the list: a proxy in front of a backend
+                # answers 200 with whatever it likes, and assigning into a row
+                # that is not an object raised out of do_GET with no status
+                # line sent, so the client saw a reset rather than an answer.
+                for slot in part if isinstance(part, list) else ():
+                    if isinstance(slot, dict):
+                        slot["backend"] = be["name"]
+                        slots.append(slot)
+            return self._send(200, json.dumps(slots).encode())
+
+        props = link.props(live[0], timeout=5)
+        # Not `is None`: a proxy in front of a backend answers 200 with a list,
+        # and subscripting that raised out of do_GET with no status line sent,
+        # so the client saw a reset instead of this 502.
+        if not isinstance(props, dict):
+            return self._error(502, f"{live[0]['name']} did not answer /props")
+        props["total_slots"] = sum(be["slots"] for be in live)
+        return self._send(200, json.dumps(props).encode())
+
+    def _route(self):
+        # A client's header. int() on junk raised before a status line went
+        # out, and BaseHTTPRequestHandler catches only TimeoutError.
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._error(400, "Content-Length is not a number")
+        if length < 0:
+            return self._error(400, "Content-Length is negative")
+        # Checked before the body is read, or a header alone could ask
+        # this process for arbitrary memory.
+        if length > self.server.pool.tuning.max_body:
+            self.close_connection = True
+            return self._error(413, f"body of {length} bytes; this router "
+                                    f"reads at most {self.server.pool.tuning.max_body}")
+        # Nothing here decodes chunked. Read as an empty body, the unread
+        # chunks become the next request line on this connection.
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            self.close_connection = True
+            return self._error(411, "send the body with a Content-Length: "
+                                    "this router does not read chunked requests")
+        body = self.rfile.read(length) if length else b""
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        # Per request, not per connection: one handler serves a whole
+        # keep-alive connection.
+        self.sending = threading.Lock()        # one writer at a time
+        self.streaming = False
+        self.stop_ping = None
+        self.went = "closed its end"
+        self.kind = client_kind(self.headers)
+
+        if self.command == "GET" and path in ("/props", "/slots"):
+            return self._pool_props(path)
+
+        # Both chat apis are POST only. A bodiless GET took a slot, parked
+        # every cache on the backend and restored gigabytes before the
+        # backend answered 404. From an unauthenticated public port.
+        if path in INFERENCE and self.command != "POST":
+            return self._error(405, f"post to {path}")
+        if path not in INFERENCE:
+            # An allowlist, see passed_paths.
+            if path not in self.server.passed:
+                return self._error(404, f"this router does not serve {path}")
+            be = next((b for b in self.server.pool.backends if b["up"]), None)
+            if not be:
+                return self._error(503, "no backend is up")
+            return self._forward(be, body)
+
+        # A typed question becomes an ordinary chat body: the rubric and
+        # the state, which every question shares. The read pass carries the
+        # first question, so that both phases send the same prompt. Reading
+        # the state alone cost the first question a full re-read on
+        # production: 351 tokens of a state of 348.
+        plan, sent = None, None
+        if path == SYSTEMONE:
+            try:
+                plan = systemone_plan(body)
+                # What the client sent, kept for the capture: the body below
+                # is rebuilt from the plan, and this one cannot be.
+                sent = body
+                body = json.dumps(
+                    systemone_body(plan, plan["questions"][0])).encode()
+            except Refused as err:
+                return self._error(400, str(err))
+        self.server.pool.turn(
+            Ask(path, body, session_key(self.headers), plan, sent), self)
+
+    # -- the client a turn answers. See pool/turn.py for what each one owes.
+
+    def answer(self, payload):
+        """Send one whole reply the router composed. A typed question
+        gathers its answers rather than forwarding a stream."""
+        self._send(200, json.dumps(payload).encode())
+
+    sending = None                             # set per request in _route
+    streaming = False                          # a stream has already begun
+    stop_ping = None                           # how to stop the keep-alive
+    kind = None                                # which client program asked
+    went = "closed its end"                    # why the client stopped waiting
+
+    def alive(self):
+        """False once the client has closed its end. The body is already read,
+        so readable with nothing on it means gone. `self.went` records which
+        case. poll, not select: select refuses a descriptor at or above
+        FD_SETSIZE (1024) and raises ValueError for a live client."""
+        try:
+            watch = select.poll()
+            watch.register(self.connection, select.POLLIN)
+            if not watch.poll(0):
+                return True
+            if self.connection.recv(1, socket.MSG_PEEK):
+                return True
+            self.went = "closed its end"
+        except (OSError, ValueError) as err:
+            # fileno() is -1 on a closed socket, which poll refuses.
+            self.went = f"{type(err).__name__}: {err}"
+        return False
+
+    def open(self, opening):
+        """Begin the stream, and fill the silence until the reply starts."""
+        self._open_stream(opening)
+        self.streaming = True
+        self.stop_ping = self._ping_until()
+
+    def settle(self):
+        """Stop the keep-alive, waiting for a ping in flight. A turn calls
+        this on every way out, so it has to bear being called twice."""
+        if self.stop_ping:
+            self.stop_ping()
+            self.stop_ping = None
+
+    def relay(self, be, body, conv):
+        self._forward(be, body, conv, opened=self.streaming)
+
+    def fail(self, code, message):
+        """Say the turn cannot be served. Once a stream has begun there is no
+        status line left to send, so the message goes in the stream."""
+        if self.streaming:
+            return self._say_and_end(message)
+        self._error(code, message)
+
+    def _open_stream(self, opening=b""):
+        """Answer the client now, before the prompt is read: a read sends
+        nothing for tens of minutes, and a client drops a quiet stream. The
+        stream opens with its protocol's opening event, not a keep-alive."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        if opening:
+            self._chunk(opening)
+
+    def _chunk(self, data):
+        """One frame of a chunked reply. The caller holds `sending`."""
+        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+        self.wfile.flush()
+
+    def _ping_until(self):
+        """Fill the silence with keep-alives. Returns the way to stop, which
+        joins the thread: a chunk frame carries its own length, so half a
+        frame makes the rest of the stream unreadable. Both writers take the
+        same lock."""
+        stop = threading.Event()
+        began = time.time()
+        beat = ping_for(self.path.split("?")[0])
+
+        def run():
+            while not stop.wait(self.server.pool.tuning.ping_every):
+                with self.sending:
+                    if stop.is_set():
+                        return
+                    try:
+                        self._chunk(beat)
+                    except Exception as err:
+                        # Without this the keep-alive stops silently.
+                        print(f"[router] keep-alive stopped after "
+                              f"{time.time() - began:.0f}s: {err}", flush=True)
+                        return
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+
+        def done():
+            stop.set()
+            thread.join(5)
+        return done
+
+    def _say_and_end(self, message):
+        """Put an error into a stream that has already started, and close it.
+        An anthropic stream ends in its error event. Under `sending`: the
+        keep-alive thread may still be running."""
+        # Before the lock: settle() joins the keep-alive thread, and that
+        # thread takes `sending` to write.
+        self.settle()
+        print(f"[router] {message}", flush=True)
+        if anthropic(self.path.split("?")[0]):
+            event = sse_event("error", {"type": "error",
+                                        "error": {"type": "api_error",
+                                                  "message": message}})
+        else:
+            event = b"data: " + json.dumps(
+                {"error": {"message": message}}).encode() + b"\n\n"
+        try:
+            with (self.sending or threading.Lock()):
+                self._chunk(event)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+        except Exception:
+            pass                               # the client left
+
+    def _forward(self, be, body, conv=None, opened=False):
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in DROP_HEADERS}
+        # llama-server 404s on a trailing slash, which a base url ending in
+        # /v1 joined with /models produces.
+        path, sep, query = self.path.partition("?")
+        target = (path.rstrip("/") or "/") + sep + query
+        # A streamed openai reply reports no usage unless asked. The router
+        # asks, reads the figures and removes the chunk when the client did
+        # not ask. The anthropic route reports usage unprompted.
+        data, oai_tee = body or None, None
+        if opened and body and not anthropic(path):
+            if wants_usage(body):
+                oai_tee = OaiUsageSplice(strip=False)
+            else:
+                injected = with_usage(body)
+                if injected is not None:
+                    data, oai_tee = injected, OaiUsageSplice(strip=True)
+        try:
+            upstream = self.server.pool.link.open(
+                be, target, data, headers, self.command,
+                self.server.pool.tuning.forward_timeout)
+        except Exception as e:
+            # With `opened` the status line went out long ago. A second HTTP
+            # response inside the chunked body poisons the connection.
+            if opened:
+                return self._say_and_end(f"{be['name']}: {e}")
+            return self._error(502, f"{be['name']}: {e}")
+
+        if upstream.status >= 400:
+            shape = request_shape(body)
+            print(f"[router] {be['name']} refused {self.path.split('?')[0]} "
+                  f"with {upstream.status}: {shape}", flush=True)
+            if opened:
+                # No status left to send, and a refusal body is not an event.
+                with upstream:
+                    reason = said_in(upstream.read()) or upstream.reason
+                return self._say_and_end(f"{be['name']}: {reason}")
+
+        with upstream:
+            # With `opened` the headers went out long ago.
+            length = None if opened else upstream.headers.get("Content-Length")
+            if not opened:
+                self.send_response(upstream.status)
+                for k, v in upstream.headers.items():
+                    if k.lower() not in DROP_HEADERS:
+                        self.send_header(k, v)
+                if length:
+                    self.send_header("Content-Length", length)
+                else:
+                    self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+
+            # read1 returns what arrived. read waits for a full buffer.
+            read = getattr(upstream, "read1", upstream.read)
+
+            # The backend sends nothing while it reads, which can be an hour.
+            # A client drops a stream quiet for five minutes.
+            sending = self.sending or threading.Lock()
+            done = threading.Event()
+            last = [time.monotonic()]
+
+            def put(data):
+                if length:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                else:
+                    self._chunk(data)      # one place frames a chunk
+                last[0] = time.monotonic()
+
+            def keep_alive():
+                while not done.wait(1.0):
+                    if time.monotonic() - last[0] < self.server.pool.tuning.ping_every:
+                        continue
+                    with sending:
+                        if done.is_set():
+                            return
+                        try:
+                            put(ping_for(self.path.split("?")[0]))
+                        except Exception:
+                            return             # client left
+
+            pinger = None
+            streamed = wants_ping(upstream.headers.get("Content-Type"), length)
+            if streamed:
+                pinger = threading.Thread(target=keep_alive, daemon=True)
+                pinger.start()
+
+            # The stream began with the router's own message_start.
+            splice = (AnthropicSplice()
+                      if opened and streamed and anthropic(path) else None)
+
+            try:
+                while True:
+                    try:
+                        chunk = read(8192)
+                    except (BrokenPipeError, ConnectionResetError) as err:
+                        # This side is the backend. The clause below that
+                        # means the client left ends the stream without its
+                        # terminator, which this must not reach.
+                        raise http.client.HTTPException(
+                            f"reset mid-reply: {err}") from err
+                    if not chunk:
+                        break
+                    if splice:
+                        chunk = splice.feed(chunk)
+                        if not chunk:
+                            continue           # partial, or the dropped one
+                    elif oai_tee:
+                        chunk = oai_tee.feed(chunk)
+                        if not chunk:
+                            continue           # the chunk the router asked for
+                    with sending:
+                        put(chunk)
+                left = (splice.tail() if splice
+                        else oai_tee.tail() if oai_tee else b"")
+                if left:
+                    with sending:
+                        put(left)
+                if splice and splice.reported:
+                    names = {"input_tokens": "input", "output_tokens": "output",
+                             "cache_read_input_tokens": "cache_read",
+                             "cache_creation_input_tokens": "cache_write"}
+                    self.server.pool.events.write("usage", backend=be["name"],
+                                 conv=short_key(conv) if conv else None,
+                                 path=self.path.split("?")[0],
+                                 **{short: splice.reported[full]
+                                    for full, short in names.items()
+                                    if isinstance(splice.reported.get(full), int)})
+                if oai_tee and oai_tee.usage:
+                    details = oai_tee.usage.get("prompt_tokens_details") or {}
+                    self.server.pool.events.write("usage", backend=be["name"],
+                                 conv=short_key(conv) if conv else None,
+                                 path=self.path.split("?")[0],
+                                 input=oai_tee.usage.get("prompt_tokens"),
+                                 output=oai_tee.usage.get("completion_tokens"),
+                                 cached=details.get("cached_tokens"))
+                done.set()
+                if pinger:
+                    pinger.join(2)
+                with sending:
+                    if not length:
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass                           # client left
+            except (OSError, http.client.HTTPException) as err:
+                # The backend went away mid-reply. The status line is on the
+                # wire, so there is no second reply: reaching _route's handler
+                # wrote a whole HTTP response inside the one in flight.
+                print(f"[router] {be['name']} stopped mid-reply: {err}", flush=True)
+                done.set()
+                if pinger:
+                    pinger.join(2)
+                if not length:
+                    self._say_and_end(f"{be['name']}: {err}")
+                else:
+                    self.close_connection = True   # body short of its count
+            finally:
+                done.set()

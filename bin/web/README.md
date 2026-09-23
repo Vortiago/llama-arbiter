@@ -1,6 +1,7 @@
 # bin/web — the router dashboard
 
-The dashboard is a static site. `router.py` serves it under `/router/`.
+The dashboard is a static site. `bin/router/web/handler.py` serves it under
+`/router/`.
 
 It starts in three steps:
 
@@ -40,7 +41,7 @@ Two vendored files are changed on purpose. A later copy from the toolkit must
 not undo either change.
 
 - `lib/chrome.js`: `wireErrorBar` no longer sends errors to
-  `/api/client-errors`. No route here serves that path. `router.py` forwards an
+  `/api/client-errors`. No route here serves that path. The router forwards an
   unrouted path to a backend, instead of answering 404.
 - `shell.js`: the upstream issue references are removed. They point at the
   toolkit's issue tracker.

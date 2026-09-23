@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 
 from test_end_to_end import EndToEnd, wait_for
+from test_turn import TurnLink
 
 import router
 
@@ -363,6 +364,51 @@ class Refusals(TypedCall):
         """It is decided before the turn asks for a slot."""
         self.refused({"state": "x"})
         self.assertEqual(self.solo.chats, [])
+
+
+class OneQuestionAtATime(unittest.TestCase):
+    """A plan is a list, and the router answers it one question at a time
+    against the slot that holds the state. Each one is a generation, bounded
+    only by read_timeout, so the client has to be watched between them as it
+    is during the read itself."""
+
+    ANSWER = {"choices": [{"logprobs": {"content": [{"top_logprobs": [
+        {"token": "A", "logprob": -0.1}]}]}}]}
+
+    class Link(TurnLink):
+        """TurnLink, plus the one thing the real call does between questions.
+
+        Not pushed down into TurnLink: http_post_watched polls the client
+        every two seconds, so a read that answers fast finishes even for a
+        client that has gone, and a case there proves it."""
+
+        def work(self, be, path, payload, alive, timeout=None):
+            if not alive():
+                raise router.Gone("the client stopped waiting")
+            return super().work(be, path, payload, alive, timeout)
+
+    def plan(self, how_many):
+        body = {"model": "m", "state": "the text", "questions": {
+            f"q{n}": {"type": "noul", "instructions": "Well?"}
+            for n in range(how_many)}}
+        return router.systemone_plan(json.dumps(body).encode())
+
+    def test_it_stops_asking_once_the_client_has_gone(self):
+        """The client leaves after the first question of five."""
+        link = self.Link(reading=self.ANSWER)
+        with self.assertRaises(router.Gone):
+            router.answers(link, {"name": "cpu", "url": "http://cpu"}, 0,
+                           self.plan(5), 30, lambda: not link.calls)
+        self.assertEqual(len(link.calls), 1,
+                         "it went on asking with nobody waiting")
+
+    def test_it_asks_every_question_while_the_client_waits(self):
+        link = self.Link(reading=self.ANSWER)
+        said, _, _ = router.answers(
+            link, {"name": "cpu", "url": "http://cpu"}, 0, self.plan(3), 30,
+            lambda: True)
+        self.assertEqual(len(link.calls), 3)
+        self.assertEqual(sorted(said), ["q0", "q1", "q2"])
 
 
 if __name__ == "__main__":

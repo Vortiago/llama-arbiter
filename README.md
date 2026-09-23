@@ -257,7 +257,8 @@ lists what those tests found.
 The dashboard builds Claude Code and OpenCode configuration files under **client
 setup**. It uses the address that you reached the dashboard on.
 
-`bin/router.py` is the whole router, and its docstrings are the reference.
+`bin/router/` is the router, and its docstrings are the reference. Start at
+`__init__.py`: it lists the modules in the order a turn meets them.
 `docs/LAYOUT.md` gives the measurements behind the defaults above. It also says
 which of those defaults are properties of llama.cpp, and which are properties
 of one machine.

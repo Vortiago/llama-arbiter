@@ -78,12 +78,6 @@
 # the faster one.
 # export BLOCK_DIR=/mnt/nvme/qwen-blocks
 
-# Deeper openings: a cut where two conversations diverge, saved so a branch
-# of a session can start from it. Off, because nothing here ever loaded one.
-# The detection still runs. tools/cache-report.py says how often a fork could
-# have started deeper. Turn this on if it says they are real.
-# export DEEP_OPENINGS=1
-
 # Disk the conversation copies may take, in GB. One copy per live
 # conversation in RUN/slots, 0.2 to 5.4 GB each at ctx 150000. When full, the
 # least recently used goes, which costs a full re-read. Default 256.

@@ -29,17 +29,24 @@ export const MARK_CAP = 24;
  * overview reads the same keys out of the same payload. */
 export { slotKey };
 
-/** The rate a reading slot moves at. A slot's own `pp_rate` is 0 until the
- * router's 10 second window closes, so 0 is silence, not a stall. Fall back
+/** The rate a reading slot moves at. A slot's own `pp_rate` is null until the
+ * router's 10 second window closes, so null is silence, not a stall. Fall back
  * to the backend average, then to READ_RATE.
+ * `||`, not `??`, on purpose here: this number is a divisor, in `stuck` below
+ * and in the eta, and a measured zero would make both infinite. A read that
+ * has genuinely stopped is caught by its `done` counter standing still, not by
+ * this rate. `genRate` is the opposite case and uses `??`.
  * @param {Backend} be @param {Slot} sl @returns {number} */
 export const readRate = (be, sl) => sl.pp_rate || be.stats?.pp_rate || READ_RATE;
 
 /** The rate a generating slot moves at, or null when nothing knows yet.
- * `tg_rate` stays 0 for up to 10 seconds after the first token, which reads
- * as under STALL_RATE. Null, not a floor: a stall is what this number is read for.
+ * `tg_rate` is null until a window has resolved, and a real figure after.
+ * Null, not a floor: a stall is what this number is read for.
+ * `??`, not `||`: a stalled slot reports 0.0 (measured 0.02 to 0.06 tokens/s,
+ * rounded to one place), and `||` replaced exactly that with the backend's
+ * healthy lifetime average, so `stuck` never fired for the case it is for.
  * @param {Backend} be @param {Slot} sl @returns {number | null} */
-export const genRate = (be, sl) => sl.tg_rate || be.stats?.tg_rate || null;
+export const genRate = (be, sl) => sl.tg_rate ?? be.stats?.tg_rate ?? null;
 
 /** What flows on the wire into or out of this slot, and how fast.
  * @param {Backend} be @param {Slot} sl
@@ -160,7 +167,7 @@ export function historyOf(status, backend) {
  *              images: number, imageTokens: number }} Arrival */
 
 /** The turns with no slot yet, and what each waits for. `since` is part of the
- * key: a `wants: "turn"` waiter is queued behind another turn of the same conversation.
+ * key: a `waiting_on: "turn"` waiter is queued behind another turn of the same conversation.
  * @param {Status} status @param {number} [aged] seconds since this payload
  *   arrived, measured locally @returns {Arrival[]} */
 export function arrivalsOf(status, aged = 0) {
@@ -171,11 +178,11 @@ export function arrivalsOf(status, aged = 0) {
     // by comparing this clock to the router's epoch: the skew is unknown.
     waited: w.waited + aged,
     tokens: w.tokens,
-    why: w.wants === "turn" ? "behind its own turn"
-      : w.wants === "pinned" ? `holding for ${w.backend || "its backend"}`
-      : w.wants === "big" ? "too big for what is free"
+    why: w.waiting_on === "turn" ? "behind its own turn"
+      : w.waiting_on === "pinned" ? `holding for ${w.backend || "its backend"}`
+      : w.waiting_on === "big" ? "too big for what is free"
       : "needs a reader",
-    kind: w.wants === "turn" ? "turn" : w.wants === "pinned" ? "pinned" : "other",
+    kind: w.waiting_on === "turn" ? "turn" : w.waiting_on === "pinned" ? "pinned" : "other",
     images: w.images || 0,
     imageTokens: w.image_tokens || 0,
   }));
@@ -345,7 +352,7 @@ export function skipped(status) {
  * that tells one hash from another: 3.4 GiB costs eleven times what 357 MiB does to read.
  * @param {Status} status @returns {Shelf[]} */
 export function shelvesOf(status) {
-  const o = status.openings || { bases: [], deeps: [], wants: [] };
+  const o = status.openings || { bases: [], deeps: [] };
   /** @param {DiskFile[]} files */
   const bySize = (files) => files.slice().sort((a, b) => (b.bytes || 0) - (a.bytes || 0));
   return [

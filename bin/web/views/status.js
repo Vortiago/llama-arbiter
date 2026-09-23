@@ -24,7 +24,7 @@
  *              bytes: number }} FileEvent */
 /** `image_tokens` is the vision encoder's charge for `images`, far below their base64 text cost.
  * @typedef {{ conv: string, since: number, waited: number, tokens: number,
- *              wants: "prefill"|"pinned"|"big"|"turn", backend: string | null,
+ *              waiting_on: "prefill"|"pinned"|"big"|"turn", backend: string | null,
  *              images?: number, image_tokens?: number }} Waiter */
 /** `reused` and `read` are the backend's `timings.cache_n` and `timings.prompt_n`.
  * Null for a turn that never reached the read path. Absent from an older router.
@@ -49,10 +49,10 @@
 /** @typedef {{ name: string, file?: string, kind: string, bytes?: number, loads?: number,
  *              conv?: string, backend?: string, slot?: number | null,
  *              parked_at?: number | null, used?: number | null }} DiskFile */
-/** @typedef {{ bases: DiskFile[], deeps: DiskFile[], wants: { name: string, kind: string }[] }} Openings */
-/** @typedef {{ count: number, bytes?: number, budget?: number, keep?: number }} Budget */
+/** @typedef {{ bases: DiskFile[], deeps: DiskFile[] }} Openings */
+/** @typedef {{ count: number, bytes?: number, budget?: number }} Budget */
 /** `openings` is one budget over both shelves. `bases` and `deeps` are usage of it, not caps.
- * @typedef {{ copies: Budget, openings: Budget, bases: Budget, deeps: Budget, wants: Budget,
+ * @typedef {{ copies: Budget, openings: Budget, bases: Budget, deeps: Budget,
  *             files?: DiskFile[],
  *             mounts?: { path: string, total: number, free: number }[] }} Disk */
 /** @typedef {"queued" | "prefill" | "generate-queue" | "generate" | "done"} Stage */
@@ -135,7 +135,8 @@ export function readerBeside(be, slot) {
 }
 
 /** Seconds until a reading slot finishes. Null until its rate resolves (10 second window).
- * `prompt` is what is still to read: router.py sets it to `whole - cached - processed`.
+ * `prompt` is what is still to read: Pool._read_slots sets it to
+ * `whole - cached - processed`.
  * Do not subtract `done` from it. `done` routinely exceeds it, which leaves this always null.
  * @param {Slot} slot @returns {number | null} */
 export function secondsLeft(slot) {
@@ -211,9 +212,9 @@ export function reuseShare(status) {
 /** A waiter's own status, or empty when it matches the queue's shared reason.
  * @param {Waiter} w @param {string} reason */
 export function waitLabel(w, reason) {
-  if (w.wants === "turn") return "waits for the turn ahead of it in the same conversation";
-  if (w.wants === "pinned") return `holds for ${w.backend || "its backend"}, its cache is there`;
-  if (w.wants === "big") return "too big for what is free";
+  if (w.waiting_on === "turn") return "waits for the turn ahead of it in the same conversation";
+  if (w.waiting_on === "pinned") return `holds for ${w.backend || "its backend"}, its cache is there`;
+  if (w.waiting_on === "big") return "too big for what is free";
   return reason.includes("busy") ? "" : "needs a backend that prefills";
 }
 
