@@ -340,21 +340,22 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
                         "the second one waited for a build that had failed")
 
 
-class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
-    """A save reads the slot it copies. A restore into that slot while the save
-    runs writes one conversation's cache to disk under another's name, and the
-    first conversation then re-reads its whole prompt.
+class MidCopy:
+    """One backend, and a copy of a finished turn still reading its slot.
 
-    pick_slot used to work out which slots were taken and then fall through
-    to ids[0] regardless, so on a one-slot backend it always answered 0."""
+    SLOTS says how many the backend has. The link blocks every call, so the
+    copy `saving` starts is still running when the case asserts."""
+
+    SLOTS = 1
 
     def setUp(self):
         self.link = FakeLink(block=True, written=1 << 30)
         self.pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
                               link=self.link, watch=False)
         self.be = self.pool.backends[0]
-        self.be.update(up=True, n_ctx=150000, slots=1,
-                       slots_detail=[{"id": 0, "busy": False}])
+        self.be.update(up=True, n_ctx=150000, slots=self.SLOTS,
+                       slots_detail=[{"id": i, "busy": False}
+                                     for i in range(self.SLOTS)])
 
     def saving(self, conv):
         """Run one turn of `conv`, then leave its copy mid-save."""
@@ -366,7 +367,16 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         self.saver.start()
         self.addCleanup(self.saver.join, 10)
         self.addCleanup(self.link.release)
-        self.assertTrue(self.link.started.wait(10), "the save never began")
+        self.assertTrue(self.link.started.wait(10), "the copy never began")
+
+
+class ASlotBeingSavedIsNotHandedOut(MidCopy, unittest.TestCase):
+    """A save reads the slot it copies. A restore into that slot while the save
+    runs writes one conversation's cache to disk under another's name, and the
+    first conversation then re-reads its whole prompt.
+
+    pick_slot used to work out which slots were taken and then fall through
+    to ids[0] regardless, so on a one-slot backend it always answered 0."""
 
     def test_the_only_slot_is_refused_while_its_cache_is_saved(self):
         self.saving("first")
@@ -398,34 +408,19 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         self.assertEqual(self.pool.pick_slot(self.be, "second"), 0)
 
 
-class OneFlagPerClaim(unittest.TestCase):
+class OneFlagPerClaim(MidCopy, unittest.TestCase):
     """`inflight` says this turn owns the pin and its slot. `parking` says a
     copy of the record is being written. They were one flag, and the two
     readings disagree: a turn is over when its client has the reply, a park
     runs on past that."""
 
-    def setUp(self):
-        self.link = FakeLink(block=True, written=1 << 30)
-        self.pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
-                              link=self.link, watch=False)
-        self.be = self.pool.backends[0]
-        self.be.update(up=True, n_ctx=150000, slots=2,
-                       slots_detail=[{"id": 0, "busy": False},
-                                     {"id": 1, "busy": False}])
+    SLOTS = 2
 
     def test_a_turn_that_is_over_does_not_still_own_its_slot(self):
         """The park outlives the turn. Told by one flag, a record being
         copied out reads as a turn still holding the slot, and every caller
         that asks `is a turn using this` gets the wrong answer."""
-        self.pool._take(self.be, "done", tokens=10)
-        self.pool.pick_slot(self.be, "done")
-        self.pool.release(self.be, "done")         # the client has its reply
-        saver = threading.Thread(target=self.pool.park_partial,
-                                 args=("done", self.be, 0), daemon=True)
-        saver.start()
-        self.addCleanup(saver.join, 10)
-        self.addCleanup(self.link.release)
-        self.assertTrue(self.link.started.wait(10), "the save never began")
+        self.saving("done")
 
         self.assertFalse(self.pool.pins["done"]["inflight"],
                          "a finished turn still reads as holding its slot")
@@ -440,17 +435,10 @@ class OneFlagPerClaim(unittest.TestCase):
         start inside that window. Cleared only for the turn it belonged to,
         the claim stayed on the record and every later copy of that
         conversation was refused for the life of the process."""
-        self.pool._take(self.be, "c", tokens=10)
-        self.pool.pick_slot(self.be, "c")
-        self.pool.release(self.be, "c")
-        saver = threading.Thread(target=self.pool.park_partial,
-                                 args=("c", self.be, 0), daemon=True)
-        saver.start()
-        self.addCleanup(saver.join, 10)
-        self.assertTrue(self.link.started.wait(10), "the copy never began")
+        self.saving("c")
         self.pool._take(self.be, "c", tokens=10)      # its next turn starts
         self.link.release()
-        saver.join(10)
+        self.saver.join(10)
 
         self.assertFalse(self.pool.pins["c"]["parking"],
                          "the copy that finished kept its claim")
@@ -861,7 +849,7 @@ class FakeLink:
         return self._note("restore", be, slot, name)
 
     def prefill(self, be, block, slot, alive, timeout=None):
-        return self._note("prefill", be, slot, block)
+        return self._note("prefill", be, slot, block, alive)
 
     def render(self, be, route, payload, alive, timeout=None):
         self._note("render", be, route)
@@ -1903,7 +1891,7 @@ class PrefixCase:
 
         class Talk(FakeLink):
             def render(inner, be, route, payload, alive, timeout=None):
-                inner._note("render", be, route)
+                inner._note("render", be, route, alive)
                 # The longer rendering carries the extra user message, so the
                 # two differ exactly where the opening ends.
                 last = payload["messages"][-1]
@@ -1912,7 +1900,7 @@ class PrefixCase:
                                            else "assistant\n")}
 
             def prefill(inner, be, blk, slot, alive, timeout=None):
-                inner._note("prefill", be, slot, blk)
+                inner._note("prefill", be, slot, blk, alive)
                 return {"tokens_evaluated": 2048}
 
             def save(inner, be, slot, name, timeout=None):
@@ -1921,13 +1909,14 @@ class PrefixCase:
 
         return Talk(fail_on=fail_on)
 
-    def warm(self, link, conv="new", cuts=None, system="", slot=1):
+    def warm(self, link, conv="new", cuts=None, system="", slot=1,
+             alive=None):
         """Slot 1 is the free one. The request path decides it once and hands
         it to everything that puts something in a slot."""
         self.pool.link = link
         return self.pool.warm_prefix(
             conv, self.CUTS[:1] if cuts is None else cuts, self.TALK,
-            system, [], self.cpu, slot, "/v1/chat/completions")
+            system, [], self.cpu, slot, "/v1/chat/completions", alive=alive)
 
     def paths(self, post):
         return post.ops()
@@ -1979,26 +1968,16 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
         minutes at ctx 150000. It went through the one door nothing can
         cancel, so a client that left was read for anyway, holding a prefill
         slot the whole time."""
-        watched = []
+        def left():
+            return False
 
-        class Watched(FakeLink):
-            def render(inner, be, path, payload, alive, timeout=None):
-                watched.append(alive)
-                return {"prompt": "rendered "}
+        post = linked(self.pool, self.talker())
+        self.warm(post, system="rules", alive=left)
+        watched = [call[-1] for call in post.calls
+                   if call[0] in ("render", "prefill")]
 
-            def prefill(inner, be, blk, slot, alive, timeout=None):
-                watched.append(alive)
-                return {"tokens_evaluated": 2048}
-
-        gone = Watched()
-        self.pool.link = gone
-        self.pool.warm_prefix("new", self.CUTS[:1], self.TALK, "rules", [],
-                              self.cpu, 1, "/v1/chat/completions",
-                              alive=lambda: False)
-
-        self.assertTrue(watched, "the read never reached the link")
-        self.assertTrue(all(a is not None and not a() for a in watched),
-                        "the opening was read with nobody waiting")
+        self.assertEqual(watched, [left, left, left],
+                         "the opening was read with nobody waiting")
 
     def test_a_busy_machine_still_gets_the_opening_saved(self):
         """The request reads the opening on its own slot, so a machine busy

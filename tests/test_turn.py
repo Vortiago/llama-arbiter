@@ -46,6 +46,7 @@ class FakeClient:
 
     def __init__(self, alive=True):
         self._alive = alive
+        self.asked = threading.Event()  # set when the router first asks
         self.opened = None             # the opening event, once a stream began
         self.relayed = []              # (backend name, conversation)
         self.failed = []               # (code, message)
@@ -53,6 +54,7 @@ class FakeClient:
         self.did = []                  # every operation, in order
 
     def alive(self):
+        self.asked.set()
         return self._alive
 
     def open(self, opening):
@@ -463,30 +465,26 @@ class ATurnWithNoFreeSlotWaits(unittest.TestCase):
     slot taken, and the turn was refused 503 where it should have queued: a
     copy starting on the last free slot did exactly that."""
 
-    def waiting(self, pool, client):
-        """A turn on its own thread, so the case can watch it queue."""
+    def test_it_queues_and_is_served_once_the_slot_comes_back(self):
+        pool = one_backend()
+        pool.backends[0].update(slots=1,
+                                slots_detail=[{"id": 0, "busy": False}])
+        pool.pins["first"] = parked_copy()
+        # `inflight` with `busy` at 0 is the window hand_off opens: the source
+        # gives its count back when the prompt is parked, and the pin holds
+        # the slot until the restore lands on the generator.
+        pool.pins["first"].update(slot=0, using=0, inflight=True)
+        client = FakeClient()
+
         turn = threading.Thread(
             target=pool.turn,
             args=(router.Ask("/v1/chat/completions", prompt(10), "c1"), client),
             daemon=True)
         turn.start()
         self.addCleanup(turn.join, 10)
-        return turn
-
-    def test_it_queues_and_is_served_once_the_slot_comes_back(self):
-        pool = one_backend()
-        pool.backends[0].update(slots=1,
-                                slots_detail=[{"id": 0, "busy": False}])
-        pool.pins["first"] = parked_copy()
-        pool.pins["first"].update(slot=0, using=0, inflight=True)
-        client = FakeClient()
-
-        turn = self.waiting(pool, client)
-        for _ in range(40):
-            if pool.waiting:
-                break
-            time.sleep(0.05)
-        self.assertTrue(pool.waiting, "the turn was never queued")
+        # acquire asks the client once per pass of its wait, and nothing else
+        # asks here: the turn has looked for a slot and found none.
+        self.assertTrue(client.asked.wait(10), "the turn never queued")
         self.assertEqual(client.failed, [], "it was refused instead")
 
         with pool.cv:                          # the turn ahead finishes
