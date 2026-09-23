@@ -748,17 +748,17 @@ class Pool:
     def _free_slot(self, be):
         """A slot id on this backend that is not working, or None.
 
-        A slot a save is reading is not free either, as pick_slot says for the
-        read path: a restore into it lands under the copy being written. The
-        generator's own slot is saved by park_later, which only queues on a
-        backend that cannot read, so this is the path that meets it."""
-        saving = be["saving"]
+        The same three accounts pick_slot reads, for the generate side: a slot
+        another turn was handed, a slot a copy is being read out of, and the
+        poll. The poll alone is two seconds old, so two turns carried inside
+        one window were told the same slot and the second restore landed on
+        the first turn's cache."""
+        taken = self._turn_slots(be) | set(be["saving"])
         detail = be.get("slots_detail") or []
         if not detail:
-            # Nothing reported yet, so slot 0 unless it is being saved.
-            return None if 0 in saving else 0
+            return None if 0 in taken else 0   # nothing reported yet
         for slot in detail:
-            if not slot["busy"] and slot["id"] not in saving:
+            if not slot["busy"] and slot["id"] not in taken:
                 return slot["id"]
         return None
 
@@ -1205,6 +1205,10 @@ class Pool:
             if record:
                 record["backend"] = target["name"]
                 record["slot"] = free
+                # Both: `slot` is where the cache is, `using` is what this
+                # turn was handed. _turn_slots answers from `using`, so
+                # without it a carried turn is invisible to the next chooser.
+                record["using"] = free
                 record["inflight"] = True
             self.note_file("moved", conv, target, free, written)
             self.flow.note(conv, "generate", target["name"], free)

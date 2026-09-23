@@ -3791,6 +3791,34 @@ class ReadOnly(unittest.TestCase):
             self.assertIsNone(router.conversation_id(body), body)
 
 
+class TwoCarriedTurnsNeverShareASlot(unittest.TestCase):
+    """The generate side chooses a slot too, and it read only the poll, which
+    is two seconds old. Two turns carried inside one window were told the same
+    slot, and the second restore landed on the first turn's cache: that
+    conversation then read its whole prompt again."""
+
+    def setUp(self):
+        self.pool = make_pool(
+            [{"name": "cpu", "url": "http://cpu", "pref": 0, "generate": False},
+             {"name": "gpu", "url": "http://gpu", "pref": 1, "prefill": False}],
+            link=FakeLink(written=1 << 30), watch=False)
+        self.cpu, self.gpu = self.pool.backends
+        self.cpu.update(up=True, n_ctx=150000, slots=2)
+        # The poll says both are idle, because it is two seconds old.
+        self.gpu.update(up=True, n_ctx=150000, slots=2,
+                        slots_detail=[{"id": 0, "busy": False},
+                                      {"id": 1, "busy": False}])
+
+    def carried(self, conv):
+        self.pool._take(self.cpu, conv, tokens=10)
+        self.pool.note_slot(conv, 0)
+        self.assertIs(self.pool.hand_off(conv, self.cpu, 10), self.gpu)
+        return self.pool.pins[conv]["slot"]
+
+    def test_each_is_given_a_slot_of_its_own(self):
+        self.assertNotEqual(self.carried("first"), self.carried("second"))
+
+
 class HandOff(unittest.TestCase):
     """Carry a conversation to the backend that should generate it.
 
