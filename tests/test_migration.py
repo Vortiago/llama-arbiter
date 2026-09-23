@@ -377,7 +377,7 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         already waits for a slot, already watches the client, and already
         ranks the other backends, so it is the one that has to know."""
         self.saving("first")
-        self.assertIsNone(self.pool.acquire("second", 10, alive=lambda: False)[0])
+        self.assertIsNone(self.pool.acquire("second", 10, alive=lambda: False))
 
     def test_the_save_is_claimed_by_save_park_and_not_its_callers(self):
         """Five callers reach _save_park. A claim each one has to remember is
@@ -2604,7 +2604,7 @@ class DrainABackend(unittest.TestCase):
 
     def test_work_goes_to_the_other_backend_while_it_drains(self):
         self.pool.drain("gpu")
-        self.assertEqual(self.pool.acquire("a", 1000)[0]['name'], "cpu")
+        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu")
 
     def test_draining_parks_what_it_holds(self):
         self.pool.pins["a"] = pin("gpu", slot=0)
@@ -2681,20 +2681,20 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
         self.addCleanup(lambda: setattr(SANDBOX, "store", self.was))
 
     def test_a_new_conversation_is_not_read_on_the_gpu(self):
-        self.assertNotEqual(self.pool.acquire("a", 1000)[0]['name'], "gpu")
+        self.assertNotEqual(self.pool.acquire("a", 1000)[0]["name"], "gpu")
 
     def test_it_fills_the_reading_backends_in_order(self):
         """Backwards through pref, so the best place to generate is read on
         last and stays free to generate."""
-        self.assertEqual(self.pool.acquire("a", 1000)[0]['name'], "cpu2")
-        self.assertEqual(self.pool.acquire("b", 1000)[0]['name'], "cpu")
+        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu2")
+        self.assertEqual(self.pool.acquire("b", 1000)[0]["name"], "cpu")
 
     def test_a_conversation_living_on_the_gpu_still_reads_elsewhere(self):
         """A later turn is not a few tokens. It can carry a whole file, and
         22% of turns re-read everything. So the cache comes back to a cpu to
         be read, and returns to the gpu only to generate."""
         self.pool.pins["a"] = pin("gpu", slot=0)
-        self.assertNotEqual(self.pool.acquire("a", 1000)[0]['name'], "gpu")
+        self.assertNotEqual(self.pool.acquire("a", 1000)[0]["name"], "gpu")
 
     def test_it_waits_rather_than_reading_on_the_gpu(self):
         self.pool._take(self.cpu, "x", tokens=10)
@@ -2718,11 +2718,11 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
         """The gpu cannot read, so waiting for it would never help. The copy
         on disk is what gets the conversation back, on whichever cpu is free."""
         self.pool.pins["a"] = pin("gpu", slot=0, parked="a.park")
-        self.assertNotEqual(self.pool.acquire("a", 1000)[0]['name'], "gpu")
+        self.assertNotEqual(self.pool.acquire("a", 1000)[0]["name"], "gpu")
 
     def test_it_gives_up_when_nothing_can_ever_serve_it(self):
         self.cpu["up"] = self.cpu2["up"] = False
-        self.assertIsNone(self.pool.acquire("brand-new", 1000)[0])
+        self.assertIsNone(self.pool.acquire("brand-new", 1000))
 
 
 
@@ -3513,7 +3513,7 @@ class AnInstanceThatDoesNotGenerate(unittest.TestCase):
             be.update(up=True, slots=1, n_ctx=150000)
 
     def test_it_is_still_where_a_new_prompt_is_read(self):
-        self.assertEqual(self.pool.acquire("a", 1000)[0]['name'], "pre")
+        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "pre")
 
     def test_it_waits_rather_than_generate_where_it_is_set_not_to(self):
         """The old fallback was "answering slowly beats not answering", which
@@ -4046,38 +4046,38 @@ class SpreadReadsAcrossNodes(unittest.TestCase):
     def test_reading_takes_the_opposite_order_to_generating(self):
         """pref says where to generate. A prompt goes to the last of those, so
         the instances kept for generating stay free to generate."""
-        self.assertEqual(self.pool.acquire("a", 1000)[0]['name'], "cpu2")
+        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu2")
 
     def test_the_second_read_crosses_to_the_other_node(self):
         """Not the other slot on node 1, which would share its cores."""
         self.reading(self.cpu2, 1)
-        self.assertEqual(self.pool.acquire("b", 1000)[0]['name'], "cpu0")
+        self.assertEqual(self.pool.acquire("b", 1000)[0]["name"], "cpu0")
 
     def test_the_generating_instance_is_read_on_last(self):
         self.reading(self.cpu2, 1)
         self.reading(self.cpu0, 1)
-        self.assertEqual(self.pool.acquire("c", 1000)[0]['name'], "cpu")
+        self.assertEqual(self.pool.acquire("c", 1000)[0]["name"], "cpu")
 
     def test_a_node_reading_twice_loses_to_a_node_reading_once(self):
         self.reading(self.cpu, 2)          # node 1, two reads
         self.reading(self.cpu0, 1)         # node 0, one read
-        self.assertEqual(self.pool.acquire("d", 1000)[0]['name'], "cpu0")
+        self.assertEqual(self.pool.acquire("d", 1000)[0]["name"], "cpu0")
 
     def test_it_prefers_a_quiet_instance_over_a_second_slot_on_a_busy_one(self):
         """llama.cpp lets the first reading slot take the whole batch, so a
         second read on the same instance barely moves until the first ends."""
         self.reading(self.cpu, 1)          # node 1, on cpu
         self.reading(self.cpu0, 1)         # node 0, on cpu0
-        self.assertEqual(self.pool.acquire("c", 1000)[0]['name'], "cpu2")
+        self.assertEqual(self.pool.acquire("c", 1000)[0]["name"], "cpu2")
 
     def test_a_generating_slot_does_not_count_against_its_node(self):
         """Only reading contends for the cores a read needs. Node 1 keeps its
         turn while cpu generates, and loses it the moment cpu reads."""
         self.cpu["slots_detail"] = [{"id": 0, "busy": True, "phase": "generating"},
                                     {"id": 1, "busy": False, "phase": "idle"}]
-        self.assertEqual(self.pool.acquire("e", 1000)[0]['name'], "cpu2")
+        self.assertEqual(self.pool.acquire("e", 1000)[0]["name"], "cpu2")
         self.reading(self.cpu, 1)
-        self.assertEqual(self.pool.acquire("f", 1000)[0]['name'], "cpu0")
+        self.assertEqual(self.pool.acquire("f", 1000)[0]["name"], "cpu0")
 
 
 class ReadingIsAllowedToTakeAsLongAsTheRequest(unittest.TestCase):

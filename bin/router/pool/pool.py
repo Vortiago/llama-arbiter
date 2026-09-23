@@ -621,11 +621,7 @@ class Pool:
 
     def acquire(self, conv, tokens, alive=None):
         """Take a slot on the backend holding this conversation. Answers
-        (backend, slot), or (None, None).
-
-        Both together, under one hold of the lock: asked as two questions, a
-        copy could start on the last free slot between them, and the turn was
-        refused where a busy box should queue.
+        (backend, slot), or None.
 
         A busy box is a queue, not a refusal, so the wait has no deadline. It
         ends when a slot frees, when no backend can serve the request, or when
@@ -643,7 +639,7 @@ class Pool:
                 if target:
                     if prefills(target) and self._usable(target, tokens):
                         got = self._take(target, conv, tokens)
-                        if got[0] is not None:
+                        if got:
                             return got
                     # A fifth of turns re-read everything: prefillers only.
                     if (not target["up"] or tokens > target["n_ctx"]
@@ -658,16 +654,16 @@ class Pool:
                             if prefills(b) and self._usable(b, tokens)]
                     for be in sorted(free, key=self._reading_rank):
                         got = self._take(be, conv, tokens)
-                        if got[0] is not None:
+                        if got:
                             return got
 
                 # Nothing that could serve this is up. Waiting cannot help.
                 served_by = target is not None or any(
                     b["up"] and prefills(b) for b in self.backends)
                 if not served_by:
-                    return None, None
+                    return None
                 if alive is not None and not alive():
-                    return None, None
+                    return None
 
                 # A pin is worth a short wait, not an idle backend.
                 if target and time.time() > patience:
@@ -677,11 +673,14 @@ class Pool:
 
     def _take(self, be, conv, tokens=0):
         """Claim a backend and a slot on it. Answers (backend, slot), or
-        (None, None) when every slot here is being copied out. Held under the
-        lock, so nothing can take the slot between the two."""
+        None when every slot here is held: one another turn was handed, or one
+        a copy is being read out of. Both are claimed under one hold of the
+        lock, because asked as two questions a copy could start on the last
+        free slot between them, and the turn was refused where a busy box
+        should queue."""
         slot = self.pick_slot(be, conv)
         if slot is None:
-            return None, None
+            return None
         be["busy"] += 1
         be["served"] += 1
         if conv:

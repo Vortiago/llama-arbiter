@@ -162,8 +162,7 @@ class Turn:
         mine = False
         try:
             mine = pool.claim_turn(conv, ticket, client.alive, work)
-            be, slot = (pool.acquire(conv, tokens, client.alive) if mine
-                        else (None, None))
+            got = pool.acquire(conv, tokens, client.alive) if mine else None
         except BaseException:
             # The same ending as the branch below, for a way out nobody
             # planned. finish_turn matches on the ticket, so it is a no-op
@@ -179,7 +178,7 @@ class Turn:
         finally:
             pool.end_wait(ticket)
         waited = time.time() - start
-        if not be:
+        if not got:
             # Only if this turn held it: Flow is keyed by conversation,
             # so otherwise this deletes the running turn's row.
             if mine:
@@ -187,6 +186,7 @@ class Turn:
             pool.finish_turn(conv, ticket)
             client.settle()
             return client.fail(503, "no backend can serve this request")
+        be, slot = got
         serving = be
         left = False                           # the client gave up mid-read
         read_stats = {}
