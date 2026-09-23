@@ -158,7 +158,7 @@ class Pool:
                     # gone longest without a turn, and `now` for every copy
                     # hides exactly that.
                     "last": row.get("last") or self.store.mtime(name),
-                    "inflight": False,
+                    "inflight": False, "parking": False,
                     "turns": row.get("turns", 1), "parked": name,
                     "bytes": row.get("bytes", 0),
                     # Without it every copy reads as age zero.
@@ -509,9 +509,7 @@ class Pool:
                 # second request could be handed this warm slot.
                 record["using"] = record["slot"]
                 return record["slot"]
-            taken = {p.get("using") for name, p in self.pins.items()
-                     if name != conv and p.get("inflight")
-                     and p.get("backend") == be["name"]}
+            taken = self._turn_slots(be, skip=conv)
             detail = be.get("slots_detail") or []
             ids = [s["id"] for s in detail] or list(
                 range(max(1, be.get("slots", 1))))
@@ -544,14 +542,30 @@ class Pool:
         # the opposite of pref, which keeps the generating instances free.
         return (on_node, reads(be), -be["pref"], be["busy"])
 
+    def _turn_slots(self, be, skip=None):
+        """The slots on this backend a turn owns. Held under the lock. `skip`
+        leaves out one conversation's own, for a caller asking what is left
+        for it."""
+        held = {p.get("using") for name, p in self.pins.items()
+                if name != skip and p.get("inflight")
+                and p.get("backend") == be["name"]}
+        held.discard(None)
+        return held
+
     def _usable(self, be, tokens):
         """True if this backend is up, has a free slot, and is big enough.
 
-        A slot a save is reading counts as busy. `busy` does not say so:
-        the turn that filled it has its reply and has been released."""
-        held = be["busy"] + len(be["saving"])
+        A slot a copy is being read out of counts as busy, because `busy`
+        does not say so: the turn that filled it has its reply and has been
+        released. Only the copies no turn is already counted for, though.
+        Every turn calls ensure_parked, which copies the cache it is about to
+        read over out of the slot it was just handed, and added to `busy`
+        that one slot filled two places for the length of the copy."""
+        owned = self._turn_slots(be)
+        copying = sum(1 for slot in be["saving"] if slot not in owned)
         return (be["up"] and not be.get("draining")
-                and held < be["slots"] and tokens <= be["n_ctx"])
+                and be["busy"] + copying < be["slots"]
+                and tokens <= be["n_ctx"])
 
     def drain(self, name, deadline=None):
         """Take a backend out of service so it can be restarted. Requests wait
@@ -579,7 +593,8 @@ class Pool:
         with self.cv:
             left = sum(1 for p in self.pins.values()
                        if p["backend"] == name and p["slot"] is not None
-                       and not p["inflight"] and not copy_is_current(p))
+                       and not p["inflight"] and not p.get("parking")
+                       and not copy_is_current(p))
         print(f"[router] {name} is drained: "
               f"{'quiet' if quiet else 'still busy'}, {parked} cache(s) parked"
               + (f", {left} still only in a slot" if left else ""), flush=True)
@@ -603,7 +618,12 @@ class Pool:
                     if be["up"] and prefills(be)], default=0)
 
     def acquire(self, conv, tokens, alive=None):
-        """Take a slot on the backend holding this conversation.
+        """Take a slot on the backend holding this conversation. Answers
+        (backend, slot), or (None, None).
+
+        Both together, under one hold of the lock: asked as two questions, a
+        copy could start on the last free slot between them, and the turn was
+        refused where a busy box should queue.
 
         A busy box is a queue, not a refusal, so the wait has no deadline. It
         ends when a slot frees, when no backend can serve the request, or when
@@ -620,7 +640,9 @@ class Pool:
 
                 if target:
                     if prefills(target) and self._usable(target, tokens):
-                        return self._take(target, conv, tokens)
+                        got = self._take(target, conv, tokens)
+                        if got[0] is not None:
+                            return got
                     # A fifth of turns re-read everything: prefillers only.
                     if (not target["up"] or tokens > target["n_ctx"]
                             or not prefills(target)):
@@ -632,17 +654,18 @@ class Pool:
                 if not target:
                     free = [b for b in self.backends
                             if prefills(b) and self._usable(b, tokens)]
-                    if free:
-                        return self._take(min(free, key=self._reading_rank),
-                                          conv, tokens)
+                    for be in sorted(free, key=self._reading_rank):
+                        got = self._take(be, conv, tokens)
+                        if got[0] is not None:
+                            return got
 
                 # Nothing that could serve this is up. Waiting cannot help.
                 served_by = target is not None or any(
                     b["up"] and prefills(b) for b in self.backends)
                 if not served_by:
-                    return None
+                    return None, None
                 if alive is not None and not alive():
-                    return None
+                    return None, None
 
                 # A pin is worth a short wait, not an idle backend.
                 if target and time.time() > patience:
@@ -651,6 +674,12 @@ class Pool:
                 self.cv.wait(1.0)
 
     def _take(self, be, conv, tokens=0):
+        """Claim a backend and a slot on it. Answers (backend, slot), or
+        (None, None) when every slot here is being copied out. Held under the
+        lock, so nothing can take the slot between the two."""
+        slot = self.pick_slot(be, conv)
+        if slot is None:
+            return None, None
         be["busy"] += 1
         be["served"] += 1
         if conv:
@@ -667,13 +696,14 @@ class Pool:
                 tokens=tokens,
                 last=time.time(),
                 inflight=True,
+                parking=record.get("parking", False),
                 turns=record.get("turns", 0) + 1)
             self.pins.move_to_end(conv)
             while len(self.pins) > self.tuning.max_pins:
                 _, dropped = self.pins.popitem(last=False)
                 if dropped.get("parked"):
                     self.store.drop(dropped["parked"])   # its copy is orphaned
-        return be
+        return be, slot
 
     def release(self, be, conv=None):
         """Give the backend back. The copy on disk stays: it is behind the
@@ -693,7 +723,9 @@ class Pool:
         disk are still good. A conversation mid-turn is left alone, because
         its own thread owns that slot."""
         for record in self.pins.values():
-            if record.get("backend") == name and not record.get("inflight"):
+            if (record.get("backend") == name
+                    and not record.get("inflight")
+                    and not record.get("parking")):
                 record["slot"] = None
                 record.pop("using", None)
         for key in [k for k in self.holds if k[0] == name]:
@@ -744,13 +776,14 @@ class Pool:
                            and conv != skip_conv
                            and conv not in tried
                            and not p["inflight"]
+                           and not p.get("parking")
                            and p["slot"] is not None
                            and not copy_is_current(p)
                            and worth_keeping(p, self.tuning)]
                 if not at_risk:
                     return
                 conv, record = min(at_risk, key=lambda item: item[1]["last"])
-                record["inflight"] = True      # hold it still while it copies
+                record["parking"] = True       # hold it still while it copies
                 slot = record["slot"]
                 tried.add(conv)
 
@@ -788,7 +821,7 @@ class Pool:
         began = time.time()
         # Which turn this save belongs to. A save can take post_timeout, and
         # the conversation's next turn can start inside that window. Clearing
-        # `inflight` for the wrong turn un-reserves a slot being read.
+        # `parking` for the wrong turn un-reserves a record being copied.
         with self.cv:
             record = self.pins.get(conv)
             turn = record.get("turns") if record else None
@@ -814,10 +847,10 @@ class Pool:
             record = self.pins.get(conv)
             if record:
                 # Only if no later turn started while the save ran. A later
-                # turn owns `inflight` and `slot` now.
+                # turn owns the record and its slot now.
                 mine = record.get("turns") == turn
                 if mine:
-                    record["inflight"] = False
+                    record["parking"] = False
                 if kept:
                     record["parked"] = name
                     record["bytes"] = written
@@ -1026,6 +1059,7 @@ class Pool:
                             and conv not in tried
                             and record["slot"] is not None
                             and not record["inflight"]
+                            and not record.get("parking")
                             and not copy_is_current(record)
                             and worth_keeping(record, self.tuning)]
                     if not live:
@@ -1041,7 +1075,7 @@ class Pool:
                                   f"{be['name']}", flush=True)
                             return parked
                     conv, slot = live[0]
-                    self.pins[conv]["inflight"] = True   # hold it still
+                    self.pins[conv]["parking"] = True    # hold it still
                     tried.add(conv)
                 if self._save_park(conv, be, slot, timeout=each):
                     parked += 1
@@ -1222,7 +1256,7 @@ class Pool:
     def park_later(self, be, conv, ticket, remove=None):
         """Copy a cache out of a backend that cannot read it, on a worker: the
         copy runs to gigabytes and the client already has its reply.
-        `inflight` reserves the slot before this returns. The turn ticket
+        `parking` reserves the record before this returns. The turn ticket
         goes with the job, because the copy overwrites the file the next turn
         restores from. Returns False, with the ticket still the caller's,
         when there is nothing to copy."""
@@ -1238,11 +1272,11 @@ class Pool:
                 return False
             if not worth_keeping(record, self.tuning):
                 return False          # shorter to read again than to copy
-            if record["inflight"]:
-                return False               # a save is running: two of them
+            if record.get("parking"):
+                return False               # a copy is running: two of them
                                            # write the same file at once
             slot = record["slot"]
-            record["inflight"] = True      # hold it still while it copies
+            record["parking"] = True       # hold it still while it copies
             if self.parker is None:
                 self.parker = threading.Thread(target=self._run_parks,
                                                name="park", daemon=True)
@@ -1314,10 +1348,10 @@ class Pool:
                 return False               # already on disk for this turn.
                                            # A save from a slot it has left
                                            # would delete the copy.
-            if record["inflight"]:
-                return False               # a save is running: two of them
+            if record.get("parking"):
+                return False               # a copy is running: two of them
                                            # write the same file at once
-            record["inflight"] = True      # hold it still while it copies
+            record["parking"] = True       # hold it still while it copies
         return self._save_park(conv, be, slot, remove)
 
     def note_holds(self, conv, be, cuts):

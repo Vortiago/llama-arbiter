@@ -162,7 +162,8 @@ class Turn:
         mine = False
         try:
             mine = pool.claim_turn(conv, ticket, client.alive, work)
-            be = pool.acquire(conv, tokens, client.alive) if mine else None
+            be, slot = (pool.acquire(conv, tokens, client.alive) if mine
+                        else (None, None))
         except BaseException:
             # The same ending as the branch below, for a way out nobody
             # planned. finish_turn matches on the ticket, so it is a no-op
@@ -187,23 +188,13 @@ class Turn:
             client.settle()
             return client.fail(503, "no backend can serve this request")
         serving = be
-        # The word the flow board puts on this turn. A typed question
-        # writes one token where a prompt writes a reply.
         left = False                           # the client gave up mid-read
         read_stats = {}
         recalled = loaded = warm = False
-        slot = None
         # Held from here. Every way out runs the same ending: claim_turn
         # has no deadline, so a claim left behind stops the conversation.
         try:
             warm = bool(conv) and pool.holds_slot(conv)
-            slot = pool.pick_slot(be, conv)
-            if slot is None:
-                # Every slot here is being saved. acquire counts those, so
-                # this is the window between its answer and this line.
-                client.settle()
-                client.fail(503, f"no slot is free on {be['name']}")
-                return
             pool.note_stage(conv, "prefill", be["name"], slot, work)
             pool.ensure_parked(be, conv)
             if pool.forget_stale_park(conv, cuts):

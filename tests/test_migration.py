@@ -64,7 +64,7 @@ def backend(name, pref, slots=1, busy=0, n_ctx=150000, up=True):
 
 def pin(backend_name, slot=0, tokens=SANDBOX.tuning.reply_tokens + 8192,
         last=0.0,
-        inflight=False, turns=1,
+        inflight=False, parking=False, turns=1,
         moved=None, parked=None, parked_turn=None):
     # `tokens` clears PARK_MIN_TOKENS by default, or no test about parking
     # would park anything. A test about the floor names its own number.
@@ -376,7 +376,7 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
         already waits for a slot, already watches the client, and already
         ranks the other backends, so it is the one that has to know."""
         self.saving("first")
-        self.assertIsNone(self.pool.acquire("second", 10, alive=lambda: False))
+        self.assertIsNone(self.pool.acquire("second", 10, alive=lambda: False)[0])
 
     def test_the_save_is_claimed_by_save_park_and_not_its_callers(self):
         """Five callers reach _save_park. A claim each one has to remember is
@@ -395,6 +395,66 @@ class ASlotBeingSavedIsNotHandedOut(unittest.TestCase):
 
         self.assertEqual(set(self.be["saving"]), set())
         self.assertEqual(self.pool.pick_slot(self.be, "second"), 0)
+
+
+class OneFlagPerClaim(unittest.TestCase):
+    """`inflight` says this turn owns the pin and its slot. `parking` says a
+    copy of the record is being written. They were one flag, and the two
+    readings disagree: a turn is over when its client has the reply, a park
+    runs on past that."""
+
+    def setUp(self):
+        self.link = FakeLink(block=True, written=1 << 30)
+        self.pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                              link=self.link, watch=False)
+        self.be = self.pool.backends[0]
+        self.be.update(up=True, n_ctx=150000, slots=2,
+                       slots_detail=[{"id": 0, "busy": False},
+                                     {"id": 1, "busy": False}])
+
+    def test_a_turn_that_is_over_does_not_still_own_its_slot(self):
+        """The park outlives the turn. Told by one flag, a record being
+        copied out reads as a turn still holding the slot, and every caller
+        that asks `is a turn using this` gets the wrong answer."""
+        self.pool._take(self.be, "done", tokens=10)
+        self.pool.pick_slot(self.be, "done")
+        self.pool.release(self.be, "done")         # the client has its reply
+        saver = threading.Thread(target=self.pool.park_partial,
+                                 args=("done", self.be, 0), daemon=True)
+        saver.start()
+        self.addCleanup(saver.join, 10)
+        self.addCleanup(self.link.release)
+        self.assertTrue(self.link.started.wait(10), "the save never began")
+
+        self.assertFalse(self.pool.pins["done"]["inflight"],
+                         "a finished turn still reads as holding its slot")
+        self.assertTrue(self.pool.pins["done"]["parking"],
+                        "nothing says a copy is being written")
+        # The slot being copied out is still refused, by the claim that
+        # means what it says. The other one is free and is the answer.
+        self.assertEqual(self.pool.pick_slot(self.be, "other"), 1)
+
+    def test_a_turn_saving_over_its_own_slot_does_not_fill_the_backend(self):
+        """Every turn calls ensure_parked, which copies the cache it is about
+        to read over out of the slot it was just handed. Counted once as the
+        turn's and once as the save's, that one slot filled two places for
+        the length of the copy, and a backend with an idle slot refused work
+        for eleven seconds at the median."""
+        self.pool._take(self.be, "reader", tokens=10)
+        self.assertEqual(self.pool.pick_slot(self.be, "reader"), 0)
+        with self.pool.cv:
+            self.be["saving"][0] += 1              # ensure_parked, on slot 0
+
+        self.assertTrue(self.pool._usable(self.be, 10),
+                        "slot 1 is idle, and the backend says it is full")
+
+    def test_a_save_on_a_slot_no_turn_holds_still_counts(self):
+        """The case the count exists for."""
+        self.be["slots"] = 1
+        with self.pool.cv:
+            self.be["saving"][0] += 1
+
+        self.assertFalse(self.pool._usable(self.be, 10))
 
 
 class TwoRequestsNeverShareASlot(unittest.TestCase):
@@ -1290,7 +1350,7 @@ class PinIsAbsolute(unittest.TestCase):
     def take(self):
         got = {}
         thread = threading.Thread(
-            target=lambda: got.update(be=self.pool.acquire("conv1", 5000)))
+            target=lambda: got.update(be=self.pool.acquire("conv1", 5000)[0]))
         thread.daemon = True
         thread.start()
         return got, thread
@@ -2496,7 +2556,7 @@ class DrainABackend(unittest.TestCase):
 
     def test_work_goes_to_the_other_backend_while_it_drains(self):
         self.pool.drain("gpu")
-        self.assertEqual(self.pool.acquire("a", 1000)["name"], "cpu")
+        self.assertEqual(self.pool.acquire("a", 1000)[0]['name'], "cpu")
 
     def test_draining_parks_what_it_holds(self):
         self.pool.pins["a"] = pin("gpu", slot=0)
@@ -2573,20 +2633,20 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
         self.addCleanup(lambda: setattr(SANDBOX, "store", self.was))
 
     def test_a_new_conversation_is_not_read_on_the_gpu(self):
-        self.assertNotEqual(self.pool.acquire("a", 1000)["name"], "gpu")
+        self.assertNotEqual(self.pool.acquire("a", 1000)[0]['name'], "gpu")
 
     def test_it_fills_the_reading_backends_in_order(self):
         """Backwards through pref, so the best place to generate is read on
         last and stays free to generate."""
-        self.assertEqual(self.pool.acquire("a", 1000)["name"], "cpu2")
-        self.assertEqual(self.pool.acquire("b", 1000)["name"], "cpu")
+        self.assertEqual(self.pool.acquire("a", 1000)[0]['name'], "cpu2")
+        self.assertEqual(self.pool.acquire("b", 1000)[0]['name'], "cpu")
 
     def test_a_conversation_living_on_the_gpu_still_reads_elsewhere(self):
         """A later turn is not a few tokens. It can carry a whole file, and
         22% of turns re-read everything. So the cache comes back to a cpu to
         be read, and returns to the gpu only to generate."""
         self.pool.pins["a"] = pin("gpu", slot=0)
-        self.assertNotEqual(self.pool.acquire("a", 1000)["name"], "gpu")
+        self.assertNotEqual(self.pool.acquire("a", 1000)[0]['name'], "gpu")
 
     def test_it_waits_rather_than_reading_on_the_gpu(self):
         self.pool._take(self.cpu, "x", tokens=10)
@@ -2594,7 +2654,7 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
         got = {}
 
         def ask():
-            got["be"] = self.pool.acquire("new", 1000)
+            got["be"] = self.pool.acquire("new", 1000)[0]
 
         threading.Thread(target=ask, daemon=True).start()
         time.sleep(0.4)
@@ -2610,11 +2670,11 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
         """The gpu cannot read, so waiting for it would never help. The copy
         on disk is what gets the conversation back, on whichever cpu is free."""
         self.pool.pins["a"] = pin("gpu", slot=0, parked="a.park")
-        self.assertNotEqual(self.pool.acquire("a", 1000)["name"], "gpu")
+        self.assertNotEqual(self.pool.acquire("a", 1000)[0]['name'], "gpu")
 
     def test_it_gives_up_when_nothing_can_ever_serve_it(self):
         self.cpu["up"] = self.cpu2["up"] = False
-        self.assertIsNone(self.pool.acquire("brand-new", 1000))
+        self.assertIsNone(self.pool.acquire("brand-new", 1000)[0])
 
 
 
@@ -3405,7 +3465,7 @@ class AnInstanceThatDoesNotGenerate(unittest.TestCase):
             be.update(up=True, slots=1, n_ctx=150000)
 
     def test_it_is_still_where_a_new_prompt_is_read(self):
-        self.assertEqual(self.pool.acquire("a", 1000)["name"], "pre")
+        self.assertEqual(self.pool.acquire("a", 1000)[0]['name'], "pre")
 
     def test_it_waits_rather_than_generate_where_it_is_set_not_to(self):
         """The old fallback was "answering slowly beats not answering", which
@@ -3483,7 +3543,7 @@ class ParkAfterGenerating(unittest.TestCase):
         """park then acquire then recall is the whole round trip."""
         self.pool.pins["a"] = pin("gpu", slot=0)
         self.park(self.gpu, "a", self.saver())
-        be = self.pool.acquire("a", 1000)
+        be, _ = self.pool.acquire("a", 1000)
         self.assertEqual(be["name"], "cpu")
         post = linked(self.pool, FakeLink())
         self.assertTrue(self.pool.recall("a", be, 1))
@@ -3500,7 +3560,8 @@ class ParkAfterGenerating(unittest.TestCase):
         slow = FakeLink(written=200_000_000, block=True)
         self.assertTrue(
             with_link(self.pool, slow).park_later(self.gpu, "a", "t"))
-        self.assertTrue(self.pool.pins["a"]["inflight"])
+        self.assertTrue(self.pool.pins["a"]["parking"],
+                        "nothing says the worker has this record")
         self.assertEqual(
             with_link(self.pool, self.saver()).park_all(only="gpu"), 0,
                          "a copy already being written was started again")
@@ -3909,38 +3970,38 @@ class SpreadReadsAcrossNodes(unittest.TestCase):
     def test_reading_takes_the_opposite_order_to_generating(self):
         """pref says where to generate. A prompt goes to the last of those, so
         the instances kept for generating stay free to generate."""
-        self.assertEqual(self.pool.acquire("a", 1000)["name"], "cpu2")
+        self.assertEqual(self.pool.acquire("a", 1000)[0]['name'], "cpu2")
 
     def test_the_second_read_crosses_to_the_other_node(self):
         """Not the other slot on node 1, which would share its cores."""
         self.reading(self.cpu2, 1)
-        self.assertEqual(self.pool.acquire("b", 1000)["name"], "cpu0")
+        self.assertEqual(self.pool.acquire("b", 1000)[0]['name'], "cpu0")
 
     def test_the_generating_instance_is_read_on_last(self):
         self.reading(self.cpu2, 1)
         self.reading(self.cpu0, 1)
-        self.assertEqual(self.pool.acquire("c", 1000)["name"], "cpu")
+        self.assertEqual(self.pool.acquire("c", 1000)[0]['name'], "cpu")
 
     def test_a_node_reading_twice_loses_to_a_node_reading_once(self):
         self.reading(self.cpu, 2)          # node 1, two reads
         self.reading(self.cpu0, 1)         # node 0, one read
-        self.assertEqual(self.pool.acquire("d", 1000)["name"], "cpu0")
+        self.assertEqual(self.pool.acquire("d", 1000)[0]['name'], "cpu0")
 
     def test_it_prefers_a_quiet_instance_over_a_second_slot_on_a_busy_one(self):
         """llama.cpp lets the first reading slot take the whole batch, so a
         second read on the same instance barely moves until the first ends."""
         self.reading(self.cpu, 1)          # node 1, on cpu
         self.reading(self.cpu0, 1)         # node 0, on cpu0
-        self.assertEqual(self.pool.acquire("c", 1000)["name"], "cpu2")
+        self.assertEqual(self.pool.acquire("c", 1000)[0]['name'], "cpu2")
 
     def test_a_generating_slot_does_not_count_against_its_node(self):
         """Only reading contends for the cores a read needs. Node 1 keeps its
         turn while cpu generates, and loses it the moment cpu reads."""
         self.cpu["slots_detail"] = [{"id": 0, "busy": True, "phase": "generating"},
                                     {"id": 1, "busy": False, "phase": "idle"}]
-        self.assertEqual(self.pool.acquire("e", 1000)["name"], "cpu2")
+        self.assertEqual(self.pool.acquire("e", 1000)[0]['name'], "cpu2")
         self.reading(self.cpu, 1)
-        self.assertEqual(self.pool.acquire("f", 1000)["name"], "cpu0")
+        self.assertEqual(self.pool.acquire("f", 1000)[0]['name'], "cpu0")
 
 
 class ReadingIsAllowedToTakeAsLongAsTheRequest(unittest.TestCase):

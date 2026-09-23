@@ -9,6 +9,7 @@ import json
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -141,7 +142,8 @@ def with_system(rules, said="hello"):
 def parked_copy(name="c1.park"):
     """A pin whose cache is on disk and in no slot."""
     return {"backend": "cpu", "slot": None, "parked": name, "bytes": 1 << 20,
-            "turns": 1, "parked_turn": 1, "inflight": False, "last": 0.0,
+            "turns": 1, "parked_turn": 1, "inflight": False,
+            "parking": False, "last": 0.0,
             "tokens": 1000, "moved": None}
 
 
@@ -453,15 +455,25 @@ class TheHandOffOutlivesItsGenerator(unittest.TestCase):
         self.assertEqual(cpu["busy"], 0)
 
 
-class ATurnWithNoFreeSlotIsRefused(unittest.TestCase):
-    """acquire counts the slots a save is reading, so it normally waits. The
-    window it cannot close is between its own answer and pick_slot: the turn
-    ahead releases the backend, this one acquires it, and only then does the
-    turn ahead start parking its cache out of the slot.
+class ATurnWithNoFreeSlotWaits(unittest.TestCase):
+    """A busy box is a queue, not a refusal.
 
-    Unslotted, the read goes to the backend with `id_slot: null`."""
+    acquire answers the backend and the slot together, under one hold of the
+    lock. Asked as two questions it could admit a turn and then find every
+    slot taken, and the turn was refused 503 where it should have queued: a
+    copy starting on the last free slot did exactly that."""
 
-    def test_the_turn_is_refused_rather_than_read_without_a_slot(self):
+    def waiting(self, pool, client):
+        """A turn on its own thread, so the case can watch it queue."""
+        turn = threading.Thread(
+            target=pool.turn,
+            args=(router.Ask("/v1/chat/completions", prompt(10), "c1"), client),
+            daemon=True)
+        turn.start()
+        self.addCleanup(turn.join, 10)
+        return turn
+
+    def test_it_queues_and_is_served_once_the_slot_comes_back(self):
         pool = one_backend()
         pool.backends[0].update(slots=1,
                                 slots_detail=[{"id": 0, "busy": False}])
@@ -469,10 +481,20 @@ class ATurnWithNoFreeSlotIsRefused(unittest.TestCase):
         pool.pins["first"].update(slot=0, using=0, inflight=True)
         client = FakeClient()
 
-        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"), client)
+        turn = self.waiting(pool, client)
+        for _ in range(40):
+            if pool.waiting:
+                break
+            time.sleep(0.05)
+        self.assertTrue(pool.waiting, "the turn was never queued")
+        self.assertEqual(client.failed, [], "it was refused instead")
 
-        self.assertEqual([code for code, _ in client.failed], [503])
-        self.assertEqual(pool.link.ops(), [])
+        with pool.cv:                          # the turn ahead finishes
+            pool.pins["first"]["inflight"] = False
+            pool.cv.notify_all()
+        turn.join(10)
+
+        self.assertEqual(client.relayed, [("cpu", "c1")])
         self.assertEqual(pool.backends[0]["busy"], 0)
 
 
@@ -486,20 +508,20 @@ class ACacheIsWrittenToDiskOnce(unittest.TestCase):
         pool.pins["c1"] = parked_copy()
         pool.pins["c1"]["slot"] = 0
         pool.pins["c1"]["parked_turn"] = 0     # the copy is of an older turn
-        pool.pins["c1"]["inflight"] = True     # a save is running on it now
+        pool.pins["c1"]["parking"] = True      # a copy is running on it now
 
         self.assertFalse(pool.park_partial("c1", pool.backends[0], 0))
         self.assertEqual(pool.link.ops(), [])
 
     def test_a_copy_on_the_worker_is_not_queued_over_a_running_save(self):
         """The same meeting, one step later. The turn's ending releases the
-        backend, which clears `inflight`, and park_all can take the record in
+        backend, and park_all can take the record in
         the two lines before the copy is queued."""
         pool = one_backend()
         pool.backends[0]["prefill"] = False    # it cannot read the next turn
         pool.pins["c1"] = parked_copy()
         pool.pins["c1"]["slot"] = 0
-        pool.pins["c1"]["inflight"] = True     # a save is running on it now
+        pool.pins["c1"]["parking"] = True      # a copy is running on it now
 
         self.assertFalse(pool.park_later(pool.backends[0], "c1", "t1"))
         self.assertTrue(pool.park_jobs.empty())
