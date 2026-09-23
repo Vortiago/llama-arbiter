@@ -561,8 +561,10 @@ class Pool:
         Every turn calls ensure_parked, which copies the cache it is about to
         read over out of the slot it was just handed, and added to `busy`
         that one slot filled two places for the length of the copy."""
-        owned = self._turn_slots(be)
-        copying = sum(1 for slot in be["saving"] if slot not in owned)
+        copying = 0
+        if be["saving"]:           # no copy, so nothing to count: no walk
+            owned = self._turn_slots(be)
+            copying = sum(1 for slot in be["saving"] if slot not in owned)
         return (be["up"] and not be.get("draining")
                 and be["busy"] + copying < be["slots"]
                 and tokens <= be["n_ctx"])
