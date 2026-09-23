@@ -555,12 +555,10 @@ class Pool:
     def _usable(self, be, tokens):
         """True if this backend is up, has a free slot, and is big enough.
 
-        A slot a copy is being read out of counts as busy, because `busy`
-        does not say so: the turn that filled it has its reply and has been
-        released. Only the copies no turn is already counted for, though.
-        Every turn calls ensure_parked, which copies the cache it is about to
-        read over out of the slot it was just handed, and added to `busy`
-        that one slot filled two places for the length of the copy."""
+        A slot a copy is being read out of counts as busy, because `busy` does
+        not: the turn that filled it has its reply and has been released. Only
+        the copies no turn is already counted for, or a turn saving over its
+        own slot would fill two places at once."""
         copying = 0
         if be["saving"]:           # no copy, so nothing to count: no walk
             owned = self._turn_slots(be)

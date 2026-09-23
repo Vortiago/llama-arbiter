@@ -1,15 +1,9 @@
 """How the router reaches a backend.
 
-Every call the router makes to a llama-server goes through here. Before this
-there were four transports: bare urlopen for the three read-only endpoints,
-http_post for the slot files, http_post_watched for the prefill probe, and a
-urllib Request for the forward. Only http_post could be substituted, and it
-was threaded through thirteen Pool methods as a `post` parameter. The other
-three could be reached from a test only over a socket.
-
-A Link carries all of them, and Pool is handed one when it is built. The
-backend record is the argument rather than the receiver, because a record is
-bookkeeping the Pool owns and a Link owns no state at all.
+Every call the router makes to a llama-server goes through here, so a test
+substitutes one object rather than four transports. Pool is handed a Link when
+it is built. The backend record is the argument rather than the receiver,
+because a record is bookkeeping the Pool owns and a Link owns no state at all.
 """
 
 import json
@@ -27,21 +21,13 @@ POST_TIMEOUT = 300.0
 class Link:
     """The production link: HTTP to a llama-server.
 
-    Three kinds of call, by what the caller can do about each.
-
-    The read-only endpoints answer None when the backend cannot be reached: a
-    backend that is down is a state the router expects rather than an error it
-    reports.
-
-    The slot files raise, and are deliberately not watched. A copy outlives
-    the turn that asked for it, and one abandoned half written is worse than
-    one nobody reads.
-
-    Work takes `alive` and has no default for it, so a call site says whether
-    a client is waiting rather than getting the unwatched kind by leaving it
-    out. Work raises OSError when the backend refused, and Gone when `alive`
-    says the client has left. `open` hands back the live response for the
-    caller to stream, including one the backend meant as an error.
+    Three kinds of call, by what the caller can do about each. A read-only
+    endpoint answers None, because a backend that is down is a state the
+    router expects rather than an error it reports. A slot file raises. Work
+    raises OSError when the backend refused, and Gone when the client has
+    left, and takes `alive` with no default, so a call site says whether
+    anybody is waiting rather than getting the unwatched kind by saying
+    nothing.
     """
 
     def __init__(self, look_timeout=LOOK_TIMEOUT, post_timeout=POST_TIMEOUT):
@@ -60,7 +46,8 @@ class Link:
         """The text /metrics answers, not json: the caller parses it."""
         return self._get(be["url"] + "/metrics", timeout, raw=True)
 
-    # -- the slot files. Not watched: the copy outlives the turn.
+    # -- the slot files. Not watched: a copy outlives the turn that asked
+    # for it, and one abandoned half written is worse than one nobody reads.
 
     def save(self, be, slot, name, timeout=None):
         return self._post(be, f"/slots/{slot}?action=save",
@@ -74,16 +61,16 @@ class Link:
 
     def work(self, be, path, payload, alive, timeout=None):
         """Ask a backend to do something, and stop when the client stops
-        waiting. Raises Gone.
-
-        The one call that reaches a backend on a turn's behalf. `prefill` and
-        `render` are this call under the name their callers read them by."""
+        waiting. Raises Gone."""
         return http_post_watched(be["url"], path, payload,
                                  self.post_timeout if timeout is None else timeout,
                                  alive)
 
     def render(self, be, path, payload, alive, timeout=None):
-        """What the backend's own template makes of these messages."""
+        """What the backend's own template makes of these messages.
+
+        `work` under a second name, so a double can answer the template
+        without also answering the prefill that calls `work` too."""
         return self.work(be, path, payload, alive, timeout)
 
     def prefill(self, be, block, slot, alive, timeout=None):
@@ -96,7 +83,7 @@ class Link:
 
     def open(self, be, path, body, headers, method, timeout):
         """The client's own request, passed through. The caller reads the
-        response and closes it; an HTTPError is a reply the backend meant to
+        response and closes it. An HTTPError is a reply the backend meant to
         send, so it comes back rather than raising."""
         request = urllib.request.Request(be["url"] + path, data=body,
                                          headers=headers, method=method)
@@ -108,8 +95,8 @@ class Link:
     # -- one way in for each convention
 
     def _post(self, be, path, payload, timeout):
-        """Every call that asks a backend to do work. One place decides what
-        an unsaid timeout means, so five methods cannot drift apart."""
+        """The slot files, which are read and written whole. Nothing watches
+        them, so there is no `alive` here."""
         return http_post(be["url"], path, payload,
                          self.post_timeout if timeout is None else timeout)
 
