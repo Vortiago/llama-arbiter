@@ -435,6 +435,26 @@ class OneFlagPerClaim(unittest.TestCase):
         # means what it says. The other one is free and is the answer.
         self.assertEqual(self.pool.pick_slot(self.be, "other"), 1)
 
+    def test_a_copy_that_outlives_its_turn_gives_its_claim_back(self):
+        """A copy can take post_timeout, and the conversation's next turn can
+        start inside that window. Cleared only for the turn it belonged to,
+        the claim stayed on the record and every later copy of that
+        conversation was refused for the life of the process."""
+        self.pool._take(self.be, "c", tokens=10)
+        self.pool.pick_slot(self.be, "c")
+        self.pool.release(self.be, "c")
+        saver = threading.Thread(target=self.pool.park_partial,
+                                 args=("c", self.be, 0), daemon=True)
+        saver.start()
+        self.addCleanup(saver.join, 10)
+        self.assertTrue(self.link.started.wait(10), "the copy never began")
+        self.pool._take(self.be, "c", tokens=10)      # its next turn starts
+        self.link.release()
+        saver.join(10)
+
+        self.assertFalse(self.pool.pins["c"]["parking"],
+                         "the copy that finished kept its claim")
+
     def test_a_turn_saving_over_its_own_slot_does_not_fill_the_backend(self):
         """Every turn calls ensure_parked, which copies the cache it is about
         to read over out of the slot it was just handed. Counted once as the

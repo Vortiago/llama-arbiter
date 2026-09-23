@@ -688,7 +688,8 @@ class Pool:
             record = self.pins.get(conv)
             if record is None:
                 # Named here because several readers index them directly.
-                record = self.pins[conv] = {"parked": None, "bytes": 0}
+                record = self.pins[conv] = {"parked": None, "bytes": 0,
+                                            "parking": False}
             record.update(
                 backend=be["name"],
                 # A slot id only means something on its own backend.
@@ -696,7 +697,6 @@ class Pool:
                 tokens=tokens,
                 last=time.time(),
                 inflight=True,
-                parking=record.get("parking", False),
                 turns=record.get("turns", 0) + 1)
             self.pins.move_to_end(conv)
             while len(self.pins) > self.tuning.max_pins:
@@ -803,9 +803,17 @@ class Pool:
         finally:
             with self.cv:
                 if be["saving"][slot] <= 1:
-                    del be["saving"][slot]     # the last saver lets it go
+                    del be["saving"][slot]     # the last writer lets it go
                 else:
                     be["saving"][slot] -= 1
+                record = self.pins.get(conv)
+                if record:
+                    # Whatever happened, and whatever turn the record is on
+                    # now. Every path that starts a copy refuses one already
+                    # running, so the writer here is the one that set this.
+                    # Left behind, it refuses every later copy of this
+                    # conversation for the life of the process.
+                    record["parking"] = False
                 self.cv.notify_all()
 
     def _park(self, conv, be, slot, remove, timeout):
@@ -849,8 +857,6 @@ class Pool:
                 # Only if no later turn started while the save ran. A later
                 # turn owns the record and its slot now.
                 mine = record.get("turns") == turn
-                if mine:
-                    record["parking"] = False
                 if kept:
                     record["parked"] = name
                     record["bytes"] = written
