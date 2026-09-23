@@ -2122,6 +2122,34 @@ class PromptCuts(unittest.TestCase):
         cuts, _, _, _ = router.prompt_cuts(self.body(*messages, **kw))
         return [key for _, key in cuts]
 
+    def tool_result(self, words):
+        """One agentic turn as the router's own client sends it: the words
+        sit under the block's own `content`, not at the top level."""
+        return {"role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1",
+                             "content": [{"type": "text", "text": words}]}]}
+
+    def test_an_agentic_conversation_names_its_cuts(self):
+        """Every turn of the router's own client is a tool_result. Measured by
+        the top level `text` alone each one counted zero, so no message ever
+        reached the bar and a conversation of any length named no cut."""
+        got = self.keys({"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": "hi"},
+                        self.tool_result(LONG),
+                        {"role": "assistant", "content": "ok"},
+                        self.tool_result(LONG))
+        self.assertEqual(len(got), 3, "no cut was named in a 24,000 "
+                                      "character conversation")
+
+    def test_a_tool_result_that_carries_its_words_directly_counts_too(self):
+        """The same block with a string where the list would be."""
+        tool = {"role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1",
+                             "content": LONG}]}
+        got = self.keys({"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": "hi"}, tool)
+        self.assertEqual(len(got), 1)
+
     def test_names_a_cut_after_each_message(self):
         cuts = self.keys({"role": "system", "content": LONG},
                          {"role": "user", "content": LONG})

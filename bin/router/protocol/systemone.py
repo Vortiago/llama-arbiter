@@ -211,19 +211,24 @@ def systemone_read(reply, question):
 
 
 
-def answers(link, be, slot, plan, timeout):
+def answers(link, be, slot, plan, timeout, alive):
     """Ask every question against the slot that already holds the state.
 
     `slot` is None when the turn was carried to another instance: the slot it
     landed in is that instance's to choose, and llama.cpp finds the state by
     prefix, exactly as it does for every turn the router forwards.
+
+    Through `read`, the one call that watches the client: a plan is a list,
+    each question is a generation bounded only by read_timeout, and a client
+    that leaves holds the slot and the claim for the whole of it otherwise.
+    Raises Gone, which the turn's ending already knows how to finish.
     """
     said, wrote, steps = {}, 0, []
     for question in plan["questions"]:
         body = systemone_body(plan, question)
         if slot is not None:
             body["id_slot"] = slot
-        reply = link.ask(be, SYSTEMONE_UP, body, timeout)
+        reply = link.read(be, SYSTEMONE_UP, body, alive, timeout)
         said[question["name"]] = systemone_read(reply, question)
         usage = (reply or {}).get("usage") or {}
         wrote += int(usage.get("completion_tokens") or 0)

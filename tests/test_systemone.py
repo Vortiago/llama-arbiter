@@ -365,5 +365,72 @@ class Refusals(TypedCall):
         self.assertEqual(self.solo.chats, [])
 
 
+class OneQuestionAtATime(unittest.TestCase):
+    """A plan is a list, and the router answers it one question at a time
+    against the slot that holds the state. Each one is a generation, bounded
+    only by read_timeout, so the client has to be watched between them as it
+    is during the read itself."""
+
+    class Link:
+        """Stands in for the one way to a backend. `read` is the cancellable
+        call: it raises Gone once the client has gone, as the real one does."""
+
+        def __init__(self):
+            self.asked = []
+
+        def read(self, be, path, payload, alive, timeout):
+            if not alive():
+                raise router.Gone("the client stopped waiting")
+            self.asked.append(path)
+            return {"choices": [{"logprobs": {"content": [{"top_logprobs": [
+                {"token": "A", "logprob": -0.1}]}]}}]}
+
+    def plan(self, how_many):
+        body = {"model": "m", "state": "the text", "questions": {
+            f"q{n}": {"type": "noul", "instructions": "Well?"}
+            for n in range(how_many)}}
+        import json as _json
+        return router.systemone_plan(_json.dumps(body).encode())
+
+    def test_it_stops_asking_once_the_client_has_gone(self):
+        """The client leaves after the first question of five."""
+        link = self.Link()
+        with self.assertRaises(router.Gone):
+            router.answers(link, {"name": "cpu", "url": "http://cpu"}, 0,
+                           self.plan(5), 30, lambda: not link.asked)
+        self.assertEqual(len(link.asked), 1,
+                         "it went on asking with nobody waiting")
+
+    def test_it_asks_every_question_while_the_client_waits(self):
+        link = self.Link()
+        said, wrote, steps = router.answers(
+            link, {"name": "cpu", "url": "http://cpu"}, 0, self.plan(3), 30,
+            lambda: True)
+        self.assertEqual(len(link.asked), 3)
+        self.assertEqual(sorted(said), ["q0", "q1", "q2"])
+
+
+class AClaimIsNeverLeftBehind(unittest.TestCase):
+    """claim_turn has no deadline, so a claim a turn does not give back stops
+    that conversation for good. Every way out of a turn has to reach
+    finish_turn, including a way out nobody planned."""
+
+    def test_a_failure_while_taking_a_backend_gives_the_claim_back(self):
+        from test_turn import FakeClient, one_backend
+        pool = one_backend()
+
+        def boom(*a, **kw):
+            raise RuntimeError("the pool fell over")
+
+        pool.acquire = boom
+        with self.assertRaises(RuntimeError):
+            pool.turn(router.Ask("/v1/chat/completions",
+                                 b'{"messages":[{"role":"user","content":"x"}]}',
+                                 "c1"), FakeClient())
+
+        self.assertNotIn("c1", pool.turns,
+                         "the conversation is claimed by a turn that is gone")
+
+
 if __name__ == "__main__":
     unittest.main()

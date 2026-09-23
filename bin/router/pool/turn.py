@@ -108,7 +108,8 @@ class Turn:
         answer in one piece. There is one reply a question to gather, so
         there is nothing to stream on."""
         said, wrote, steps = answers(self.pool.link, be, slot, plan,
-                                     self.pool.tuning.read_timeout)
+                                     self.pool.tuning.read_timeout,
+                                     client.alive)
         read = read_stats.get("read_prompt_n") or 0
         reused = read_stats.get("read_cache_n") or 0
         client.answer({
@@ -158,9 +159,18 @@ class Turn:
             client.open(opening_event(ask.path, body))
 
         ticket = pool.begin_wait(conv, tokens, images, image_charge)
+        mine = False
         try:
             mine = pool.claim_turn(conv, ticket, client.alive, work)
             be = pool.acquire(conv, tokens, client.alive) if mine else None
+        except BaseException:
+            # The try below is what gives the claim back on every planned way
+            # out, and it starts two statements from here. claim_turn has no
+            # deadline, so a claim left behind stops the conversation for the
+            # life of the process.
+            if mine:
+                pool.finish_turn(conv, ticket)
+            raise
         finally:
             pool.end_wait(ticket)
         waited = time.time() - start

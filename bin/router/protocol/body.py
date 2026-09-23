@@ -14,6 +14,26 @@ def text_of(value):
     return ""
 
 
+def content_size(value):
+    """How many characters of a message a backend will read.
+
+    Not text_of: that reads the words a content block says at its top level,
+    and names a conversation by them. A tool_result carries its words under
+    its own `content`, so every turn of an agentic client measured zero, no
+    message reached the bar and a conversation of any length named no cut.
+    Kept apart from text_of on purpose: changing that one renames every
+    conversation on disk."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(content_size(part) for part in value)
+    if isinstance(value, dict):
+        for key in ("text", "content"):
+            if key in value:
+                return content_size(value[key])
+    return 0
+
+
 def message_shape(message):
     """Everything about one message that a later request must match. The
     backend renders the whole message, not only its words. Sorted keys and
@@ -99,7 +119,7 @@ def prompt_cuts(body, tuning=None):
         # hashed by text_of got the same cut names at every depth.
         running.update(f"{message.get('role')}\x00".encode())
         running.update(message_shape(message))
-        size += len(text_of(message.get("content")))
+        size += content_size(message.get("content"))
         bar = tuning.system_min_chars if index < lead else tuning.prefix_min_chars
         if size >= bar and closes(message):
             cuts.append((index, running.hexdigest()[:16]))
