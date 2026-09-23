@@ -228,7 +228,7 @@ def answers(link, be, slot, plan, timeout, alive):
         body = systemone_body(plan, question)
         if slot is not None:
             body["id_slot"] = slot
-        reply = link.read(be, SYSTEMONE_UP, body, alive, timeout)
+        reply = link.work(be, SYSTEMONE_UP, body, alive, timeout)
         said[question["name"]] = systemone_read(reply, question)
         usage = (reply or {}).get("usage") or {}
         wrote += int(usage.get("completion_tokens") or 0)

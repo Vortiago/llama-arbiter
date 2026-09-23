@@ -27,12 +27,20 @@ POST_TIMEOUT = 300.0
 class Link:
     """The production link: HTTP to a llama-server.
 
-    Two conventions, by what the caller can do about it. The three read-only
-    endpoints answer None when the backend cannot be reached, because a
+    Three kinds of call, by what the caller can do about each.
+
+    The read-only endpoints answer None when the backend cannot be reached: a
     backend that is down is a state the router expects rather than an error it
-    reports. Everything that asks a backend to do work raises instead: OSError
-    when it refused or could not be reached, and from `read` also Gone, when
-    the client stopped waiting. `open` hands back the live response for the
+    reports.
+
+    The slot files raise, and are deliberately not watched. A copy outlives
+    the turn that asked for it, and one abandoned half written is worse than
+    one nobody reads.
+
+    Work takes `alive` and has no default for it, so a call site says whether
+    a client is waiting rather than getting the unwatched kind by leaving it
+    out. Work raises OSError when the backend refused, and Gone when `alive`
+    says the client has left. `open` hands back the live response for the
     caller to stream, including one the backend meant as an error.
     """
 
@@ -52,7 +60,7 @@ class Link:
         """The text /metrics answers, not json: the caller parses it."""
         return self._get(be["url"] + "/metrics", timeout, raw=True)
 
-    # -- the slot files
+    # -- the slot files. Not watched: the copy outlives the turn.
 
     def save(self, be, slot, name, timeout=None):
         return self._post(be, f"/slots/{slot}?action=save",
@@ -62,26 +70,29 @@ class Link:
         return self._post(be, f"/slots/{slot}?action=restore",
                           {"filename": name}, timeout)
 
-    # -- work
+    # -- work. One door, and `alive` is how it is held open.
 
-    def render(self, be, path, payload, timeout=None):
-        """What the backend's own template makes of these messages.
+    def work(self, be, path, payload, alive, timeout=None):
+        """Ask a backend to do something, and stop when the client stops
+        waiting. Raises Gone.
 
-        Nothing waits on this: it is the router asking a question of its own,
-        between a client's turns. A call a client is waiting for goes through
-        `read`, which stops when the client does."""
-        return self._post(be, path, payload, timeout)
+        The one call that reaches a backend on a turn's behalf. `prefill` and
+        `render` are this call under the name their callers read them by."""
+        return http_post_watched(be["url"], path, payload,
+                                 self.post_timeout if timeout is None else timeout,
+                                 alive)
 
-    def prefill(self, be, block, slot, timeout=None):
+    def render(self, be, path, payload, alive, timeout=None):
+        """What the backend's own template makes of these messages."""
+        return self.work(be, path, payload, alive, timeout)
+
+    def prefill(self, be, block, slot, alive, timeout=None):
         """Read a block into a slot and generate nothing. The reply's timings
         say how much was processed and how much came from the cache."""
-        return self._post(be, "/completion",
-                          {"prompt": block, "n_predict": 0,
-                           "cache_prompt": True, "id_slot": slot}, timeout)
-
-    def read(self, be, path, payload, alive, timeout):
-        """Read a prompt and stop when the client stops waiting. Raises Gone."""
-        return http_post_watched(be["url"], path, payload, timeout, alive)
+        return self.work(be, "/completion",
+                         {"prompt": block, "n_predict": 0,
+                          "cache_prompt": True, "id_slot": slot},
+                         alive, timeout)
 
     def open(self, be, path, body, headers, method, timeout):
         """The client's own request, passed through. The caller reads the

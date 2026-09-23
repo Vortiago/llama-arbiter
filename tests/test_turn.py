@@ -106,7 +106,7 @@ class TurnLink:
         self.calls.append(("restore", be["name"], name))
         return {"id_slot": slot, "n_restored": 3}
 
-    def read(self, be, path, payload, alive, timeout):
+    def work(self, be, path, payload, alive, timeout=None):
         self.calls.append(("read", be["name"], payload))
         if isinstance(self.reading, BaseException):
             raise self.reading

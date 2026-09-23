@@ -210,7 +210,7 @@ class Turn:
             messages = system = tools = None
             if asked is not None:
                 # `asked` is reused: a second parse of this body is megabytes.
-                answer = pool.link.read(be, up_path,
+                answer = pool.link.work(be, up_path,
                                         dict(asked, id_slot=slot),
                                         client.alive, pool.tuning.read_timeout)
                 timing = (answer or {}).get("timings") or {}

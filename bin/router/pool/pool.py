@@ -1016,7 +1016,7 @@ class Pool:
             return self._wait_for_opening(plan[1], be, slot, alive)
         try:
             return self._read_prefix(base, messages, system, tools, be,
-                                     plan[3], path)
+                                     plan[3], path, alive)
         finally:
             with self.cv:
                 self.building.pop(plan[1], None)
@@ -1429,7 +1429,8 @@ class Pool:
               f"slot {slot}", flush=True)
         return True
 
-    def _read_prefix(self, cut, messages, system, tools, be, slot, path):
+    def _read_prefix(self, cut, messages, system, tools, be, slot, path,
+                     alive):
         """Read one opening into a slot, then keep a copy of the slot."""
         index, key = cut
         name = f"base-{key}.park"
@@ -1437,9 +1438,9 @@ class Pool:
         self.store.link_block(name)   # so the save lands on the faster disk
         try:
             block = self._render_block(system, tools, messages[:index + 1],
-                                       be, self.link, path)
+                                       be, self.link, path, alive)
             # The zero-token reply's timings: tokens processed and cached.
-            read = self.link.prefill(be, block, slot,
+            read = self.link.prefill(be, block, slot, alive,
                                      self.tuning.read_timeout) or {}
             answer = self.link.save(be, slot, name) or {}
         except Exception as err:
@@ -1485,7 +1486,7 @@ class Pool:
         return True
 
     @staticmethod
-    def _render_block(system, tools, head, be, link, path):
+    def _render_block(system, tools, head, be, link, path, alive):
         """One opening, as the backend's own template renders it: what two
         renderings that differ only after the opening share. /apply-template
         refuses anthropic tool_use and tool_result blocks, so an opening from
@@ -1506,8 +1507,9 @@ class Pool:
         full = link.render(be, route,
                            dict(extra,
                                 messages=opening + [{"role": "user",
-                                                     "content": "x"}]))
-        alone = link.render(be, route, dict(extra, messages=opening))
+                                                     "content": "x"}]),
+                           alive)
+        alone = link.render(be, route, dict(extra, messages=opening), alive)
         return common_prefix(full["prompt"], alone["prompt"])
 
     def status(self):

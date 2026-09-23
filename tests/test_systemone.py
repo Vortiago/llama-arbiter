@@ -376,16 +376,16 @@ class OneQuestionAtATime(unittest.TestCase):
         {"token": "A", "logprob": -0.1}]}]}}]}
 
     class Link(TurnLink):
-        """TurnLink, plus the one thing the real read does between questions.
+        """TurnLink, plus the one thing the real call does between questions.
 
         Not pushed down into TurnLink: http_post_watched polls the client
         every two seconds, so a read that answers fast finishes even for a
         client that has gone, and a case there proves it."""
 
-        def read(self, be, path, payload, alive, timeout):
+        def work(self, be, path, payload, alive, timeout=None):
             if not alive():
                 raise router.Gone("the client stopped waiting")
-            return super().read(be, path, payload, alive, timeout)
+            return super().work(be, path, payload, alive, timeout)
 
     def plan(self, how_many):
         body = {"model": "m", "state": "the text", "questions": {

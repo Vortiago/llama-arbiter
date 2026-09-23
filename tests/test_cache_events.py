@@ -53,10 +53,10 @@ class QuietLink:
     def restore(self, be, slot, name, timeout=None):
         return {}
 
-    def prefill(self, be, block, slot, timeout=None):
+    def prefill(self, be, block, slot, alive, timeout=None):
         return {}
 
-    def render(self, be, route, payload, timeout=None):
+    def render(self, be, route, payload, alive, timeout=None):
         return {"prompt": ""}
 
 

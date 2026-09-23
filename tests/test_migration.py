@@ -115,12 +115,13 @@ class AnOpeningIsRenderedByItsOwnProtocol(unittest.TestCase):
         asked = []
 
         class Rendering(FakeLink):
-            def render(inner, be, route, payload, timeout=None):
+            def render(inner, be, route, payload, alive, timeout=None):
                 asked.append(route)
                 return {"prompt": "rendered"}
 
         pool._render_block("rules", [], [{"role": "user", "content": "hi"}],
-                           pool.backends[0], Rendering(), "/v1/messages")
+                           pool.backends[0], Rendering(), "/v1/messages",
+                           lambda: True)
         self.assertEqual(set(asked), {"/v1/messages/apply-template"})
 
 
@@ -278,7 +279,7 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
         opening, reads, started = "R" * 40000, [], threading.Event()
 
         class OneReader(FakeLink):
-            def prefill(inner, be, block, slot, timeout=None):
+            def prefill(inner, be, block, slot, alive, timeout=None):
                 reads.append(block)
                 started.set()
                 time.sleep(0.4)          # long enough for the others to queue
@@ -287,7 +288,7 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
             def save(inner, be, slot, name, timeout=None):
                 return {"n_written": 10 ** 9}
 
-            def render(inner, be, route, payload, timeout=None):
+            def render(inner, be, route, payload, alive, timeout=None):
                 return {"prompt": "rendered"}
 
         post = OneReader()
@@ -313,7 +314,7 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
             def save(inner, be, slot, name, timeout=None):
                 return {"n_written": 10 ** 9}
 
-            def render(inner, be, route, payload, timeout=None):
+            def render(inner, be, route, payload, alive, timeout=None):
                 return {"prompt": "rendered"}
 
         post = Loading()
@@ -325,10 +326,10 @@ class OneSessionReadsTheOpeningForAll(unittest.TestCase):
         opening = "R" * 40000
 
         class ReadFails(FakeLink):
-            def prefill(inner, be, block, slot, timeout=None):
+            def prefill(inner, be, block, slot, alive, timeout=None):
                 raise OSError("the read failed")
 
-            def render(inner, be, route, payload, timeout=None):
+            def render(inner, be, route, payload, alive, timeout=None):
                 return {"prompt": "rendered"}
 
         post = ReadFails()
@@ -570,13 +571,14 @@ class ToolsBelongToTheOpening(unittest.TestCase):
         sent = []
 
         class Rendering(FakeLink):
-            def render(inner, be, route, payload, timeout=None):
+            def render(inner, be, route, payload, alive, timeout=None):
                 sent.append(payload)
                 return {"prompt": "rendered"}
 
         pool._render_block("rules", self.TOOLS,
                            [{"role": "user", "content": "hi"}],
-                           pool.backends[0], Rendering(), "/v1/messages")
+                           pool.backends[0], Rendering(), "/v1/messages",
+                           lambda: True)
         self.assertTrue(sent, "it rendered nothing")
         for payload in sent:
             self.assertEqual(payload.get("tools"), self.TOOLS,
@@ -838,10 +840,10 @@ class FakeLink:
     def restore(self, be, slot, name, timeout=None):
         return self._note("restore", be, slot, name)
 
-    def prefill(self, be, block, slot, timeout=None):
+    def prefill(self, be, block, slot, alive, timeout=None):
         return self._note("prefill", be, slot, block)
 
-    def render(self, be, route, payload, timeout=None):
+    def render(self, be, route, payload, alive, timeout=None):
         self._note("render", be, route)
         # Two renderings that share everything up to the opening. The router
         # keeps the common prefix, so the answer decides what a block is.
@@ -1880,7 +1882,7 @@ class PrefixCase:
         block = self.BLOCK
 
         class Talk(FakeLink):
-            def render(inner, be, route, payload, timeout=None):
+            def render(inner, be, route, payload, alive, timeout=None):
                 inner._note("render", be, route)
                 # The longer rendering carries the extra user message, so the
                 # two differ exactly where the opening ends.
@@ -1889,7 +1891,7 @@ class PrefixCase:
                                            if last["content"] == "x"
                                            else "assistant\n")}
 
-            def prefill(inner, be, blk, slot, timeout=None):
+            def prefill(inner, be, blk, slot, alive, timeout=None):
                 inner._note("prefill", be, slot, blk)
                 return {"tokens_evaluated": 2048}
 
@@ -1951,6 +1953,32 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
         self.assertEqual(self.paths(post),
                          ["render", "render", "prefill", "save"])
         self.assertIn("k1", self.pool.openings)
+
+    def test_the_read_of_an_opening_watches_the_client(self):
+        """Reading an opening is the longest call the router makes: tens of
+        minutes at ctx 150000. It went through the one door nothing can
+        cancel, so a client that left was read for anyway, holding a prefill
+        slot the whole time."""
+        watched = []
+
+        class Watched(FakeLink):
+            def render(inner, be, path, payload, alive, timeout=None):
+                watched.append(alive)
+                return {"prompt": "rendered "}
+
+            def prefill(inner, be, blk, slot, alive, timeout=None):
+                watched.append(alive)
+                return {"tokens_evaluated": 2048}
+
+        gone = Watched()
+        self.pool.link = gone
+        self.pool.warm_prefix("new", self.CUTS[:1], self.TALK, "rules", [],
+                              self.cpu, 1, "/v1/chat/completions",
+                              alive=lambda: False)
+
+        self.assertTrue(watched, "the read never reached the link")
+        self.assertTrue(all(a is not None and not a() for a in watched),
+                        "the opening was read with nobody waiting")
 
     def test_a_busy_machine_still_gets_the_opening_saved(self):
         """The request reads the opening on its own slot, so a machine busy
