@@ -6,13 +6,10 @@
 # first. Both instances get every core on the node. The scheduler splits the
 # socket when both have work.
 set -euo pipefail
-source "$(dirname "$0")/common.sh"
-
+# Before common.sh, which defaults NODE to 0 and binds and counts threads
+# against whatever NODE holds then.
 NODE=${NODE:-1}        # 1 is the socket without the GPU
-NUMACTL=(--cpunodebind="$NODE" --preferred="$NODE")
-# common.sh counted THREADS against the default NODE. THREADS_ENV is the
-# caller's value.
-THREADS=${THREADS_ENV:-$(cores_on_node "$NODE")}
+source "$(dirname "$0")/common.sh"
 
 # Each node reads its own copy of the weights. Its page cache is then local.
 if [[ $NODE == 0 ]]; then
