@@ -56,6 +56,6 @@ ARGS=(
                        # socket.
 )
 # No --poll: this build is GGML_OPENMP=ON, and that path never reads it.
-# OMP_WAIT_POLICY and GOMP_SPINCOUNT are the equivalent, unmeasured here.
+# common.sh sets OMP_WAIT_POLICY and GOMP_SPINCOUNT, the equivalent.
 
 launch

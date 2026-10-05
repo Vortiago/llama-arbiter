@@ -24,9 +24,12 @@ env=($rest)
 
 # A setting in the environment wins over the table: `env` takes the last
 # assignment of a name. A sweep restarts one backend with one knob moved.
-for name_of in BATCH UBATCH TB SLOTS PRIME CACHE_RAM; do
+for name_of in BATCH UBATCH TB SLOTS PRIME CACHE_RAM CPUSET CKPT_STEP CKPT_N PRIO; do
   [[ -n ${!name_of:-} ]] && env+=("$name_of=${!name_of}")
 done
+# THREADS_ENV, not THREADS: common.sh fills THREADS with the core count, which
+# would override every THREADS in the table.
+[[ -n $THREADS_ENV ]] && env+=("THREADS=$THREADS_ENV")
 
 echo "draining $name (this waits for work already running)..."
 # mktemp, not /tmp/drain.$$: curl -o follows a symlink planted at a guessable

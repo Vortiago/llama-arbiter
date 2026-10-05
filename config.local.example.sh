@@ -31,6 +31,14 @@
 # to, which is usually right.
 # THREADS=18
 
+# One NUMA node: nothing to bind away from, so no numactl and no --numa.
+# export NUMA_MODE=off
+
+# A podman container for the tool calls --agent makes, and the MCP servers it
+# reaches, for a launch script that calls tools_args. Unset: no tools sandbox.
+# TOOLS_CONTAINER=llama-tools
+# MCP_CONFIG=/srv/llama-tools/mcp-servers.json
+
 # Context per slot. Every backend must use the same number: a conversation
 # that outgrew one can never move back to it. 150000 needs about 15.3 GiB of
 # VRAM at f16 KV, about 36.5 KiB a token. Size it to your own card;
