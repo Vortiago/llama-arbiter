@@ -32,6 +32,7 @@ MODELS = Path("/home/atle/local_llm/models")
 MODEL = MODELS / "unsloth/Qwen3.8-Flash-Next-GGUF/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf"
 DRAFT = MODELS / "ggml-org/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q8_0.gguf"
 TSV = BENCH / "perf-results.tsv"
+SLOTS = BENCH / "slots"
 PORT = 18080
 
 # The live backends' context, so the KV cache and its layout match production.
@@ -71,6 +72,14 @@ GENERATE_PROMPTS = {
 }
 SEED = 42
 
+# Wikitext averages about 4 characters a token for this tokenizer.
+CHARS_PER_TOKEN = 4
+
+# About 2000 tokens read at depth: four ubatches of 512.
+DEPTH_EXTENSION_CHARS = 8000
+
+DEPTH_REPLY_TOKENS = 256
+
 COLUMNS = ["time", "label", "test", "case", "rep", "metric", "value", "tokens",
            "build", "flags"]
 
@@ -84,7 +93,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(required=True)
 
-    for name, func in [("prefill", run_prefill), ("generate", run_generate),
+    for name, func in [("prefill", run_prefill), ("generate", run_generate), ("depth", run_depth),
                        ("kernel", run_kernel), ("quality", run_quality)]:
         p = sub.add_parser(name)
         p.add_argument("--label", required=True)
@@ -100,6 +109,10 @@ def parse_args():
             p.add_argument("--prompt-file", type=Path, default=BENCH / "prompt-8k.txt")
         if name == "generate":
             p.add_argument("--n-predict", type=int, default=512)
+        if name == "depth":
+            p.add_argument("--depth", type=int, default=32768,
+                           help="tokens of context before the measured read and reply")
+            p.set_defaults(reps=2)
         if name == "kernel":
             p.add_argument("--bench-args", default="-p 512,2048 -n 128")
         if name == "quality":
@@ -127,7 +140,6 @@ def run_prefill(args):
 def run_generate(args):
     with Server(args, "generate") as server:
         for case, prompt in GENERATE_PROMPTS.items():
-            server.complete(greedy(prompt, args.n_predict))  # warms the slot
             for rep in range(args.reps):
                 result = server.complete(sampled(prompt, args.n_predict))
                 timings = result["timings"]
@@ -137,6 +149,39 @@ def run_generate(args):
                        acceptance(timings), timings.get("draft_n", 0))
             text = server.complete(greedy(prompt, args.n_predict))["content"]
             record(args, "generate", case, 0, "greedy_sha", digest(text), len(text))
+
+
+def run_depth(args):
+    """Time a read and a reply with a long context already in the slot.
+
+    The context is read once and saved to a slot file. Every rep restores that
+    file, so each build starts from the same state, and only the extension is read.
+    """
+    text = (BENCH / "wiki.test.raw").read_text()
+    chars = args.depth * CHARS_PER_TOKEN
+    context = text[:chars]
+    saved = f"depth{args.depth // 1024}k.bin"
+    case = f"d{args.depth // 1024}k"
+    with Server(args, "generate", slot_dir=SLOTS) as server:
+        if not (SLOTS / saved).exists():
+            timings = server.complete({"prompt": context, "n_predict": 0,
+                                       "cache_prompt": True})["timings"]
+            record(args, "depth", f"fill-{case}", 0, "prompt_tok_s",
+                   timings["prompt_per_second"], timings["prompt_n"])
+            server.slot_action("save", saved)
+        for rep in range(args.reps):
+            server.slot_action("restore", saved)
+            start = chars + rep * DEPTH_EXTENSION_CHARS
+            body = sampled(context + text[start:start + DEPTH_EXTENSION_CHARS],
+                           DEPTH_REPLY_TOKENS)
+            body.update({"cache_prompt": True, "id_slot": 0})
+            timings = server.complete(body)["timings"]
+            record(args, "depth", case, rep, "prompt_tok_s",
+                   timings["prompt_per_second"], timings["prompt_n"])
+            record(args, "depth", case, rep, "gen_tok_s",
+                   timings["predicted_per_second"], timings["predicted_n"])
+            record(args, "depth", case, rep, "acceptance",
+                   acceptance(timings), timings.get("draft_n", 0))
 
 
 def greedy(prompt, n_predict):
@@ -222,11 +267,12 @@ def parse_kld(text):
 class Server:
     """One llama-server on PORT, started for a measurement and stopped after it."""
 
-    def __init__(self, args, role):
+    def __init__(self, args, role, slot_dir=None):
         self.log_path = BENCH / "run" / f"{args.label}-{role}.log"
+        slots = ["--slot-save-path", f"{slot_dir}/"] if slot_dir else []
         self.command = [str(args.build / "bin/llama-server"), "--model", str(MODEL),
                         "--model-draft", str(args.draft), "--ctx-size", str(CTX),
-                        *COMMON, *ROLE_FLAGS[role], *shlex.split(args.extra),
+                        *COMMON, *ROLE_FLAGS[role], *slots, *shlex.split(args.extra),
                         "--host", "127.0.0.1", "--port", str(PORT)]
         self.process = None
 
@@ -262,8 +308,15 @@ class Server:
         raise RuntimeError(f"llama-server not healthy after {STARTUP_SECONDS} s")
 
     def complete(self, body):
+        return self.post("/completion", body)
+
+    def slot_action(self, action, filename):
+        """Save slot 0 to, or restore it from, a file in the slot directory."""
+        return self.post(f"/slots/0?action={action}", {"filename": filename})
+
+    def post(self, path, body):
         request = urllib.request.Request(
-            f"http://127.0.0.1:{PORT}/completion", data=json.dumps(body).encode(),
+            f"http://127.0.0.1:{PORT}{path}", data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=REQUEST_SECONDS) as response:
             return json.load(response)
