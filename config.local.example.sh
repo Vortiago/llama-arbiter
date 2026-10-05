@@ -63,6 +63,15 @@
 # cpu1_0 8081 qwen-mtp-cpu.sh SLOTS=1 NODE=1
 # '
 #
+# One socket and no GPU: two readers over every core, and a generator that
+# floats over the same cores at a higher priority.
+#
+# BACKENDS='
+# pre0 8080 cpu-prefill.sh  CPUSET=0-31 THREADS=32
+# pre1 8081 cpu-prefill.sh  CPUSET=0-31 THREADS=32
+# gen0 8082 cpu-generate.sh CPUSET=0-31 THREADS=16 SLOTS=2
+# '
+#
 # The JSON has the same names plus what each instance may do: "prefill" and
 # "generate". "pref" orders the instances a turn would rather generate on.
 # Both on: read and answer in place. Prefill off: the generator that turns
