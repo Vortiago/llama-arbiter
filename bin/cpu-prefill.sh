@@ -22,7 +22,7 @@ ARGS=(
   --device none
   "${MTP_ARGS[@]}"
   "${VISION_ARGS[@]}"
-  ${TOOLS_ARGS[@]+"${TOOLS_ARGS[@]}"}
+  "${TOOLS_ARGS[@]}"
   --parallel 1
   --ctx-size "${CTX:-150000}"
   --cpu-range "${CPUSET:-0-31}" --cpu-strict 1

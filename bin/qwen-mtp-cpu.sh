@@ -24,14 +24,8 @@ ALIAS=qwen3.8-flash-next-mtp-cpu
 
 mapfile -t VISION_ARGS < <(vision_args "$MMPROJ_FILE")
 
-# A state file records n_stream, and a restore refuses a file that disagrees.
-# n_stream is 1 for a unified KV, otherwise the number of sequences. One slot
-# needs nothing. More than one must be told. CTX must match the GPU backend.
-if [[ ${SLOTS:-1} -gt 1 ]]; then
-  KV_ARGS=(--kv-unified --kv-unified-per-slot "${CTX:-150000}")
-else
-  KV_ARGS=(--ctx-size "${CTX:-150000}")
-fi
+# CTX must match the GPU backend.
+mapfile -t KV_ARGS < <(kv_args "${SLOTS:-1}")
 
 ARGS=(
   --device none        # keep the GPU free for the other backend
@@ -52,7 +46,5 @@ ARGS=(
                        # Prefill only. THREADS is the physical cores on the
                        # socket.
 )
-# No --poll: this build is GGML_OPENMP=ON, and that path never reads it.
-# common.sh sets OMP_WAIT_POLICY and GOMP_SPINCOUNT, the equivalent.
 
 launch

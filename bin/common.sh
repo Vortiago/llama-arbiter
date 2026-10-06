@@ -84,7 +84,7 @@ fi
 # This build is GGML_OPENMP=ON, so --poll is never read and an idle worker
 # spins for GOMP_SPINCOUNT instead. Three instances on one 32-core socket spin
 # 48 threads, which takes cores from the one that has work. PASSIVE makes an
-# idle worker sleep. Exported here so restart-backend.sh gets it too.
+# idle worker sleep. Exported, so the llama-server that launch() execs reads it.
 export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-PASSIVE}
 export GOMP_SPINCOUNT=${GOMP_SPINCOUNT:-0}
 
@@ -94,6 +94,18 @@ MTP_ARGS=(--model-draft "$DRAFT" --spec-type draft-mtp --spec-draft-n-max 3)
 # vision_args <mmproj-file>: empty if the file is absent or VISION=0
 vision_args() {
   [[ ${VISION:-1} == 1 && -f $1 ]] && printf '%s\n' --mmproj "$1" --no-mmproj-offload
+}
+
+# kv_args <slots>: the KV flags for that many slots. A state file records
+# n_stream (src/llama-kv-cache.cpp, n_stream = unified ? 1 : n_seq_max), and a
+# restore refuses a file that disagrees. One slot needs nothing; more than one
+# must be unified, or its states will not move between backends.
+kv_args() {
+  if (( $1 > 1 )); then
+    printf '%s\n' --kv-unified --kv-unified-per-slot "${CTX:-150000}"
+  else
+    printf '%s\n' --ctx-size "${CTX:-150000}"
+  fi
 }
 
 # tools_args: a podman sandbox for the tool calls --agent makes, and the MCP
@@ -118,7 +130,7 @@ tools_args() {
 # --agent gives any client shell and file access, and there is no API key.
 # The backends listen on localhost. Only the router is public.
 COMMON=(
-  ${NUMA_ARGS[@]+"${NUMA_ARGS[@]}"}
+  "${NUMA_ARGS[@]}"
   --parallel 1
   --flash-attn auto
   --jinja
@@ -160,9 +172,8 @@ COMMON=(
 
 die() { echo "${0##*/}: $*" >&2; exit 1; }
 
-# Read the weights once, so the server maps pages already in memory. Under
-# --numa, llama.cpp sets MADV_RANDOM and skips MAP_POPULATE, and never does
-# this itself. PRIME_SKIP names shards not worth reading. The default is the
+# Read the weights once, so the server maps pages already in memory: under
+# --numa it never does this itself (see NUMA_MODE above). PRIME_SKIP names shards not worth reading. The default is the
 # shard with the 50 GiB per_layer_token_embd tensor, which --lazy-mode leaves
 # on disk. Best effort: a missing DRAFT or oddly named shards must not stop a
 # backend from starting.
@@ -179,7 +190,7 @@ prime() {
   done
   shopt -u nullglob
   (( ${#keep[@]} )) || { echo "${0##*/}: nothing to prime for $MODEL" >&2; return 0; }
-  ${NUMA_PREFIX[@]+"${NUMA_PREFIX[@]}"} cat "${keep[@]}" > /dev/null 2>&1 || true
+  "${NUMA_PREFIX[@]}" cat "${keep[@]}" > /dev/null 2>&1 || true
   return 0
 }
 
@@ -195,7 +206,7 @@ launch() {
   # last statement of a function returns 1 from it.
   if [[ ${PRIME:-1} == 1 ]]; then prime; fi
 
-  exec ${NUMA_PREFIX[@]+"${NUMA_PREFIX[@]}"} "$SERVER" \
+  exec "${NUMA_PREFIX[@]}" "$SERVER" \
     --model "$MODEL" \
     --alias "$ALIAS" \
     --threads "$THREADS" \
