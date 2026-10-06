@@ -6,12 +6,14 @@ ggml-org master `8e1642198`, the commit that `llama-ref` names.
 - The server patches in this directory change `llama-server`. Three of them
   are required.
 - The CPU speed patches in `cpu/` make Qwen3.8-Flash-Next faster on the CPU
-  backend. None of them is required.
+  backend. None of them is required. `cpu/core/` applies by default, and each
+  set in `cpu/optional/` applies only when `CPU_OPTIONAL` names it.
 
 `tools/get-llama.sh` checks out that commit and applies the server patches in
-name order. It then applies `cpu/` in number order. To apply one server patch
-by hand, run `git apply <name>.patch` from inside that checkout. A CPU patch
-applies only on top of the one before it.
+name order. It then applies `cpu/core/` in number order, and then the optional
+sets that `CPU_OPTIONAL` names. To apply one server patch by hand, run
+`git apply <name>.patch` from inside that checkout. A CPU patch applies only on
+top of the one before it, and an optional set applies only on top of core.
 
 ## The server patches
 
@@ -139,51 +141,86 @@ readout: llama.cpp ignores a field it does not know.
 
 ## The CPU speed patches
 
-The patches in `cpu/` are one series, exported from a llama.cpp branch. Each
-one applies on top of the one before it. They change the CPU backend and its
-tests. Q1 also changes `ggml_argsort_top_k` in `ggml.c`, which every backend
-shares. The CUDA argsort reads only the sort order, so it ignores the new
-top-k hint. A CUDA build compiles the CPU backend too, so it takes the series
-as well. No CUDA build of the series has been made yet.
+The CPU patches are the final stack, branch `perf/stack4` in the llama.cpp
+checkout, in two tiers:
 
-To write the series again, for example after a commit is added, run:
+- **Core**, in `cpu/core/`, is 17 patches for 10 changes. It applies by
+  default. Every change in it gives the same bits as the base, except U4. U4
+  changes the order in which batch-1 decode attention sums, so its output is
+  numerically close, not the same.
+- **Optional**, in `cpu/optional/<name>/`, is one directory for each change
+  that moves the model's output a little: I1 and Q1. Each set is made on top
+  of core alone. The sets apply in any combination, always in name order.
 
-    LLAMA=<llama.cpp checkout> tools/export-cpu-patches.sh <branch> [<base>]
+To build with both optional sets, run:
 
-The base is the branch that holds `8e1642198` plus the server patches. The
-default is `perf/base`. The script checks, in a scratch index, that the base
-is exactly that, and that the series gives the tree of the branch.
+    CPU_OPTIONAL="I1 Q1" tools/get-llama.sh
+
+Core plus I1 and Q1 gives the tree of `perf/stack4` exactly. `tools/README.md`
+says how `get-llama.sh` finds a patch already applied, and how to write
+`cpu/` again from a branch with `tools/export-cpu-patches.sh`.
+
+The patches change the CPU backend and its tests, with two exceptions in
+`ggml.c`, which every backend shares. U4's 0012 aligns a host buffer of 4 MiB
+or more to 2 MiB and asks Linux for transparent huge pages. Q1 adds a top-k
+hint to `ggml_argsort_top_k`. The CUDA argsort reads only the sort order, so it
+ignores the hint. A CUDA build compiles the CPU backend too, so it takes the
+patches as well. No CUDA build of them has been made yet.
 
 ### What each one does
 
 The machine is one EPYC 7502P with 32 cores and no GPU, and the model is
-Qwen3.8-Flash-Next at Q8_0. Each change is against master plus the server
-patches, in one run. A change marked *paired* is against patches 0001 to
-0009 together, in two alternating rounds. The reference drifted up to 6.2%
-between rounds, so a smaller change from a single run is not a result.
+Qwen3.8-Flash-Next at Q8_0. Every number is from
+`/home/atle/llama-arbiter-bench/perf-results.tsv`. A change with no mark is a
+single run of the patch alone against master plus the server patches
+(`B-main`). A change marked *paired* is against the stack named, in
+alternating rounds. Repeated runs of `B-main` alone spread 3.0% on 8k prefill
+and 12.2% on tg128, so a smaller single-run change is not a result.
+`docs/PERF.md` gives the method and every run.
 
-- **pp512** and **tg128** are `llama-bench` at 32 threads.
+- **pp512**, **pp2048** and **tg128** are `llama-bench` at 32 threads.
 - **8k prefill** is one backend with the cpu-prefill flags reading 8192
   tokens.
 - **generate** is one backend with the generator flags and the MTP draft,
-  writing 512 tokens for each of three prompts.
-- **bit-exact** means `test-backend-ops` gives the same bits as the unpatched
-  CPU backend for every op the patch touches.
+  writing a reply to each of three prompts.
+- **depth** restores a saved slot of 32k or 128k tokens, reads about 1800 more
+  and writes 256.
+- **bit-exact** means `test-backend-ops` gives the same bits as the base CPU
+  backend for every op the patch touches. **KLD** is the mean KL divergence of
+  `llama-perplexity` on wikitext against `B-main`.
 
-| patch | id | what it does | measured | exactness |
+| patches | id | what it does | measured | exactness |
 |---|---|---|---|---|
-| 0001, 0002 | X1 | A Q8_0 expert with 4 or more routed rows runs through the llamafile sgemm kernel that dense Q8_0 matmuls use, not one dot product per output. | pp512 +15.0%, 8k prefill +7.4% | bit-exact on x86 AVX, AVX2 and AVX-512, mean KLD 0 |
-| 0003 | X3 | At generate an expert gets 1 to 4 rows. The small experts share one work list, so a thread reads longer runs, and a late thread hands its share on. | generate +4.2 to +8.2%, tg128 +1.0% | bit-exact |
-| 0004 | I4A | `get_rows` and the strided copy split a wide row over all threads. One or two threads copied the 3 MiB recurrent state of each layer. | tg128 +19.9%, generate +3.5 to +7.0% | bit-exact |
-| 0005 | I4B | `gated_delta_net` writes each state snapshot straight into its cache slot, so the copy after it goes. A port of the CUDA fusion. | tg128 +6.3%, generate +6.0 to +8.9% | bit-exact |
-| 0006 | M3 | A run of tiny row-wise ops runs on thread 0, with one barrier after the run, not one per op. `GGML_CPU_SERIAL_BYTES` sets the limit: 32768 by default, 0 turns it off. | generate +4.6 to +7.7%, tg128 +0.9% | bit-exact |
-| 0007 | W1 | `concat` splits over destination rows and copies a transposed source in cache-line tiles. One thread copied the conv state alone. | pp512 +19.0%, 8k prefill +10.8%, generate +1.0 to +4.7% | bit-exact |
-| 0008, 0009 | W2 | The norms split rows over every dimension. `dsv4_hc_post` walks one stream row at a time, without three integer divides per element. | pp512 +8.5%, 8k prefill +6.8% | bit-exact |
-| 0010, 0011 | I1 | A SIMD sigmoid, which the gated `dsv4_hc_pre` now uses row by row. | *paired*: pp512 +2.4%, 8k prefill +1.7% | not bit-exact: at most 1.2e-7 per op. The model KLD is not measured yet. |
-| 0012, 0013 | Q1 | `ggml_argsort_top_k` passes k as a hint, and the CPU kernel sorts only the top k of a row. The MoE router sorted 512 ids to read 10. | *paired*: generate +0.9 to +3.2%, tg128 +1.3% | bit-exact |
+| `core/0001, 0002` | X1 | A Q8_0 expert with 4 or more routed rows runs through the llamafile sgemm kernel that dense Q8_0 matmuls use, not one dot product per output. | pp512 +13.7%, 8k prefill +7.2% | bit-exact (947 cases), KLD 0 |
+| `core/0003` | X3 | At generate an expert gets 1 to 4 rows. The small experts share one work list, so a thread reads longer runs, and a late thread hands its share on. | generate +4.2 to +8.2%. *Paired* on stack4, with and without X3: generate +6.1 to +7.3% | bit-exact (953 cases) |
+| `core/0004` | I4A | `get_rows` and the strided copy split a wide row over all threads. One or two threads copied the 3 MiB recurrent state of each layer. | tg128 +20.1%, generate +3.5 to +7.0% | bit-exact (1388 cases) |
+| `core/0005` | I4B | `gated_delta_net` writes each state snapshot straight into its cache slot, so the copy after it goes. A port of the CUDA fusion. | tg128 +6.4%, generate +6.0 to +8.9% | bit-exact (52 cases) |
+| `core/0006` | M3 | A run of tiny row-wise ops runs on thread 0, with one barrier after the run, not one per op. `GGML_CPU_SERIAL_BYTES` sets the limit: 32768 by default, 0 turns it off. | generate +4.6 to +7.7%, tg128 +1.0% | bit-exact (5662 cases) |
+| `core/0007` | W1 | `concat` splits over destination rows and copies a transposed source in cache-line tiles. One thread copied the conv state alone. | pp512 +17.7%, 8k prefill +10.6%, generate +1.0 to +4.7% | bit-exact (219 cases) |
+| `core/0008, 0009` | W2 | The norms split rows over every dimension. `dsv4_hc_post` walks one stream row at a time, without three integer divides per element. | pp512 +7.3%, 8k prefill +6.6% | bit-exact (464 cases) |
+| `core/0010` | K3 | The MoE weighted reduction runs as one kernel, not one multiply and one add per expert, each with a barrier. A port of the CUDA fusion. | *paired* on stack2: pp512 +2.6%, pp2048 +3.2%, 8k prefill +0.7% | bit-exact (306 cases) |
+| `core/0011 to 0013` | U4 | Batch-1 flash attention decode scores KV cells in blocks of 32, with one vectorised softmax for each block. 0012 aligns large host buffers to 2 MiB for huge pages. 0013 adds test cases. A port of upstream #27478. | tg128 +1.7% | numerically close: 4574 of 5317 cases differ. KLD 0 at 8192, but the perplexity test reads in batches and does not run this path. Greedy replies differ. |
+| `core/0014 to 0017` | K1 | A long prefill honours the `n_kv_max` sparse hint: each group of 8 query tokens reads only the 64-cell KV tiles in which one of its rows sees a cell. CUDA, Vulkan and Metal already do this. | on U4: 32k depth read 30.7 tok/s against 24.0 (+27.6%) | bit-exact against U4 (5338 cases, 32 and 16 threads). KLD 0, PPL ratio 1.0001 at 8192 |
+| `optional/I1/0001, 0002` | I1 | A SIMD sigmoid, which the gated `dsv4_hc_pre` now uses row by row. | *paired* on stack2: pp512 +2.4%, 8k prefill +1.7% | at most 1.2e-7 per op. KLD 0.020, same top token 96.0%, PPL ratio 0.9972 ± 0.0037 at 512 |
+| `optional/Q1/0001, 0002` | Q1 | `ggml_argsort_top_k` passes k as a hint, and the CPU kernel sorts only the top k of a row. The MoE router sorted 512 ids to read 10. | *paired* on stack2: generate +0.9 to +3.2%, tg128 +1.3% | bit-exact (1047 cases). KLD 0.002, same top token 99.5%, PPL ratio 0.9984 ± 0.0015 at 512 |
 
-The gains overlap, so they do not add. Patches 0001 to 0009 together read the
-8k prompt 31.9% faster than master plus the server patches. They do pp512
-47.9% faster, tg128 24.4% faster and generate 20.4 to 23.5% faster. Their mean
-KLD is 0 and the top token is the same at contexts 512 and 8192. The whole
-series is not measured yet.
+The PPL ratio is the perplexity of the patch over that of `B-main`. For I1 and
+Q1 it is below 1, by about one uncertainty or less, so neither shows a
+measurable loss. They are optional because they change the output, not because
+the output got worse.
+
+The gains overlap, so they do not add. All of them together, `perf/stack4`,
+measure against `B-main`:
+
+| measure | stack4 | `B-main` |
+|---|---|---|
+| 8k prefill, tok/s | 59.4 to 60.9 | 44.0 |
+| read at 128k depth, 32 threads, tok/s | 38.4 and 38.9 | 19.2 and 19.8 |
+| tg128, tok/s | 11.7 (+29.4%) | 9.07 |
+| KLD at 512 and 8192 | 0.020 and 0.019 | 0 |
+| PPL ratio at 512 and 8192 | 0.9992 ± 0.0037 and 1.0045 ± 0.0028 | 1 |
+
+At 128k depth, stack3 (stack4 without K3, U4 and K1) read 22.4 and 22.7
+tok/s. Stack2 has a KLD of 0, and stack4 has the KLD of stack3 at both
+contexts. On this test, I1 and Q1 therefore account for all of it. Core alone has not
+been built and measured yet.
