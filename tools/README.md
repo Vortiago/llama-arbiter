@@ -5,7 +5,9 @@ server the rest of this repository is a router for.
 
 | file | purpose |
 |---|---|
-| `get-llama.sh` | Clone llama.cpp, apply `patches/`, build `llama-server`. Safe to re-run. |
+| `get-llama.sh` | Clone llama.cpp at the commit in `patches/llama-ref`, apply `patches/` and then `patches/cpu/`, build `llama-server`. Safe to re-run. |
+| `export-cpu-patches.sh` | Write `patches/cpu/` again from a llama.cpp branch, one patch per commit. |
+| `perf-ab.py` | Measure one llama.cpp build at a time for an A/B, and compare the results. |
 | `setup-nvme.sh` | Partition and format the NVMe disk. Run once, as root. Erases the disk. |
 | `numa-ab.sh`    | Compare NUMA settings. |
 | `qwen.sh`       | The old non-MTP backend. Slower. Kept for reference. |
