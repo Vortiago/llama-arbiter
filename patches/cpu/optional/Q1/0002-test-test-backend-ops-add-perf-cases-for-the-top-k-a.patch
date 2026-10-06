@@ -1,4 +1,4 @@
-From 0dc921882d4dd430f2d71fef10ff7939271542e4 Mon Sep 17 00:00:00 2001
+From b3f35e5ae195be47ffb572054968669f226742e6 Mon Sep 17 00:00:00 2001
 From: Vortiago <atle@havso.net>
 Date: Mon, 5 Oct 2026 21:20:54 +0200
 Subject: [PATCH] test(test-backend-ops): add perf cases for the top-k argsort
@@ -22,10 +22,10 @@ Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
  1 file changed, 7 insertions(+)
 
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 88a9b0036..653941dd4 100644
+index c07c29ff2..be861c542 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -12105,6 +12105,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12351,6 +12351,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 1,  1, 1}));
      test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
  

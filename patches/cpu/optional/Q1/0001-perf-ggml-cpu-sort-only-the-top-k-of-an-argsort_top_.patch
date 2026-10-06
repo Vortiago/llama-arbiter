@@ -1,4 +1,4 @@
-From 2fbd2459b150c058b2bb21cebb5623c946f2822b Mon Sep 17 00:00:00 2001
+From 3588a3ab505a0b9f716a59cb328cd2b1bab8a428 Mon Sep 17 00:00:00 2001
 From: Vortiago <atle@havso.net>
 Date: Mon, 5 Oct 2026 16:35:53 +0200
 Subject: [PATCH] perf(ggml-cpu): sort only the top k of an argsort_top_k row
@@ -71,10 +71,10 @@ index 224bdef92..38515320f 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * a,
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 2b057da82..39f194ee0 100644
+index de19fd19f..b618cb08a 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -8733,6 +8733,17 @@ struct cmp_argsort {
+@@ -8830,6 +8830,17 @@ struct cmp_argsort {
      }
  };
  
@@ -92,7 +92,7 @@ index 2b057da82..39f194ee0 100644
  static void ggml_compute_forward_argsort_f32(
      const ggml_compute_params * params,
      ggml_tensor * dst) {
-@@ -8750,6 +8761,13 @@ static void ggml_compute_forward_argsort_f32(
+@@ -8847,6 +8858,13 @@ static void ggml_compute_forward_argsort_f32(
  
      ggml_sort_order order = (ggml_sort_order) ggml_get_op_params_i32(dst, 0);
  
@@ -106,7 +106,7 @@ index 2b057da82..39f194ee0 100644
      for (int64_t i = ith; i < nr; i += nth) {
          const float * src_data = (float *)((char *) src0->data + i*nb01);
  
-@@ -8761,11 +8779,11 @@ static void ggml_compute_forward_argsort_f32(
+@@ -8858,11 +8876,11 @@ static void ggml_compute_forward_argsort_f32(
  
          switch (order) {
              case GGML_SORT_ORDER_ASC:
@@ -121,10 +121,10 @@ index 2b057da82..39f194ee0 100644
  
              default:
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9bcabdbd3..92a8e2742 100644
+index 6330b1df6..d2589ba80 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5451,10 +5451,16 @@ struct ggml_tensor * ggml_argsort_top_k(
+@@ -5480,10 +5480,16 @@ struct ggml_tensor * ggml_argsort_top_k(
          struct ggml_context * ctx,
          struct ggml_tensor  * a,
          int                   k) {
@@ -143,10 +143,10 @@ index 9bcabdbd3..92a8e2742 100644
                  k, result->ne[1], result->ne[2], result->ne[3],
                     result->nb[1], result->nb[2], result->nb[3],
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index dc1a67f80..88a9b0036 100644
+index b70384cbd..c07c29ff2 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6768,6 +6768,18 @@ struct test_concat : public test_case {
+@@ -6887,6 +6887,18 @@ struct test_concat : public test_case {
      }
  };
  
@@ -165,7 +165,7 @@ index dc1a67f80..88a9b0036 100644
  // GGML_OP_ARGSORT
  struct test_argsort : public test_case {
      const ggml_type type;
-@@ -6806,15 +6818,7 @@ struct test_argsort : public test_case {
+@@ -6925,15 +6937,7 @@ struct test_argsort : public test_case {
                  std::shuffle(data.begin(), data.end(), rng);
                  ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
              } else if (t->type == GGML_TYPE_F32) {
@@ -182,7 +182,7 @@ index dc1a67f80..88a9b0036 100644
              } else {
                  GGML_ABORT("fatal error");
              }
-@@ -6822,6 +6826,51 @@ struct test_argsort : public test_case {
+@@ -6941,6 +6945,51 @@ struct test_argsort : public test_case {
      }
  };
  
@@ -234,7 +234,7 @@ index dc1a67f80..88a9b0036 100644
  // GGML_OP_TOP_K
  struct test_top_k : public test_case {
      const ggml_type type;
-@@ -11063,8 +11112,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11255,8 +11304,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  
      for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
          for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
@@ -245,7 +245,7 @@ index dc1a67f80..88a9b0036 100644
          }
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {16, 10, 10, 10}, order));
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {60, 10, 10, 10}, order)); // qwen
-@@ -11079,6 +11128,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11271,6 +11320,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
      }
  

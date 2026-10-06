@@ -1,4 +1,4 @@
-From c78f3a91e1246512849c97dde8a796149db6100c Mon Sep 17 00:00:00 2001
+From fa326748af8633c661bb16de2f9d6ef89c0001ee Mon Sep 17 00:00:00 2001
 From: Vortiago <atle@havso.net>
 Date: Mon, 5 Oct 2026 13:41:22 +0200
 Subject: [PATCH] perf(ggml-cpu): vectorise the gated dsv4_hc_pre
@@ -36,10 +36,10 @@ Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
  3 files changed, 85 insertions(+)
 
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index e970b4f6a..2b057da82 100644
+index de19fd19f..8d7605b79 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -11510,6 +11510,37 @@ void ggml_compute_forward_dsv4_hc_comb(
+@@ -12079,6 +12079,37 @@ void ggml_compute_forward_dsv4_hc_comb(
  
  // ggml_compute_forward_dsv4_hc_pre
  
@@ -77,7 +77,7 @@ index e970b4f6a..2b057da82 100644
  static void ggml_compute_forward_dsv4_hc_pre_f32(
          const ggml_compute_params * params,
          ggml_tensor * dst) {
-@@ -11550,6 +11581,13 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
+@@ -12119,6 +12150,13 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
      const int64_t ir0 = dr * ith;
      const int64_t ir1 = MIN(ir0 + dr, nr);
  
@@ -147,10 +147,10 @@ index 7be3f83ef..1e0c3557a 100644
      int i = 0;
      ggml_float sum = 0;
 diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
-index 520da85ee..d58b662fe 100644
+index ae24c42a6..32eb13c2b 100644
 --- a/ggml/src/ggml-cpu/vec.h
 +++ b/ggml/src/ggml-cpu/vec.h
-@@ -1540,6 +1540,9 @@ inline static void ggml_vec_geglu_bf16(const int n, ggml_bf16_t * y, const ggml_
+@@ -1656,6 +1656,9 @@ inline static void ggml_vec_geglu_bf16(const int n, ggml_bf16_t * y, const ggml_
  
  void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g);
  

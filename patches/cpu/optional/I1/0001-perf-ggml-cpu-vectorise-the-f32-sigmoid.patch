@@ -1,4 +1,4 @@
-From 007cf4f87c55b261ca337517e44d27aa9ab8fb4c Mon Sep 17 00:00:00 2001
+From bb76905934925dc96cf4421d78dfe8579ed1177e Mon Sep 17 00:00:00 2001
 From: Vortiago <atle@havso.net>
 Date: Mon, 5 Oct 2026 13:41:14 +0200
 Subject: [PATCH] perf(ggml-cpu): vectorise the f32 sigmoid
@@ -135,7 +135,7 @@ index 3918a6f4d..7be3f83ef 100644
      int i = 0;
  #if defined(__AVX512F__) && defined(__AVX512DQ__)
 diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
-index 59fa88f2c..520da85ee 100644
+index ff3286a4b..ae24c42a6 100644
 --- a/ggml/src/ggml-cpu/vec.h
 +++ b/ggml/src/ggml-cpu/vec.h
 @@ -73,6 +73,7 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t *
@@ -146,7 +146,7 @@ index 59fa88f2c..520da85ee 100644
  ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean); //it will also center y ( y = y - mean )
  ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max);
  ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max);
-@@ -933,7 +934,6 @@ inline static void ggml_vec_leaky_relu_f16 (const int n, ggml_fp16_t * y, const
+@@ -1049,7 +1050,6 @@ inline static void ggml_vec_leaky_relu_f16 (const int n, ggml_fp16_t * y, const
          y[i] = GGML_CPU_FP32_TO_FP16(((v > 0.f) ? v : 0.f) + ns * ((v < 0.0f) ? v : 0.f));
      }
  }
@@ -154,7 +154,7 @@ index 59fa88f2c..520da85ee 100644
  inline static void ggml_vec_sigmoid_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
      for (int i = 0; i < n; ++i) {
          y[i] = GGML_CPU_FP32_TO_FP16(1.f / (1.f + expf(-GGML_CPU_FP16_TO_FP32(x[i]))));
-@@ -1143,6 +1143,16 @@ inline static svfloat32_t ggml_v_silu(svbool_t pg, svfloat32_t x) {
+@@ -1259,6 +1259,16 @@ inline static svfloat32_t ggml_v_silu(svbool_t pg, svfloat32_t x) {
      return svdiv_f32_x(pg, x, one_plus_exp_neg_x);
  }
  
@@ -171,7 +171,7 @@ index 59fa88f2c..520da85ee 100644
  #elif defined(__ARM_NEON) && defined(__aarch64__)
  
  // adapted from arm limited optimized routine
-@@ -1182,6 +1192,16 @@ inline static float32x4_t ggml_v_silu(float32x4_t x) {
+@@ -1298,6 +1308,16 @@ inline static float32x4_t ggml_v_silu(float32x4_t x) {
      return vdivq_f32(x, one_plus_exp_neg_x);
  }
  
@@ -188,7 +188,7 @@ index 59fa88f2c..520da85ee 100644
  #elif defined(__AVX512F__) && defined(__AVX512DQ__)
  
  // adapted from arm limited optimized routine
-@@ -1225,6 +1245,16 @@ inline static __m512 ggml_v_silu(__m512 x) {
+@@ -1341,6 +1361,16 @@ inline static __m512 ggml_v_silu(__m512 x) {
      return _mm512_div_ps(x, one_plus_exp_neg_x);
  }
  
@@ -205,7 +205,7 @@ index 59fa88f2c..520da85ee 100644
  #elif defined(__AVX2__) && defined(__FMA__)
  
  // adapted from arm limited optimized routine
-@@ -1280,6 +1310,16 @@ inline static __m256 ggml_v_silu(__m256 x) {
+@@ -1396,6 +1426,16 @@ inline static __m256 ggml_v_silu(__m256 x) {
      return _mm256_div_ps(x, one_plus_exp_neg_x);
  }
  
@@ -222,7 +222,7 @@ index 59fa88f2c..520da85ee 100644
  #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON
  
  #if defined(__FMA__)
-@@ -1334,6 +1374,16 @@ inline static __m128 ggml_v_silu(__m128 x) {
+@@ -1450,6 +1490,16 @@ inline static __m128 ggml_v_silu(__m128 x) {
      return _mm_div_ps(x, one_plus_exp_neg_x);
  }
  
@@ -239,7 +239,7 @@ index 59fa88f2c..520da85ee 100644
  #elif defined(__riscv_v_intrinsic)
  
  // adapted from arm limited optimized routine
-@@ -1386,6 +1436,14 @@ inline static vfloat32m2_t ggml_v_silu_m2(vfloat32m2_t x, int vl) {
+@@ -1502,6 +1552,14 @@ inline static vfloat32m2_t ggml_v_silu_m2(vfloat32m2_t x, int vl) {
      return __riscv_vfdiv_vv_f32m2(x, one_plus_exp_neg_x, vl);
  }
  
