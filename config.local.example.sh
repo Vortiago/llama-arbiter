@@ -62,6 +62,12 @@
 # router refuses a table with nothing to prefill on, nothing to generate on,
 # or an instance that does neither.
 #
+# "prefill" can also list the paths an instance reads for. It is then the
+# generator for every other path. At least one instance must read every path.
+# koishi runs gpu0_0 with "prefill": ["/v1/systemone"]: a typed question
+# writes one token, so the gpu is one more reader there and loses nothing
+# as a generator.
+#
 #   [{"name": "gpu0_0", "url": "http://127.0.0.1:8080", "pref": 0,
 #     "prefill": false, "generate": true,  "node": 0},
 #    {"name": "cpu1_0", "url": "http://127.0.0.1:8081", "pref": 1,

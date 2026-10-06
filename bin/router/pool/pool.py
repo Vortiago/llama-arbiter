@@ -611,13 +611,13 @@ class Pool:
         print(f"[router] {name} is back in service", flush=True)
         return True
 
-    def largest(self):
+    def largest(self, path=None):
         """The largest prompt any prefiller will read. A generator's ctx does
         not count: a conversation pinned to one spills to a prefiller."""
         return max([be["n_ctx"] for be in self.backends
-                    if be["up"] and prefills(be)], default=0)
+                    if be["up"] and prefills(be, path)], default=0)
 
-    def acquire(self, conv, tokens, alive=None):
+    def acquire(self, conv, tokens, alive=None, path=None):
         """Take a slot on the backend holding this conversation. Answers
         (backend, slot), or None.
 
@@ -635,13 +635,13 @@ class Pool:
                 target = next((b for b in self.backends if b["name"] == pinned), None)
 
                 if target:
-                    if prefills(target) and self._usable(target, tokens):
+                    if prefills(target, path) and self._usable(target, tokens):
                         got = self._take(target, conv, tokens)
                         if got:
                             return got
                     # A fifth of turns re-read everything: prefillers only.
                     if (not target["up"] or tokens > target["n_ctx"]
-                            or not prefills(target)):
+                            or not prefills(target, path)):
                         spill = True          # it can never take this request
                         target = None
                 else:
@@ -649,7 +649,7 @@ class Pool:
 
                 if not target:
                     free = [b for b in self.backends
-                            if prefills(b) and self._usable(b, tokens)]
+                            if prefills(b, path) and self._usable(b, tokens)]
                     for be in sorted(free, key=self._reading_rank):
                         got = self._take(be, conv, tokens)
                         if got:
@@ -657,7 +657,7 @@ class Pool:
 
                 # Nothing that could serve this is up. Waiting cannot help.
                 served_by = target is not None or any(
-                    b["up"] and prefills(b) for b in self.backends)
+                    b["up"] and prefills(b, path) for b in self.backends)
                 if not served_by:
                     return None
                 if alive is not None and not alive():
@@ -1114,7 +1114,7 @@ class Pool:
         return len(kept)
 
     def hand_off(self, conv, source, tokens, remove=None, alive=None,
-                 migrate=True):
+                 migrate=True, path=None):
         """Move a conversation to the backend it generates on.
 
         The prefiller is released before the wait to generate. The other
@@ -1140,7 +1140,7 @@ class Pool:
             return self._stay(source, "the handoff is turned off")
         if not migrate and generates(source):
             return self._stay(source, "this turn is not worth carrying")
-        target = self.generator(tokens)
+        target = self.generator(tokens, path)
         while target is None and not generates(source):
             # Nothing to carry this to, and the instance holding it does
             # not generate. Wait, holding a prefill slot.
@@ -1151,7 +1151,7 @@ class Pool:
                 raise Gone("while it waited for a slot to generate in")
             with self.cv:
                 self.cv.wait(1.0)
-            target = self.generator(tokens)
+            target = self.generator(tokens, path)
         if target is None or target is source:
             return self._stay(source, "nothing that generates can take it")
         with self.cv:
@@ -1183,7 +1183,7 @@ class Pool:
                 return source
             # `generate: false` is an operator's setting. The turn is parked
             # on disk, the cheapest place to wait. Wait for a generator.
-            target = self.generator(tokens)
+            target = self.generator(tokens, path)
             if target is None:
                 with self.cv:
                     self.cv.wait(1.0)
@@ -1227,14 +1227,14 @@ class Pool:
                   f"not to: {why}", flush=True)
         return source
 
-    def generator(self, tokens):
+    def generator(self, tokens, path=None):
         """The backend turns migrate to after their prompt is read, or None:
         one that generates and does not prefill. Where every instance does
         both, a turn generates where it read. None also when the configured
         one is down, draining or too small."""
         with self.cv:
             for be in sorted(self.backends, key=lambda b: b["pref"]):
-                if prefills(be) or not generates(be):
+                if prefills(be, path) or not generates(be):
                     continue
                 if be["up"] and not be.get("draining") and tokens <= be["n_ctx"]:
                     return be
@@ -1262,7 +1262,7 @@ class Pool:
             with self.cv:
                 self.to_generate -= 1
 
-    def park_later(self, be, conv, ticket, remove=None):
+    def park_later(self, be, conv, ticket, remove=None, path=None):
         """Copy a cache out of a backend that cannot read it, on a worker: the
         copy runs to gigabytes and the client already has its reply.
         `parking` reserves the record before this returns. The turn ticket
@@ -1270,7 +1270,7 @@ class Pool:
         restores from. Returns False, with the ticket still the caller's,
         when there is nothing to copy."""
         remove = remove or self.store.drop
-        if prefills(be):
+        if prefills(be, path):
             return False              # it can be read again here
         with self.cv:
             if self.stopping:

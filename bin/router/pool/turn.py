@@ -127,7 +127,7 @@ class Turn:
                                                     pool.tuning)
         # `tokens` carries reply_tokens of room the client never sent.
         prompt_tokens = max(0, tokens - pool.tuning.reply_tokens)
-        largest = pool.largest()
+        largest = pool.largest(ask.path)
         if largest and tokens > largest:
             return client.fail(413, f"needs about {tokens} tokens. "
                                     f"The largest backend holds {largest}.")
@@ -162,7 +162,7 @@ class Turn:
         mine = False
         try:
             mine = pool.claim_turn(conv, ticket, client.alive, work)
-            got = pool.acquire(conv, tokens, client.alive) if mine else None
+            got = pool.acquire(conv, tokens, client.alive, ask.path) if mine else None
         except BaseException:
             # The same ending as the branch below, for a way out nobody
             # planned. finish_turn matches on the ticket, so it is a no-op
@@ -219,7 +219,8 @@ class Turn:
                 pool.note_slot(conv, slot)
                 serving = pool.hand_off(conv, be, tokens,
                                         alive=client.alive,
-                                        migrate=not ask.plan)
+                                        migrate=not ask.plan,
+                                        path=ask.path)
                 if serving is None:
                     raise Gone("after its prompt was parked")
             if serving is be:
@@ -251,7 +252,8 @@ class Turn:
                 if left:
                     pool.park_partial(conv, be, slot)
                 if serving is not None:
-                    parking = pool.park_later(serving, conv, ticket)
+                    parking = pool.park_later(serving, conv, ticket,
+                                              path=ask.path)
             except Exception as err:
                 # claim_turn has no deadline, so the lines below must run.
                 print(f"[router] {short} could not be put away: {err}",

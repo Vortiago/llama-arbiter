@@ -44,6 +44,9 @@ def read_backend_table(env=None):
         if not any(be[job] for be in table):
             raise SystemExit(f"[router] no backend in {whence} can "
                              f"{job}, so no request could be served")
+    if not any(be["prefill"] is True for be in table):
+        raise SystemExit(f"[router] no backend in {whence} reads every path, "
+                         f"so some request could not be served")
     # A turn leaves its reader only through the handoff.
     if not handoff_on(env) and not all(be["generate"] for be in table):
         raise SystemExit("[router] the handoff is off, which keeps every turn "
@@ -52,9 +55,16 @@ def read_backend_table(env=None):
     return table, whence
 
 
-def prefills(be):
-    """May a new conversation have its prompt read on this backend."""
-    return be.get("prefill", True)
+def prefills(be, path=None):
+    """May a prompt sent to this path be read on this backend.
+
+    `prefill` is true, false, or the paths the backend reads for. A gpu that
+    reads only typed questions stays the generator for every other turn.
+    No path asks whether it reads anything at all."""
+    said = be.get("prefill", True)
+    if isinstance(said, list):
+        return bool(said) if path is None else path in said
+    return bool(said)
 
 
 def generates(be):

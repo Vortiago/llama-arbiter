@@ -319,6 +319,44 @@ class ItStaysWhereItRead(EndToEnd):
         self.assertEqual([c["key"] for c in self.gpu.answers], ["talker"])
 
 
+class AReaderForSomePathsOnly(EndToEnd):
+    """`prefill` may name the paths a backend reads for.
+
+    The gpu reads no faster than a cpu socket, so it is worth more as the
+    generator of a chat turn. A typed question writes one token, so there
+    nothing is lost when the gpu reads it, and it is one more lane."""
+
+    def setUp(self):
+        super().setUp()
+        self.duo = self.pool([self.stub("gpu", 0, prefill=[router.SYSTEMONE]),
+                              self.stub("cpu", 1)])
+        self.url = self.serve(self.duo)
+
+    def test_a_typed_question_reads_and_answers_there(self):
+        """Once the cpu is busy. A free cpu still comes first, which keeps
+        the gpu free to generate."""
+        self.cpu.hold()
+        self.start_turn(self.url, "talker")
+        self.assertTrue(wait_for(lambda: self.backend(self.duo, "cpu")["busy"] == 1),
+                        "the chat turn never reached the cpu")
+        try:
+            said = typed_call(self.url, {
+                "model": "fake-model", "prompt_cache_key": "asker",
+                "state": "cpu1_0 read 150000 tokens",
+                "questions": {"ok": {"instructions": "Healthy?"}}})
+        finally:
+            self.cpu.release()
+        self.assertEqual(said["router"]["backend"], "gpu")
+        self.assertEqual([c["key"] for c in self.gpu.probes], ["asker"])
+
+    def test_a_chat_turn_reads_elsewhere_and_still_generates_there(self):
+        self.turn(self.url, "talker")
+        self.assertEqual([c["key"] for c in self.cpu.probes], ["talker"])
+        self.assertEqual(self.gpu.probes, [], "the gpu read a chat prompt")
+        self.assertEqual([c["key"] for c in self.gpu.answers], ["talker"],
+                         "the gpu is no longer the chat generator")
+
+
 class UnlessTheReaderMayNotAnswer(EndToEnd):
     """A reader set `generate: false` is not overruled by this endpoint.
 

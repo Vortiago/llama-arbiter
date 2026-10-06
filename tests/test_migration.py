@@ -2982,6 +2982,17 @@ class TheBackendTableIsCheckedAtStartup(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("can prefill", said)
 
+    def test_a_table_where_every_reader_names_its_paths_is_refused(self):
+        """A chat turn would find no backend to read it."""
+        code, said = self.loading([self.row("gpu", prefill=["/v1/systemone"])])
+        self.assertNotEqual(code, 0)
+        self.assertIn("reads every path", said)
+
+    def test_a_reader_for_some_paths_beside_one_for_all_loads(self):
+        code, said = self.loading([self.row("gpu", prefill=["/v1/systemone"]),
+                                   self.row("cpu", pref=1)])
+        self.assertEqual(code, 0, said)
+
     def test_a_table_with_nothing_to_generate_on_is_refused(self):
         code, said = self.loading([self.row("pre", generate=False)])
         self.assertNotEqual(code, 0)
