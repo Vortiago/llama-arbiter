@@ -2,8 +2,13 @@
 
 This page reports the work to make Qwen3.8-Flash-Next (`qwen4exp`, Q8_0) faster
 on the CPU backends. The machine is one EPYC 7502P with 32 cores and no GPU.
-The numbers are from bench queues 1 to 7, on 5 and 6 October 2026. Rows marked
+The numbers are from bench queues 1 to 9, on 5 and 6 October 2026. Rows marked
 **pending** wait for a later run.
+
+On this box the core set reads an 8k prompt 37% faster than `B-main`, in one
+backend with the server's flags, at KLD 0. Stack4, which is core with I1 and
+Q1, reads a restored slot about twice as fast at 128k and 240k. Stack2, the
+bit-exact part of core, generates 20 to 24% faster with MTP.
 
 ## What was asked, and what we found
 
@@ -32,6 +37,7 @@ gives each patch with its tier.
 | `perf/stack3` | `perf/stack2` + I1, Q1 |
 | `perf/stack4` | `perf/stack3` + K3, U4, K1: the final stack |
 | `perf/stack4-noX3` | `perf/stack4` without X3, for the paired X3 test |
+| `perf/stack4-noU4dec` | `perf/stack4` without U4's batch-1 decode attention, for the U4 test of queue 9 |
 | `perf/s2-<id>-*` | `perf/stack2` + one candidate, for a paired test or its quality alone |
 | `perf/K1-sparse-fa-tiled-prefill` | `perf/U4-batch1-decode-attn` + K1, with the bit-exact fix |
 
@@ -49,8 +55,8 @@ process, so two builds never share the CPU.
 | kernel | `llama-bench`, 32 threads, flash attention on: prompts of 512 and 2048 tokens (pp512, pp2048), 128 generated tokens (tg128) | tok/s |
 | prefill | one backend with the prefill backend's flags (32 threads, ubatch 512) reads an 8k prompt | prompt tok/s |
 | pair | two prefill backends on the same cores, as pre0 and pre1 run, each read their own 8k prompt at the same moment | prompt tok/s of each, and of both over the slower one's time |
-| generate | one backend with the generator's flags (16 threads) and the MTP draft, n-max 3, writes 512 or 256 tokens for 3 prompts | tok/s, acceptance, hash of a greedy reply |
-| depth | a backend restores a saved slot of 32k or 128k tokens, reads about 1800 more and writes 256. At 128k it reads on 32 threads (`--threads-batch 32`), as the prefill backends do. | prompt tok/s, tok/s |
+| generate | one backend with the generator's flags (16 threads) and the MTP draft, n-max 3, writes 512 or 256 tokens for 3 prompts, or for the 16 prompts of `prompts-16.json` | tok/s, acceptance, hash of a greedy reply |
+| depth | a backend restores a saved slot of 32k, 128k or 240k tokens, reads about 1800 more and writes 256. At 128k and 240k it reads on 32 threads (`--threads-batch 32`), as the prefill backends do. Since the end of queue 7 the reply ignores the end-of-generation token, so each rep writes all 256. | prompt tok/s, tok/s |
 | quality | `llama-perplexity` on wikitext against the logits of `B-main`, contexts 512 and 8192 | mean KL divergence (KLD), same top token %, perplexity (PPL) ratio |
 
 Five rules keep the numbers honest:
@@ -84,20 +90,33 @@ python3 tools/perf-ab.py report --ref B-main
 
 ### The stacks against `B-main`
 
-| build | pp512 | pp2048 | tg128 | 8k prefill | 32k depth read | 128k depth read | quality |
-|---|---|---|---|---|---|---|---|
-| `B-main` | 64.8 | 63.3 | 9.07 | 44.1 | 24.0 | 18.3 to 19.8 | reference |
-| stack1 (X1, X3, I4A, I4B, M3) | +11.8% | +13.2% | +18.5% | +8.2% | +8.8% | not run | KLD 0, top 100% |
-| stack2 | +46.3% | +44.7% | +24.6% | +31.7% | not run | not run | KLD 0, top 100% at 512 and 8192 |
-| stack3 | +47.0% | +40.0% | +27.1% | +31.8% | 30.2 (+25.6%) | 22.4, 22.7 | KLD 0.020 and 0.019, top 95.8% and 96.6%, PPL ratio 0.9992 ± 0.0037 at 512 |
-| stack4 | *paired* against stack3: +1.9% | *paired* against stack3: +3.0% | +29.4% | **59.4 to 60.9 (+38.2%)** | not run | **38.4, 38.9** | KLD 0.020 and 0.019, top 95.8% and 96.6%, PPL ratio 0.9992 ± 0.0037 at 512 and 1.0045 ± 0.0028 at 8192 |
-| stack4, 240k depth | | | | | | **pending** | |
+| build | pp512 | pp2048 | tg128 | 8k prefill | 32k depth read | 128k depth read | 240k depth read | quality |
+|---|---|---|---|---|---|---|---|---|
+| `B-main` | 64.8 | 63.3 | 9.07 | 44.1 | 24.0 | 18.3 to 19.8 | 18.2, 18.1 | reference |
+| stack1 (X1, X3, I4A, I4B, M3) | +11.8% | +13.2% | +18.5% | +8.2% | +8.8% | not run | not run | KLD 0, top 100% |
+| stack2 | +46.3% | +44.7% | +24.6% | +31.7% | not run | not run | not run | KLD 0, top 100% at 512 and 8192 |
+| stack3 | +47.0% | +40.0% | +27.1% | +31.8% | 30.2 (+25.6%) | 22.4, 22.7 | not run | KLD 0.020 and 0.019, top 95.8% and 96.6%, PPL ratio 0.9992 ± 0.0037 at 512 |
+| stack4 | *paired* against stack3: +1.9% | *paired* against stack3: +3.0% | +29.4% | **59.4 to 60.9 (+38.2%)** | not run | **38.4, 38.9** | **36.6, 38.2** | KLD 0.020 and 0.019, top 95.8% and 96.6%, PPL ratio 0.9992 ± 0.0037 at 512 and 1.0045 ± 0.0028 at 8192 |
+| core | +44.2% | +45.3% | +25.9% | **60.1 to 60.4 (+36.9%)** | not run | not run | not run | KLD 0, top 100% at 512 and 8192, PPL ratio 1.0004 ± 0.0004 at 512 and 1.0001 ± 0.0001 at 8192 |
+| core with I1 and Q1 | *paired* against core: +3.4% | *paired* against core: +1.5% | *paired* against core: +2.7% | *paired* against core: +1.5% | not run | not run | not run | KLD 0.019, top 96.6%, PPL ratio 1.0045 ± 0.0028 at 8192 |
 
 The `B-main` row is in tok/s, and so are the depth cells. The 128k read of
 `B-main` comes from two runs of 2 reps: 19.1 and 18.3, then 19.8 and 19.2.
 Stack4 reads a restored 128k slot about twice as fast as `B-main`, and 71%
 faster than stack3. Of the three changes from stack3 to stack4, K1 is the one
 that targets the read at depth.
+
+At 240k the fill read 226,745 tokens at 22.4 tok/s on average, in about 2
+hours 50 minutes. The `B-main` cell is the rerun, which restores the saved slot
+in a new process. The first run read in the process that did the fill, at
+16.4 tok/s, so it is not comparable. Stack4 reads the restored 240k slot 2.0 to
+2.1 times as fast as `B-main`.
+
+At 240k, rep 0 of `B-main` wrote 4.73 tok/s at acceptance 0.45, and rep 0 of
+stack4 wrote 5.13 tok/s at 0.38. Rep 1 of `B-main` wrote 3.53 tok/s at 0.31.
+Rep 1 of stack4 wrote one token, because its first sampled token ended the
+reply, so it has no generate rate. The depth test has ignored the
+end-of-generation token since then.
 
 In a single run in queue 5, stack4 did pp512 at 89.5 against 95.3 for stack3
 in queue 4. The paired test in queue 7 settles it: stack4 is 1.9% faster on
@@ -106,8 +125,9 @@ pp512, and +5.9% and -0.4% on pp2048.
 
 At 512 tokens stack1 generates 17.5 to 21.4% faster than `B-main`, and stack2
 20.4 to 23.5% faster. Stack2 is bit-exact end to end: its greedy replies hash
-the same as `B-main` on all three prompts. Stack3 and stack4 are not, because of I1 and Q1, so
-their generate rate is not a like-for-like comparison. Against `B-main` at 256
+the same as `B-main` on all three prompts. Stack3 is not, because of I1 and
+Q1, and stack4 is not, because of I1, Q1 and U4. Their generate rate is
+therefore not a like-for-like comparison. Against `B-main` at 256
 tokens (6.7 to 9.8 tok/s), stack3 generates 7.6 to 48.0% faster and stack4
 30.3 to 42.1% faster. The acceptance moves with the reply: on `explain`
 stack3 accepts 0.448 against 0.559 for `B-main`.
@@ -133,7 +153,7 @@ experts.
 | W1 | splits `concat` over destination rows and tiles a transposed source | prefill | pp512 +17.7%, 8k prefill +10.6%, tg128 +3.6% | bit-exact (219 cases) | core |
 | W2 | walks `dsv4_hc_post` one stream row at a time, splits norm rows over every dimension | prefill | pp512 +7.3%, 8k prefill +6.6% | bit-exact (464 cases) | core |
 | K3 | fuses the MoE weighted reduction (port of the CUDA fusion) | prefill | *paired* on stack2: pp512 +2.6%, pp2048 +3.2%, 8k prefill +0.7% | bit-exact (306 cases) | core |
-| U4 | batch-1 decode attention (port of upstream #27478), and 2 MiB aligned host buffers with huge pages | generate | tg128 +1.7%, generate -15.5 to +4.7%, 32k depth read +5.1% | numerically close: 4574 of 5317 cases differ. KLD 0 at 8192, but perplexity reads in batches and does not run this path. Greedy replies differ. | core |
+| U4 | batch-1 decode attention (port of upstream #27478), and 2 MiB aligned host buffers with huge pages | generate | tg128 +1.7%, generate -15.5 to +4.7%, 32k depth read +5.1%. *Paired* on stack4, 16 prompts: generate +0.9% ± 1.8%, acceptance +0.007 ± 0.016 | numerically close: 4574 of 5317 cases differ. KLD 0 at 8192, but perplexity reads in batches and does not run this path. Greedy replies differ. | core |
 | K1 | honours the `n_kv_max` sparse hint in tiled flash-attention prefill | prefill at depth | on U4: 32k depth read +27.6% (30.7 against 24.0 tok/s) | bit-exact against U4 (5338 cases, 32 and 16 threads). KLD 0, PPL ratio 1.0001 at 8192 | core |
 | I1 | SIMD sigmoid, and a vectorised gated `dsv4_hc_pre` | prefill | *paired* on stack2: pp512 +2.4%, 8k prefill +1.7% | numerically close: 10 of 162 cases differ, max error 1.2e-7. On stack2: KLD 0.020, top 96.0%, PPL ratio 0.9972 ± 0.0037 at 512 | optional |
 | Q1 | sorts only the top k of an `argsort_top_k` row (MoE router) | generate | *paired* on stack2: tg128 +1.3%, generate +0.9 to +3.2% | bit-exact (1047 cases). On stack2: KLD 0.002, top 99.5%, PPL ratio 0.9984 ± 0.0015 at 512 | optional |
@@ -172,22 +192,17 @@ attention case. The 32k read drops from 34.5 to 30.7 tok/s, because 94% of
 the tiles are live against 69% of the cells.
 
 **X3 holds in the real model.** In the microbenchmark below, stack3's expert
-matmuls took 5 to 17% longer than mainline's at 1 and 4 tokens on 32 threads. Queue 6 ran
-stack4 against stack4 without X3, in three alternating rounds of 2 reps at 256
-tokens. With X3, generate is 6.4%, 7.3% and 6.1% faster on the three prompts
-by the median, and 5.3 to 6.1% by the mean. The rounds ranged from +1.3% to
-+10.5%. Both sides write the same greedy replies, by hash, and accept the
-same share of drafts.
+matmuls took 5 to 17% longer than mainline's at 1 and 4 tokens on 32 threads.
+Queue 6 ran stack4 against stack4 without X3, in three alternating rounds of
+2 reps at 256 tokens. With X3, generate is 6.4%, 7.3% and 6.1% faster on the
+three prompts by the median, and 5.3 to 6.1% by the mean. The rounds ranged
+from +1.3% to +10.5%. Both sides write the same greedy replies, by hash, and
+accept the same share of drafts.
 
 **The depth test repeats.** `B-main` at 32k read 24.0 tok/s in queue 2 and 23.8
 in queue 4. At 128k its two runs read 18.7 and 19.5 tok/s. Generate at depth
 is not a result: its rate follows the reply and the acceptance, which vary
 from 0.19 to 0.72 between reps.
-
-**A 128k fill outlives a request.** At about 26 tok/s a 123k-token fill takes
-78 minutes. The 30-minute request timeout cut it off in queue 5, so no slot was
-saved and every depth run after it failed. The fill now waits up to 6 hours,
-and queue 7 ran the 128k depth.
 
 **Flags on stack3, each against stack3 in the same queue:**
 
@@ -208,6 +223,70 @@ test on stack4 at ubatch 512 and 2048, in two alternating rounds:
 
 The load average was 44 to 61 during the test, from other containers. The
 result is inconclusive, so the prefill backends keep ubatch 512.
+
+### What queues 8 and 9 settled
+
+**The tiered patch set builds, and core alone gives KLD 0.** Queue 8 built the
+patch set as a user does, with `tools/get-llama.sh`: core alone (`CORE`), and
+core with `CPU_OPTIONAL="I1 Q1"` (`FULL`). The tree of `FULL` equals
+`perf/stack4`. Core gives KLD 0 at 512 and 8192, with the same top token at
+every position. Its PPL ratio is 1.0004 ± 0.0004 at 512. At 8192 it is
+1.0001, the floor of the stored base logits, so a bit-exact build reads no
+lower. `FULL` gives KLD 0.019 and PPL ratio 1.0045 ± 0.0028 at 8192.
+
+The speed test ran `CORE` and `FULL` in 2 alternating rounds. Each cell is the
+median over both rounds:
+
+| test | `CORE` | `CORE` against `B-main` | `FULL` against `CORE` | `FULL` against `CORE`, by round |
+|---|---|---|---|---|
+| pp512 | 93.4 | +44.2% | +3.4% | +4.3%, +2.8% |
+| pp2048 | 92.0 | +45.3% | +1.5% | +1.8%, -3.1% |
+| tg128 | 11.42 | +25.9% | +2.7% | +3.1%, +2.2% |
+| 8k prefill | 60.3 | +36.9% | +1.5% | +1.8%, +1.5% |
+
+`CORE` against `B-main` is against the `B-main` median over every round, so
+drift applies to it. The generate test is not a speed comparison between
+`CORE` and `FULL`. The two builds write different texts, by hash, on all three
+prompts, and they accept a different share of drafts. `FULL` accepts 0.535
+against 0.423 on `explain`, and writes 17.8% faster there. `CORE` does not
+write the text of `B-main` either, because of U4.
+
+The arbiter's tests pass on the core build: 577 unit tests, and the 66 live
+tests in `tests/live` with small models. One live test expected the old
+fork's error text for a state too big to restore. Commit 3b270e4 changed it to
+the wording of master.
+
+**U4's decode change does not move MTP acceptance.** On three prompts U4
+generated -15.5 to +4.7% against `B-main`, and `explain` accepted 13.7% less.
+Queue 9 ran stack4 against `perf/stack4-noU4dec` on 16 prompts, in 2
+alternating rounds with MTP and one round without. Each figure is the mean
+over the 16 prompts, with its standard error:
+
+| measure | U4 against no U4 |
+|---|---|
+| acceptance | 0.626 against 0.619, difference +0.007 ± 0.016 |
+| generate with MTP | +0.9% ± 1.8% |
+| generate without MTP | +0.1% ± 0.5% |
+| greedy text | differs on 14 of 16 prompts with MTP |
+
+U4 changes the text, but it costs no acceptance and gains no generate speed at
+short context. U4 stays in core. Its gain is at depth: the 32k depth read is
+5.1% faster.
+
+### Lessons for the bench
+
+- **Compare generate speed only between builds that write the same text.**
+  The acceptance follows the text, so a build that samples another reply
+  generates at another rate. When the texts differ, compare over many
+  prompts, as queue 9 does.
+- **A depth fill takes hours.** A 123k-token fill takes 78 minutes at about
+  26 tok/s, and the 240k fill took about 2 hours 50 minutes. In queue 5 the
+  30-minute request timeout cut off the 128k fill, so no slot was saved and
+  every depth run after it failed. The fill now waits up to 6 hours.
+- **Compare a depth run only with runs that restore the slot in a new
+  process.** A run in the process that did the fill reads slower. At 240k it
+  read 16.4 tok/s against 18.2 and 18.1 for the rerun. At 128k the gap was
+  smaller: 19.1 and 18.3 against 19.8 and 19.2.
 
 ### The expert matmul microbenchmark
 
@@ -246,8 +325,7 @@ pp2048 87.3 and tg128 11.5 tok/s (`ik-rtr0.md`, not in the TSV). Stack3 did
 
 | cell | why |
 |---|---|
-| depth 240k: `B-main` and stack4 | queue 7 runs it now |
-| core alone: kernel, prefill, generate, quality | core is stack4 without I1 and Q1, and no build of it exists yet |
+| core alone at depth | only stack4 ran at 128k and 240k |
 | U4's 2 MiB alignment: startup time and `compact_stall` | its commit asks for both before it is kept |
 | M5 at depth | its cost grows with depth |
 
@@ -285,9 +363,10 @@ attention by an NMSE (normalised mean squared error) of at most 1e-4. QSA picks
 its pool and the router picks 10 experts by top-k, so a tiny change can flip
 one pick. After that the hidden state takes another path. U4 has a mean KLD of
 0 at 8192, but all three greedy replies change and `explain` acceptance falls
-13.7%. The first K1 showed the same as a KLD of 0.0167 with 96.9% same top
-token. Treat a numerically close patch as a quality change, and test it with
-KLD, PPL and greedy.
+13.7%. Over 16 prompts the mean acceptance does not move (queue 9). The
+first K1 showed the same as a KLD of 0.0167 with 96.9% same top token. Treat
+a numerically close patch as a quality change, and test it with KLD, PPL and
+greedy.
 
 **Flags on stack2, against stack2's own generate and prefill:**
 
