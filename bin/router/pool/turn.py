@@ -204,7 +204,9 @@ class Turn:
             loaded = (not recalled
                       and pool.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, ask.path,
-                                           alive=client.alive))
+                                           alive=client.alive,
+                                           template=(asked or {}).get(
+                                               "chat_template_kwargs")))
             # warm_prefix was their last reader, and each holds a parsed
             # copy of the prompt. The read below runs for tens of minutes.
             messages = system = tools = None

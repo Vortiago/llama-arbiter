@@ -106,6 +106,12 @@ def prompt_cuts(body, tuning=None):
     tools = fields.get("tools")
     tools = tools if isinstance(tools, list) else []
     running = hashlib.sha256()
+    # They change what the template writes, so two requests that differ only
+    # here share no opening.
+    template = fields.get("chat_template_kwargs")
+    if template:
+        running.update(b"template\x00" + json.dumps(
+            template, sort_keys=True).encode("utf-8", "replace"))
     size = 0
     cuts = []
     # The template renders the tools inside the system block. For Claude

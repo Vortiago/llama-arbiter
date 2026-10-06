@@ -125,6 +125,43 @@ class AnOpeningIsRenderedByItsOwnProtocol(unittest.TestCase):
         self.assertEqual(set(asked), {"/v1/messages/apply-template"})
 
 
+class AnOpeningRendersWithTheRequestsTemplateOptions(unittest.TestCase):
+    """`chat_template_kwargs` change what the template writes, and not only
+    at the end. Without `enable_thinking: false` this model's template puts
+    a line about reasoning effort at the top of the system prompt. An opening
+    rendered without the request's options shared 3 tokens with every typed
+    question, which then read all 4150 from the start."""
+
+    KWARGS = {"enable_thinking": False}
+
+    def test_the_render_carries_them(self):
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                           watch=False)
+        sent = []
+
+        class Rendering(FakeLink):
+            def render(inner, be, route, payload, alive, timeout=None):
+                sent.append(payload.get("chat_template_kwargs"))
+                return {"prompt": "rendered"}
+
+        pool._render_block("rules", [], [{"role": "user", "content": "hi"}],
+                           pool.backends[0], Rendering(),
+                           "/v1/chat/completions", lambda: True,
+                           template=self.KWARGS)
+        self.assertEqual(sent, [self.KWARGS, self.KWARGS])
+
+    def test_they_name_a_different_opening(self):
+        def keys(**extra):
+            body = dict(extra, messages=[
+                {"role": "system", "content": "rules " * 1000},
+                {"role": "user", "content": "hi"}])
+            cuts, _, _, _ = router.prompt_cuts(json.dumps(body))
+            return [key for _, key in cuts]
+
+        self.assertTrue(keys())
+        self.assertNotEqual(keys(), keys(chat_template_kwargs=self.KWARGS))
+
+
 class ARequestCanBeWrittenDown(unittest.TestCase):
     """A prompt that keeps re-reading is one whose start has changed.
 

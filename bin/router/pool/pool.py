@@ -928,7 +928,7 @@ class Pool:
         return True
 
     def warm_prefix(self, conv, cuts, messages, system, tools, be, slot,
-                    path, alive=None):
+                    path, alive=None, template=None):
         """Load the opening this request shares into a slot on this backend,
         or read and save the one nobody has yet. Returns True when an
         opening was loaded."""
@@ -1021,7 +1021,7 @@ class Pool:
             return self._wait_for_opening(plan[1], be, slot, alive)
         try:
             return self._read_prefix(base, messages, system, tools, be,
-                                     plan[3], path, alive)
+                                     plan[3], path, alive, template)
         finally:
             with self.cv:
                 self.building.pop(plan[1], None)
@@ -1439,7 +1439,7 @@ class Pool:
         return True
 
     def _read_prefix(self, cut, messages, system, tools, be, slot, path,
-                     alive):
+                     alive, template=None):
         """Read one opening into a slot, then keep a copy of the slot."""
         index, key = cut
         name = f"base-{key}.park"
@@ -1447,7 +1447,7 @@ class Pool:
         self.store.link_block(name)   # so the save lands on the faster disk
         try:
             block = self._render_block(system, tools, messages[:index + 1],
-                                       be, self.link, path, alive)
+                                       be, self.link, path, alive, template)
             # The zero-token reply's timings: tokens processed and cached.
             read = self.link.prefill(be, block, slot, alive,
                                      self.tuning.read_timeout) or {}
@@ -1495,13 +1495,19 @@ class Pool:
         return True
 
     @staticmethod
-    def _render_block(system, tools, head, be, link, path, alive):
+    def _render_block(system, tools, head, be, link, path, alive,
+                      template=None):
         """One opening, as the backend's own template renders it: what two
         renderings that differ only after the opening share. /apply-template
         refuses anthropic tool_use and tool_result blocks, so an opening from
         /v1/messages goes through the anthropic route."""
         route = template_route(path)
         extra = {"tools": tools} if tools else {}
+        # The request's template options. They can change the top of the
+        # prompt: this model's template writes a reasoning line into the
+        # system prompt unless thinking is off.
+        if template:
+            extra["chat_template_kwargs"] = template
         # The anthropic route takes the system prompt in its own field, where
         # llama.cpp normalises it: server-chat.cpp
         # normalize_anthropic_billing_header rewrites Claude Code's cch=<hash>
