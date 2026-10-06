@@ -4,8 +4,8 @@ import queue, threading, time
 from collections import Counter, OrderedDict, deque
 from ..backends import by_place, generates, prefills
 from ..identity import copy_is_current, last_used, short_key, worth_keeping
-from ..protocol.body import (common_prefix, deepest_shared, head_text,
-                             shared_start, start_key, template_route)
+from ..protocol.body import (common_prefix, deepest_shared, head_of,
+                             lead_key, shared_start, start_key, template_route)
 from ..settings import Tuning
 from ..sizing import VISION
 from ..store.backendlog import CacheWatch, read_config, read_vision
@@ -942,17 +942,16 @@ class Pool:
         or read and save the one nobody has yet. Returns True when an
         opening was loaded."""
         with self.cv:
-            if not cuts:
-                return False
             record = self.pins.get(conv)
             if record and (record.get("parked") or record["slot"] is not None):
                 return False       # its own cache is better
             saved = self.openings
-            stored = deepest_shared(cuts, saved)
+            stored = deepest_shared(cuts, saved) if cuts else None
 
-            base = cuts[0]
-            # The first cut is a system prompt by construction.
-            unsaved = base[1] not in saved
+            # The first cut is a system prompt by construction. A short one
+            # is no cut, and then there is no base.
+            base = cuts[0] if cuts else None
+            unsaved = base is not None and base[1] not in saved
             # Nobody has this opening: one request reads it, the others wait.
             plan = None
             if stored:
@@ -962,85 +961,97 @@ class Pool:
                     plan = ("wait", base[1], None, None)
                 else:
                     plan = ("read", base[1], None, slot)
-            # Deeper than the system prompt, into the message after it: a
+            # Deeper than the system prompt, into the first user message: a
             # start that message shares with an earlier one.
             start = None
-            head = head_text(messages, base[0])
-            if head is not None and (stored is None or stored[1] == base[1]):
-                found = self._stored_start(base[1], head)
+            lead = head_of(messages)
+            if lead and not unsaved and (stored is None or stored == base):
+                index, head = lead
+                anchor = lead_key(system, tools, messages[:index], template)
+                found = self._stored_start(anchor, head)
                 if found:
                     plan = ("load", found, saved[found], slot)
-                elif not unsaved:
-                    text = shared_start(head, self.heads.get(base[1], ()),
+                else:
+                    text = shared_start(head, self.heads.get(anchor, ()),
                                         self.tuning.system_min_chars)
-                    key = text and start_key(base[1], text)
+                    key = text and start_key(anchor, text)
                     if key and key not in self.building:
-                        start = (key, text)
-                        plan = ("start", key, saved[base[1]], slot)
-                kept = self.heads.setdefault(base[1], deque(maxlen=8))
+                        # The base opening ends where the start begins, so
+                        # it is loaded first and only the start is read.
+                        under = base if base and base[0] == index - 1 else None
+                        start = (key, text, anchor, index, under)
+                        plan = ("start", key, None, slot)
+                kept = self.heads.setdefault(anchor, deque(maxlen=8))
                 if head not in kept:
                     kept.append(head)
-            # Measurement only, both of these: how deep a fork could have
-            # started. `shared` needs the parent to hold a slot, so the rate
-            # it shows is a floor. A parked copy restores as an opening does.
-            seen = set().union(*self.holds.values()) if self.holds else set()
-            shared = deepest_shared(cuts, seen)
-            copied, copied_from = None, None
-            for other, other_pin in self.pins.items():
-                if other == conv or not other_pin.get("parked"):
-                    continue
-                hit = deepest_shared(cuts, other_pin.get("holds") or ())
-                if hit and hit[1] != base[1] and (copied is None
-                                                  or hit[0] > copied[0]):
-                    copied, copied_from = hit, other
+            if not cuts:
+                if plan is None:
+                    return False
+                if plan[0] == "start":
+                    self.building[plan[1]] = time.time()
+            if cuts:
+                # Measurement only, both of these: how deep a fork could have
+                # started. `shared` needs the parent to hold a slot, so the rate
+                # it shows is a floor. A parked copy restores as an opening does.
+                seen = set().union(*self.holds.values()) if self.holds else set()
+                shared = deepest_shared(cuts, seen)
+                copied, copied_from = None, None
+                for other, other_pin in self.pins.items():
+                    if other == conv or not other_pin.get("parked"):
+                        continue
+                    hit = deepest_shared(cuts, other_pin.get("holds") or ())
+                    if hit and hit[1] != base[1] and (copied is None
+                                                      or hit[0] > copied[0]):
+                        copied, copied_from = hit, other
 
-            self.choices[conv] = {"cuts": len(cuts),
-                                  "stored": stored[0] if stored else None,
-                                  "shared": shared[0] if shared else None,
-                                  "copied": copied[0] if copied else None,
-                                  "held": len(seen)}
-            self.choices.move_to_end(conv)
-            while len(self.choices) > self.tuning.recent_requests:
-                self.choices.popitem(last=False)
+                self.choices[conv] = {"cuts": len(cuts),
+                                      "stored": stored[0] if stored else None,
+                                      "shared": shared[0] if shared else None,
+                                      "copied": copied[0] if copied else None,
+                                      "held": len(seen)}
+                self.choices.move_to_end(conv)
+                while len(self.choices) > self.tuning.recent_requests:
+                    self.choices.popitem(last=False)
 
-            # A request sharing more than the base opening has branched off
-            # somebody's session. The pins say whose slot holds the deep cut.
-            if shared and shared[1] != base[1]:
-                holder = next((c for c, p in self.pins.items()
-                               if shared[1] in self.holds.get(
-                                   (p["backend"], p["slot"]), ())), None)
-                if holder and holder != conv \
-                        and self.forked.get(conv) != (holder, shared[0]):
-                    self.forked[conv] = (holder, shared[0])
-                    # Assigning an existing key does not move it. Without
-                    # this the dedupe above wrote the same fork twice.
-                    self.forked.move_to_end(conv)
-                    while len(self.forked) > self.tuning.recent_requests:
-                        self.forked.popitem(last=False)
-                    self.events.write("fork", conv=short_key(conv),
-                                 parent=short_key(holder), depth=shared[0],
-                                 cuts=len(cuts))
-            # The cut keys, so an offline report can match them to copies.
-            self.events.write("choice", conv=short_key(conv),
-                         base=short_key(base[1]),
-                         stored=stored[0] if stored else None,
-                         stored_key=short_key(stored[1]) if stored else None,
-                         shelf=shelf_of(saved[stored[1]]) if stored else None,
-                         shared=shared[0] if shared else None,
-                         shared_key=short_key(shared[1]) if shared else None,
-                         copied=copied[0] if copied else None,
-                         copied_key=short_key(copied[1]) if copied else None,
-                         copied_from=short_key(copied_from) if copied else None,
-                         cuts_deep=cuts[-1][0] if cuts else None,
-                         plan=plan[0] if plan else None)
+                # A request sharing more than the base opening has branched off
+                # somebody's session. The pins say whose slot holds the deep cut.
+                if shared and shared[1] != base[1]:
+                    holder = next((c for c, p in self.pins.items()
+                                   if shared[1] in self.holds.get(
+                                       (p["backend"], p["slot"]), ())), None)
+                    if holder and holder != conv \
+                            and self.forked.get(conv) != (holder, shared[0]):
+                        self.forked[conv] = (holder, shared[0])
+                        # Assigning an existing key does not move it. Without
+                        # this the dedupe above wrote the same fork twice.
+                        self.forked.move_to_end(conv)
+                        while len(self.forked) > self.tuning.recent_requests:
+                            self.forked.popitem(last=False)
+                        self.events.write("fork", conv=short_key(conv),
+                                     parent=short_key(holder), depth=shared[0],
+                                     cuts=len(cuts))
+                # The cut keys, so an offline report can match them to copies.
+                self.events.write("choice", conv=short_key(conv),
+                             base=short_key(base[1]),
+                             stored=stored[0] if stored else None,
+                             stored_key=short_key(stored[1]) if stored else None,
+                             shelf=shelf_of(saved[stored[1]]) if stored else None,
+                             shared=shared[0] if shared else None,
+                             shared_key=short_key(shared[1]) if shared else None,
+                             copied=copied[0] if copied else None,
+                             copied_key=short_key(copied[1]) if copied else None,
+                             copied_from=short_key(copied_from) if copied else None,
+                             cuts_deep=cuts[-1][0] if cuts else None,
+                             plan=plan[0] if plan else None)
 
-            if plan is None:
-                return False
-            # Next to the finally that pops it, so nothing that raises can
-            # sit between. A key left behind makes every later conversation
-            # with this system prompt wait build_patience for nothing.
-            if plan[0] in ("read", "start"):
-                self.building[plan[1]] = time.time()
+                if plan is None:
+                    return False
+                # Next to the finally that pops it, so nothing that raises
+                # can sit between. A key left behind makes every later
+                # conversation with this system prompt wait build_patience
+                # for nothing.
+                if plan[0] in ("read", "start"):
+                    self.building[plan[1]] = time.time()
 
         if plan[0] == "load":
             return self._load_prefix(plan[1], plan[2], be, plan[3])
@@ -1048,7 +1059,7 @@ class Pool:
             return self._wait_for_opening(plan[1], be, slot, alive)
         if plan[0] == "start":
             try:
-                return self._read_start(base, start, messages, system, tools,
+                return self._read_start(start, messages, system, tools,
                                         be, slot, path, alive, template)
             finally:
                 with self.cv:
@@ -1062,31 +1073,32 @@ class Pool:
                 self.building.pop(plan[1], None)
                 self.cv.notify_all()
 
-    def _stored_start(self, base_key, head):
-        """The deepest saved opening that runs from this base cut into a
-        message starting as this one does. Held under the lock."""
+    def _stored_start(self, anchor, head):
+        """The deepest saved opening that runs under this lead into a message
+        starting as this one does. Held under the lock."""
         best = None
-        for key, (base, chars) in self.starts.items():
-            if (base == base_key and key in self.openings and len(head) >= chars
-                    and start_key(base, head[:chars]) == key
+        for key, (lead, chars) in self.starts.items():
+            if (lead == anchor and key in self.openings and len(head) >= chars
+                    and start_key(lead, head[:chars]) == key
                     and (best is None or chars > self.starts[best][1])):
                 best = key
         return best
 
-    def _read_start(self, base, start, messages, system, tools, be, slot,
-                    path, alive, template):
-        """Load the system prompt, read on into the start the message shares,
-        and keep that as a deep opening. The request was going to read those
-        tokens anyway, so it pays only the save. True when the base loaded,
-        whatever became of the rest."""
-        key, text = start
-        if not self._load_prefix(base[1], self.openings.get(base[1]), be, slot):
+    def _read_start(self, start, messages, system, tools, be, slot, path,
+                    alive, template):
+        """Read on into the start the message shares, from the system prompt's
+        opening where there is one, and keep that as a deep opening. The
+        request was going to read those tokens anyway, so it pays only the
+        save. False only when the base would not load and nothing was read."""
+        key, text, anchor, index, under = start
+        if under and not self._load_prefix(under[1], self.openings.get(under[1]),
+                                           be, slot):
             return False
         name = f"deep-{key}.park"
         began = time.time()
         self.store.link_block(name)
         try:
-            block = self._render_block(system, tools, messages[:base[0] + 1],
+            block = self._render_block(system, tools, messages[:index],
                                        be, self.link, path, alive, template,
                                        start=text)
             read = self.link.prefill(be, block, slot, alive,
@@ -1100,13 +1112,13 @@ class Pool:
                               backend=be["name"], slot=slot, ok=False,
                               error=str(err)[:120],
                               secs=round(time.time() - began, 1))
-            return True
+            return bool(under)
         written = self.store.size(name) or (answer.get("n_written") or 0)
         with self.cv:
             self.openings[key] = name
             self.openings.move_to_end(key)
             self.opening_bytes[key] = written
-            self.starts[key] = (base[1], len(text))
+            self.starts[key] = (anchor, len(text))
             self.note_file("kept opening", key, be, slot, written)
             dropped = trim_openings(self.openings, self.opening_bytes,
                                     keep=set(self.building),

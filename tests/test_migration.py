@@ -2054,6 +2054,64 @@ class TheSharedStartOfAMessage(PrefixCase, unittest.TestCase):
         self.assertEqual(link.files(), [name])
 
 
+class TheSharedStartAfterAShortSystemPrompt(TheSharedStartOfAMessage):
+    """The same, where the system prompt is too short to be a cut. A typed
+    question's is a few lines, so the shared start is all there is to keep,
+    and nothing is loaded before it is read."""
+
+    def messages(self, case):
+        return [{"role": "system", "content": "Answer with one letter."},
+                {"role": "user", "content": self.RUBRIC + case}]
+
+    def setUp(self):
+        PrefixCase.setUp(self)
+        cuts, _, _, _ = router.prompt_cuts(
+            json.dumps({"messages": self.messages("x")}))
+        self.assertEqual(cuts, [], "the system prompt became a cut after all")
+
+    def test_the_first_request_has_nothing_to_share_with(self):
+        loaded, link = self.ask("one", "case one")
+        self.assertFalse(loaded)
+        self.assertEqual(link.ops(), [])
+
+    def test_the_second_reads_and_keeps_what_both_start_with(self):
+        self.ask("one", "case one")
+        loaded, link = self.ask("two", "case two")
+        self.assertTrue(loaded)
+        self.assertEqual(link.ops(), ["render", "prefill", "save"])
+        block = [call for call in link.calls if call[0] == "prefill"][0][3]
+        self.assertTrue(block.startswith("<system>Answer with one letter."))
+        self.assertTrue(block.endswith(self.RUBRIC), block[-60:])
+
+    def test_it_is_still_there_after_a_restart(self):
+        self.ask("one", "case one")
+        _, made = self.ask("two", "case two")
+        name = made.files("save")[0]
+        (SANDBOX.store.slots / name).write_bytes(b"x")
+        self.pool.save_openings()
+        again = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                          store=SANDBOX.store, watch=False)
+        again.adopt(remove=lambda name: None)
+        self.assertIn(name, again.openings.values())
+        self.pool, self.cpu = again, again.backends[0]
+        self.cpu.update(up=True, slots=3, n_ctx=150000, slots_detail=[])
+        _, link = self.ask("four", "case four")
+        self.assertEqual(link.files(), [name])
+
+    def test_template_options_name_a_different_start(self):
+        """They change what the template writes before the start."""
+        self.ask("one", "case one")
+        _, made = self.ask("two", "case two")
+        self.pool.link = self.renders()
+        self.pool.pins["five"] = pin("cpu", slot=None, inflight=True)
+        cuts, messages, system, tools = router.prompt_cuts(
+            json.dumps({"messages": self.messages("case five")}))
+        self.pool.warm_prefix("five", cuts, messages, system, tools,
+                              self.cpu, 1, "/v1/chat/completions",
+                              template={"enable_thinking": False})
+        self.assertNotIn(made.files("save")[0], self.pool.link.files())
+
+
 class WarmPrefix(PrefixCase, unittest.TestCase):
     """What a request does about an opening.
 

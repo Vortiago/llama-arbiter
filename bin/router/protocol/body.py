@@ -150,19 +150,31 @@ def deepest_shared(cuts, known):
     return None
 
 
-def head_text(messages, base_index):
-    """The message right after the base cut, and its text, when it is a user
-    message of plain text. Requests that share a system prompt part there
-    first, and it is the one place a long shared start inside a message is
-    worth finding."""
-    index = base_index + 1
-    if not 0 <= index < len(messages or ()):
+def head_of(messages):
+    """The first user message, as (index, text), when only system messages
+    come before it and it is plain text. Requests that share a system
+    prompt part there first, and it is the one place a long shared start
+    inside a message is worth finding."""
+    for index, message in enumerate(messages or ()):
+        if not isinstance(message, dict):
+            return None
+        role = message.get("role")
+        if role in SYSTEM_ROLES:
+            continue
+        content = message.get("content")
+        if role == "user" and isinstance(content, str):
+            return index, content
         return None
-    message = messages[index]
-    if not isinstance(message, dict) or message.get("role") != "user":
-        return None
-    content = message.get("content")
-    return content if isinstance(content, str) else None
+    return None
+
+
+def lead_key(system, tools, lead, template):
+    """What comes before the first user message, as a key: the system
+    prompt, the tools, the messages before it and the template's options.
+    A shared start is only shared under the same lead."""
+    said = json.dumps([system, tools, lead, template], sort_keys=True,
+                      separators=(",", ":"))
+    return hashlib.sha256(said.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def shared_start(text, others, least):
