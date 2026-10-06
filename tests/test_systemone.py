@@ -243,6 +243,46 @@ class SeveralQuestionsOneState(TypedCall):
                                f"{step['question']} read the state again")
 
 
+class TheQuestionsAreReadOnce(unittest.TestCase):
+    """A client asks the same questions about a new state on every call.
+
+    On production a test audit asks 29 questions of about 70 tokens each, and
+    a cpu backend reads 20 tokens a second. Read after the state, the
+    questions were 2000 of the 2500 tokens a call read, and no call could
+    reuse them. Read before it, in the system prompt, they are an opening."""
+
+    QUESTIONS = {f"q{n}": {"type": "choice",
+                           "instructions": f"Does the test check case {n}?",
+                           "criteria": {"yes": "it asserts on that case",
+                                        "no": "it never reaches that case",
+                                        "unsure": "the text does not say"}}
+                 for n in range(29)}
+
+    def body(self, state, index=0):
+        plan = router.systemone_plan(json.dumps(
+            {"state": state, "questions": self.QUESTIONS}).encode())
+        return router.systemone_body(plan, plan["questions"][index])
+
+    def test_two_calls_share_everything_before_the_state(self):
+        first = self.body("def test_one(): assert 1")["messages"]
+        second = self.body("def test_two(): assert 2")["messages"]
+        self.assertEqual(first[0], second[0])
+        self.assertIn("Does the test check case 28?", first[0]["content"])
+
+    def test_the_system_prompt_is_an_opening(self):
+        cuts, _, _, _ = router.prompt_cuts(json.dumps(self.body("x")))
+        self.assertIn(0, [index for index, _ in cuts],
+                      "the system prompt is not a cut, so no opening holds "
+                      "the questions")
+
+    def test_a_question_adds_only_its_name_after_the_state(self):
+        first = self.body("the state", 0)["messages"]
+        last = self.body("the state", 28)["messages"]
+        self.assertEqual(first[:-1], last[:-1])
+        self.assertNotIn("Does the test check", last[-1]["content"])
+        self.assertLess(len(last[-1]["content"]), 80)
+
+
 class ItStaysWhereItRead(EndToEnd):
     """A gpu that only generates, and a cpu that only reads.
 
