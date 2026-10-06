@@ -26,12 +26,12 @@ ARGS=(
   --parallel 1
   --ctx-size "${CTX:-150000}"
   --cpu-range "${CPUSET:-0-31}" --cpu-strict 1
-  --batch-size "${BATCH:-2048}"
-  --ubatch-size "${UBATCH:-2048}"
-                       # With the CPU patches, one backend read 8192 tokens
-                       # 6.6% faster at 2048 than at 512. A checkpoint falls
-                       # only between batches, so CKPT_STEP (common.sh) must
-                       # stay at or above UBATCH.
+  --batch-size "${BATCH:-512}"
+  --ubatch-size "${UBATCH:-512}"
+                       # 512/512, not the 2048/512 that one server alone
+                       # settled on. Two instances sharing a socket: 43.6
+                       # tok/s aggregate at 512 against 41.0 at 2048 reading
+                       # 8192 tokens, 35.0 against 34.3 at 32768.
   --threads-batch "${TB:-$THREADS}"
 )
 
