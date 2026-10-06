@@ -76,10 +76,14 @@ Verified against a running server. The rendered prefix tokenizes to the same
 count that the real call reports, so a prompt prefilled from it is a true
 prefix.
 
-## mtp-fit-ctx-other.patch
+## mtp-fit-ctx-other.patch, removed
 
-Local, and not required. It fits the context to the free device memory when a
-draft model is present.
+This patch gave the memory-fit pass a `ctx_other`, so that the pass could
+measure a draft model that reads `token_embd` from the target model. It does
+not apply to master `8e1642198`, and this model no longer needs it. The
+`qwen4exp` graph creates its own `token_embd`, and the ggml-org MTP draft
+carries one. The patch is therefore gone from this directory. To read it, run
+`git show 37dc46b:patches/mtp-fit-ctx-other.patch`.
 
 ## grammar-probs.patch
 
