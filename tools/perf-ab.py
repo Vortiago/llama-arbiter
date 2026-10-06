@@ -118,6 +118,8 @@ def parse_args():
             p.add_argument("--prompt-file", type=Path, default=BENCH / "prompt-8k.txt")
         if name == "generate":
             p.add_argument("--n-predict", type=int, default=512)
+            p.add_argument("--prompts", type=Path,
+                           help="a JSON object of case name to prompt, in place of the three built in")
         if name == "depth":
             p.add_argument("--depth", type=int, default=32768,
                            help="tokens of context before the measured read and reply")
@@ -173,8 +175,9 @@ def run_pair(args):
 
 
 def run_generate(args):
+    prompts = json.loads(args.prompts.read_text()) if args.prompts else GENERATE_PROMPTS
     with Server(args, "generate") as server:
-        for case, prompt in GENERATE_PROMPTS.items():
+        for case, prompt in prompts.items():
             for rep in range(args.reps):
                 result = server.complete(sampled(prompt, args.n_predict))
                 timings = result["timings"]
