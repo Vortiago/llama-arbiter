@@ -23,13 +23,8 @@ class Refused(Exception):
     client as a 400, so it says what to send instead."""
 
 
-# The questions go here, ahead of the state. A client asks the same ones
-# about a new state on every call, so they are an opening every call starts
-# from. After the state, a test audit read 2000 tokens of questions a call.
-SYSTEMONE_RUBRIC = ("The user sends a text, then names one of the questions "
-                    "below.\n"
-                    "Answer that question about the text with one letter.\n"
-                    "Each question gives a letter for every answer it takes.\n"
+SYSTEMONE_RUBRIC = ("Answer the question about the text above with one letter.\n"
+                    "The question gives a letter for every answer it takes.\n"
                     "Write that letter and nothing else.")
 
 
@@ -118,29 +113,22 @@ def systemone_plan(raw):
 
 
 def systemone_says(question):
-    """One question and its lettered answers, as the system prompt lists it."""
+    """The message that asks one question and letters its answers."""
     criteria = question["criteria"]
     head = question["instructions"].strip()
-    lines = [f"Question {question['name']}:"] + ([head] if head else [])
+    lines = [head, ""] if head else []
     for letter, option in zip(question["letters"], question["options"]):
         means = criteria.get(option) if isinstance(criteria, dict) else None
         lines.append(f"{letter} = {means or option}")
+    lines += ["", "Answer with one letter.", "Answer:"]
     return "\n".join(lines)
-
-
-def systemone_system(plan):
-    """The rubric and every question. Nothing in it depends on the state."""
-    return "\n\n".join([SYSTEMONE_RUBRIC]
-                       + [systemone_says(q) for q in plan["questions"]])
 
 
 def systemone_body(plan, question):
     """The chat body that asks one question about this plan's state."""
-    messages = [{"role": "system", "content": systemone_system(plan)},
+    messages = [{"role": "system", "content": SYSTEMONE_RUBRIC},
                 {"role": "user", "content": plan["state"]},
-                {"role": "user", "content":
-                    f"Question {question['name']}. Answer with one letter.\n"
-                    f"Answer:"}]
+                {"role": "user", "content": systemone_says(question)}]
     body = {"model": plan["model"], "messages": messages, "stream": False}
     if plan["key"]:
         body["prompt_cache_key"] = plan["key"]
