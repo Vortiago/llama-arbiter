@@ -13,6 +13,7 @@ its measurement and stops it, so that two builds never share the CPU. The
 """
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -97,7 +98,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(required=True)
 
-    for name, func in [("prefill", run_prefill), ("generate", run_generate), ("depth", run_depth),
+    for name, func in [("prefill", run_prefill), ("pair", run_pair), ("generate", run_generate), ("depth", run_depth),
                        ("kernel", run_kernel), ("quality", run_quality)]:
         p = sub.add_parser(name)
         p.add_argument("--label", required=True)
@@ -110,7 +111,7 @@ def parse_args():
         p.add_argument("--reps", type=int, default=3)
         p.add_argument("--tsv", type=Path, default=TSV)
         p.set_defaults(func=func)
-        if name == "prefill":
+        if name in ("prefill", "pair"):
             p.add_argument("--prompt-file", type=Path, default=BENCH / "prompt-8k.txt")
         if name == "generate":
             p.add_argument("--n-predict", type=int, default=512)
@@ -142,6 +143,30 @@ def run_prefill(args):
             timings = server.complete(body)["timings"]
             record(args, "prefill", "8k", rep, "prompt_tok_s",
                    timings["prompt_per_second"], timings["prompt_n"])
+
+
+def run_pair(args):
+    """Read two prompts at once on two prefill backends, as pre0 and pre1 share the socket.
+
+    Each backend gets its own text, so neither reads what the other has cached.
+    The aggregate is both prompts' tokens over the time until the slower one ends.
+    """
+    first = args.prompt_file.read_text()
+    second = (BENCH / "wiki.test.raw").read_text()[400000:400000 + len(first)]
+    with Server(args, "prefill", port=PORT) as a, Server(args, "prefill", port=PORT + 1) as b:
+        for rep in range(args.reps):
+            bodies = [{"prompt": text, "n_predict": 1, "cache_prompt": False}
+                      for text in (first, second)]
+            started = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                results = list(pool.map(lambda pair: pair[0].complete(pair[1]),
+                                        zip((a, b), bodies)))
+            wall = time.monotonic() - started
+            tokens = sum(r["timings"]["prompt_n"] for r in results)
+            for side, result in zip("ab", results):
+                record(args, "pair", f"8k-{side}", rep, "prompt_tok_s",
+                       result["timings"]["prompt_per_second"], result["timings"]["prompt_n"])
+            record(args, "pair", "8k-both", rep, "prompt_tok_s", tokens / wall, tokens)
 
 
 def run_generate(args):
@@ -279,19 +304,20 @@ def draft_flags(draft):
 
 
 class Server:
-    """One llama-server on PORT, started for a measurement and stopped after it."""
+    """One llama-server on a port, started for a measurement and stopped after it."""
 
-    def __init__(self, args, role, slot_dir=None):
-        self.log_path = BENCH / "run" / f"{args.label}-{role}.log"
+    def __init__(self, args, role, slot_dir=None, port=PORT):
+        self.port = port
+        self.log_path = BENCH / "run" / f"{args.label}-{role}-{port}.log"
         slots = ["--slot-save-path", f"{slot_dir}/"] if slot_dir else []
         self.command = [str(args.build / "bin/llama-server"), "--model", str(MODEL),
                         "--ctx-size", str(CTX), *COMMON, *draft_flags(args.draft),
                         *ROLE_FLAGS[role], *slots, *shlex.split(args.extra),
-                        "--host", "127.0.0.1", "--port", str(PORT)]
+                        "--host", "127.0.0.1", "--port", str(port)]
         self.process = None
 
     def __enter__(self):
-        refuse_if_taken(PORT)
+        refuse_if_taken(self.port)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         env = {**os.environ, "OMP_WAIT_POLICY": "PASSIVE", "GOMP_SPINCOUNT": "0"}
         with open(self.log_path, "w") as log:
@@ -315,7 +341,7 @@ class Server:
                 raise RuntimeError(f"llama-server exited with {self.process.returncode}, "
                                    f"see {self.log_path}")
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=5):
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=5):
                     return
             except OSError:
                 time.sleep(2)
@@ -330,7 +356,7 @@ class Server:
 
     def post(self, path, body):
         request = urllib.request.Request(
-            f"http://127.0.0.1:{PORT}{path}", data=json.dumps(body).encode(),
+            f"http://127.0.0.1:{self.port}{path}", data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=REQUEST_SECONDS) as response:
             return json.load(response)
