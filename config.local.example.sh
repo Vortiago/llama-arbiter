@@ -64,9 +64,9 @@
 #
 # "prefill" can also list the paths an instance reads for. It is then the
 # generator for every other path. At least one instance must read every path.
-# koishi runs gpu0_0 with "prefill": ["/v1/systemone"]: a typed question
-# writes one token, so the gpu is one more reader there and loses nothing
-# as a generator.
+# koishi tried gpu0_0 with "prefill": ["/v1/systemone"] and went back to
+# false: the gpu read 120-token questions at 9.4 tokens/s against 21 on a
+# cpu socket, and a call took 382 s against 150-175.
 #
 #   [{"name": "gpu0_0", "url": "http://127.0.0.1:8080", "pref": 0,
 #     "prefill": false, "generate": true,  "node": 0},
