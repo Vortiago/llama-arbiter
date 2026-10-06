@@ -209,7 +209,9 @@ def run_depth(args):
             start = chars + rep * DEPTH_EXTENSION_CHARS
             body = sampled(context + text[start:start + DEPTH_EXTENSION_CHARS],
                            DEPTH_REPLY_TOKENS)
-            body.update({"cache_prompt": True, "id_slot": 0})
+            # A reply that ends at its first token measures nothing, and at
+            # depth that happened in one rep in four.
+            body.update({"cache_prompt": True, "id_slot": 0, "ignore_eos": True})
             timings = server.complete(body)["timings"]
             record(args, "depth", case, rep, "prompt_tok_s",
                    timings["prompt_per_second"], timings["prompt_n"])
