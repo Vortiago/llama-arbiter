@@ -164,24 +164,25 @@ for name in "${names[@]}"; do
   (( ${count[$name]:-0} )) || die "-o $name matches no commit between $BASE and $BRANCH"
 done
 
-core=$(llama rev-parse "$BASE")
-for commit in "${commits[@]}"; do
-  if [[ ${tier[$commit]} == core ]]; then core=$(replay "$core" "$commit"); fi
-done
+# replay_tier <onto> <tier>: replay that tier's commits in branch order, print the tip
+replay_tier() {
+  local tip=$1 commit
+  for commit in "${commits[@]}"; do
+    if [[ ${tier[$commit]} == "$2" ]]; then tip=$(replay "$tip" "$commit"); fi
+  done
+  echo "$tip"
+}
+
+core=$(replay_tier "$(llama rev-parse "$BASE")" core)
 export_series "$BASE" "$core" "$scratch/core"
 for name in "${names[@]}"; do
-  tip=$core
-  for commit in "${commits[@]}"; do
-    if [[ ${tier[$commit]} == "$name" ]]; then tip=$(replay "$tip" "$commit"); fi
-  done
-  export_series "$core" "$tip" "$scratch/optional/$name"
+  export_series "$core" "$(replay_tier "$core" "$name")" "$scratch/optional/$name"
 done
 
 say "checking core and every combination of the ${#names[@]} optional set(s) against $BRANCH"
 check_combinations
 
 rm -rf "$OUT/core" "$OUT/optional"
-rm -f "$OUT"/*.patch
 mkdir -p "$OUT"
 mv "$scratch/core" "$OUT/"
 [[ ! -d $scratch/optional ]] || mv "$scratch/optional" "$OUT/"

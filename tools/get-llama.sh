@@ -77,7 +77,7 @@ known_sets=("$ROOT"/patches/cpu/optional/*/)
 shopt -u nullglob
 known_sets=("${known_sets[@]%/}")
 known_sets=("${known_sets[@]##*/}")
-for set in ${optional_sets[@]+"${optional_sets[@]}"}; do
+for set in "${optional_sets[@]}"; do
   compgen -G "$ROOT/patches/cpu/optional/$set/*.patch" >/dev/null ||
     die "expected an optional CPU set in CPU_OPTIONAL, got $set. patches/cpu/optional/ holds: ${known_sets[*]:-none}"
 done
@@ -151,7 +151,7 @@ declare -A set_held=()
 count_held() {
   local scratch index set
   local -a all=("${core_patches[@]}") paths=() patches
-  for set in ${known_sets[@]+"${known_sets[@]}"}; do
+  for set in "${known_sets[@]}"; do
     mapfile -t patches < <(set_patches "$set")
     all+=("${patches[@]}")
   done
@@ -160,7 +160,7 @@ count_held() {
   mapfile -t paths < <(sed -n -e 's|^+++ b/||p' -e 's|^--- a/||p' "${all[@]}" | sort -u)
   GIT_INDEX_FILE=$index git read-tree HEAD
   GIT_INDEX_FILE=$index git update-index --add --remove -- "${paths[@]}"
-  for set in ${known_sets[@]+"${known_sets[@]}"}; do
+  for set in "${known_sets[@]}"; do
     mapfile -t patches < <(set_patches "$set")
     set_held[$set]=$(peel "$index" "${patches[@]}")
   done
@@ -199,18 +199,18 @@ apply_cpu() {
   local set
   local -a patches
   count_held
-  for set in ${known_sets[@]+"${known_sets[@]}"}; do
+  for set in "${known_sets[@]}"; do
     (( ${set_held[$set]} == 0 )) || [[ " ${optional_sets[*]} " == *" $set "* ]] ||
       die "$DIR holds the optional CPU set $set, which CPU_OPTIONAL does not name.
     Name it, or remove every patch with: git -C $DIR checkout -- ."
   done
   if ! apply_series "$core_held" "${core_patches[@]}"; then
-    for set in ${optional_sets[@]+"${optional_sets[@]}"}; do
+    for set in "${optional_sets[@]}"; do
       missing_optional+=("cpu/optional/$set"); echo "    cpu/optional/$set - not tried, core does not apply whole"
     done
     return 0
   fi
-  for set in ${optional_sets[@]+"${optional_sets[@]}"}; do
+  for set in "${optional_sets[@]}"; do
     mapfile -t patches < <(set_patches "$set")
     apply_series "${set_held[$set]}" "${patches[@]}" || true
   done
@@ -257,7 +257,7 @@ fi
 read -ra extra <<<"${CMAKE_ARGS:-}"
 
 say "configuring, GGML_CUDA=$cuda"
-cmake -B build "-DGGML_CUDA=$cuda" ${extra[@]+"${extra[@]}"}
+cmake -B build "-DGGML_CUDA=$cuda" "${extra[@]}"
 say "building llama-server - this takes a while"
 cmake --build build -j --target llama-server
 
