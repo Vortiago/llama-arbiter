@@ -1,0 +1,162 @@
+From c78f3a91e1246512849c97dde8a796149db6100c Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 13:41:22 +0200
+Subject: [PATCH] perf(ggml-cpu): vectorise the gated dsv4_hc_pre
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The gated branch of ggml_compute_forward_dsv4_hc_pre_f32 ran one scalar
+expf per element and stream. It now walks the thread's element range one
+token segment at a time with row kernels: zero the segment, add
+x*sigmoid(gate) for each stream with the new ggml_vec_mad_sigmoid_f32,
+then scale. The thread split and the order of the sum over the streams
+stay as they are.
+
+The scalar loop still runs for the ungated branch, for use_ref, and when
+x, the gate or dst has a non-contiguous first dimension.
+
+The result is not bit-exact: the sigmoid uses ggml_v_expf, and the
+compiler may contract a mul and add differently on either path. On the
+test-backend-ops gated DSV4_HC_PRE cases the max abs error is 1.2e-07
+and the NMSE is below 1.4e-14. The ungated cases stay bit-exact.
+
+Depends on ggml_v_sigmoid from the previous commit. Ported from
+ik_llama.cpp PR 2457 ("Simdify sigmoid evaluations"), which does the same
+for its fused sigmoid-mul op.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/ops.cpp | 38 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cpu/vec.cpp | 44 +++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cpu/vec.h   |  3 +++
+ 3 files changed, 85 insertions(+)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index e970b4f6a..2b057da82 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11510,6 +11510,37 @@ void ggml_compute_forward_dsv4_hc_comb(
+ 
+ // ggml_compute_forward_dsv4_hc_pre
+ 
++// Element range [ir0, ir1) of dst, flattened over (n_embd, n_tokens), one token segment at a time.
++// Sums the streams in the same order as the scalar path.
++static void ggml_compute_forward_dsv4_hc_pre_gated_rows(
++        const ggml_tensor * x,
++        const ggml_tensor * gate,
++        ggml_tensor * dst,
++        const float scale,
++        const int64_t ir0,
++        const int64_t ir1) {
++    const int64_t n_embd = x->ne[0];
++    const int64_t hc     = x->ne[1];
++
++    for (int64_t ir = ir0; ir < ir1; ) {
++        const int64_t it = ir / n_embd;
++        const int64_t i0 = ir % n_embd;
++        const int     n  = (int) MIN(n_embd - i0, ir1 - ir);
++
++        float * d = (float *) ((char *) dst->data + it*dst->nb[1]) + i0;
++
++        ggml_vec_set_f32(n, d, 0.0f);
++        for (int64_t ih = 0; ih < hc; ++ih) {
++            const float * xr = (const float *) ((const char *) x->data    + ih*x->nb[1]    + it*x->nb[2])    + i0;
++            const float * gr = (const float *) ((const char *) gate->data + ih*gate->nb[1] + it*gate->nb[2]) + i0;
++            ggml_vec_mad_sigmoid_f32(n, d, xr, gr);
++        }
++        ggml_vec_scale_f32(n, d, scale);
++
++        ir += n;
++    }
++}
++
+ static void ggml_compute_forward_dsv4_hc_pre_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -11550,6 +11581,13 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
+     const int64_t ir0 = dr * ith;
+     const int64_t ir1 = MIN(ir0 + dr, nr);
+ 
++    // use_ref keeps the scalar libm path, so a CPU-only test compares the SIMD path against it
++    const bool rows_contiguous = nbx0 == sizeof(float) && nbw0 == sizeof(float) && nbd0 == sizeof(float);
++    if (gated && rows_contiguous && !params->use_ref) {
++        ggml_compute_forward_dsv4_hc_pre_gated_rows(x, weights, dst, scale, ir0, ir1);
++        return;
++    }
++
+     for (int64_t ir = ir0; ir < ir1; ++ir) {
+         const int64_t i0 = ir % n_embd;
+         const int64_t it = ir / n_embd;
+diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
+index 7be3f83ef..1e0c3557a 100644
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -489,6 +489,50 @@ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float *
+     }
+ }
+ 
++void ggml_vec_mad_sigmoid_f32(const int n, float * y, const float * x, const float * g) {
++    int i = 0;
++#if defined(__AVX512F__) && defined(__AVX512DQ__)
++    for (; i + 15 < n; i += 16) {
++        const __m512 xg = _mm512_mul_ps(_mm512_loadu_ps(x + i), ggml_v_sigmoid(_mm512_loadu_ps(g + i)));
++        _mm512_storeu_ps(y + i, _mm512_add_ps(_mm512_loadu_ps(y + i), xg));
++    }
++#elif defined(__AVX2__) && defined(__FMA__)
++    for (; i + 7 < n; i += 8) {
++        const __m256 xg = _mm256_mul_ps(_mm256_loadu_ps(x + i), ggml_v_sigmoid(_mm256_loadu_ps(g + i)));
++        _mm256_storeu_ps(y + i, _mm256_add_ps(_mm256_loadu_ps(y + i), xg));
++    }
++#elif defined(__SSE2__)
++    for (; i + 3 < n; i += 4) {
++        const __m128 xg = _mm_mul_ps(_mm_loadu_ps(x + i), ggml_v_sigmoid(_mm_loadu_ps(g + i)));
++        _mm_storeu_ps(y + i, _mm_add_ps(_mm_loadu_ps(y + i), xg));
++    }
++#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
++    const int vlen = svcntw();
++    for (; i < n; i += vlen) {
++        const svbool_t pg = svwhilelt_b32_s32(i, n);
++        const svfloat32_t xg = svmul_f32_x(pg, svld1_f32(pg, x + i), ggml_v_sigmoid(pg, svld1_f32(pg, g + i)));
++        svst1_f32(pg, y + i, svadd_f32_x(pg, svld1_f32(pg, y + i), xg));
++    }
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    for (; i + 3 < n; i += 4) {
++        const float32x4_t xg = vmulq_f32(vld1q_f32(x + i), ggml_v_sigmoid(vld1q_f32(g + i)));
++        vst1q_f32(y + i, vaddq_f32(vld1q_f32(y + i), xg));
++    }
++#elif defined(__riscv_v_intrinsic)
++    for (int vl; i < n; i += vl) {
++        vl = __riscv_vsetvl_e32m2(n - i);
++        vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
++        vfloat32m2_t vg = __riscv_vle32_v_f32m2(&g[i], vl);
++        vfloat32m2_t vy = __riscv_vle32_v_f32m2(&y[i], vl);
++        vy = __riscv_vfadd_vv_f32m2(vy, __riscv_vfmul_vv_f32m2(vx, ggml_v_sigmoid_m2(vg, vl), vl), vl);
++        __riscv_vse32_v_f32m2(&y[i], vy, vl);
++    }
++#endif
++    for (; i < n; ++i) {
++        y[i] += x[i] / (1.f + expf(-g[i]));
++    }
++}
++
+ ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean) {
+     int i = 0;
+     ggml_float sum = 0;
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 520da85ee..d58b662fe 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -1540,6 +1540,9 @@ inline static void ggml_vec_geglu_bf16(const int n, ggml_bf16_t * y, const ggml_
+ 
+ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g);
+ 
++// y[i] += x[i]*sigmoid(g[i])
++void ggml_vec_mad_sigmoid_f32(const int n, float * y, const float * x, const float * g);
++
+ inline static void ggml_vec_swiglu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
+     for (int i = 0; i < n; ++i) {
+         float xi = GGML_CPU_FP16_TO_FP32(x[i]);

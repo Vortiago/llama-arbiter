@@ -1,0 +1,256 @@
+From 007cf4f87c55b261ca337517e44d27aa9ab8fb4c Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 13:41:14 +0200
+Subject: [PATCH] perf(ggml-cpu): vectorise the f32 sigmoid
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add ggml_v_sigmoid, 1/(1+ggml_v_expf(-x)), next to ggml_v_silu for every
+ISA that has it (AVX512, AVX2, SSE2, SVE, NEON, RVV), and a row kernel
+ggml_vec_sigmoid_f32 in vec.cpp on the same ISA ladder as
+ggml_vec_silu_f32. It replaces the scalar inline ggml_vec_sigmoid_f32 in
+vec.h, which had no callers.
+
+The F32 GGML_UNARY_OP_SIGMOID path now calls the row kernel. F16, BF16
+and use_ref keep the scalar libm path, so test-backend-ops on a CPU-only
+machine compares the SIMD path against the scalar one.
+
+The result is not bit-exact with libm expf: ggml_v_expf has a maximum
+error of about 1.45 ulp + 0.5. On the test-backend-ops SIGMOID cases the
+max abs error is 1.2e-07 and the NMSE is below 4e-17.
+
+Ported from ik_llama.cpp PR 2457 ("Simdify sigmoid evaluations"). The
+scope is f32 only.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/unary-ops.cpp | 30 +++++++++++++++++
+ ggml/src/ggml-cpu/vec.cpp       | 37 ++++++++++++++++++++
+ ggml/src/ggml-cpu/vec.h         | 60 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 126 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/unary-ops.cpp b/ggml/src/ggml-cpu/unary-ops.cpp
+index 1d8344436..405c19913 100644
+--- a/ggml/src/ggml-cpu/unary-ops.cpp
++++ b/ggml/src/ggml-cpu/unary-ops.cpp
+@@ -1,4 +1,5 @@
+ #include "unary-ops.h"
++#include "vec.h"
+ 
+ static inline float op_abs(float x) {
+     return fabsf(x);
+@@ -132,6 +133,30 @@ static void apply_unary_op(const ggml_compute_params * params, ggml_tensor * dst
+     }
+ }
+ 
++static void apply_sigmoid_f32(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++
++    GGML_ASSERT(ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(dst) && ggml_are_same_shape(src0, dst));
++
++    GGML_TENSOR_UNARY_OP_LOCALS
++
++    GGML_ASSERT( nb0 == sizeof(float));
++    GGML_ASSERT(nb00 == sizeof(float));
++
++    const auto [ir0, ir1] = get_thread_range(params, src0);
++
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t i03 = ir/(ne02*ne01);
++        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
++        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
++
++        float       * dst_ptr  = (float *)       ((char *)       dst->data  + i03*nb3  + i02*nb2  + i01*nb1 );
++        const float * src0_ptr = (const float *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
++
++        ggml_vec_sigmoid_f32(ne0, dst_ptr, src0_ptr);
++    }
++}
++
+ // TODO: Use the 'traits' lookup table (for type conversion fns), instead of a mass of 'if' conditions with long templates
+ template <float (*op)(float)>
+ static void unary_op(const ggml_compute_params * params, ggml_tensor * dst) {
+@@ -263,6 +288,11 @@ void ggml_compute_forward_relu(const ggml_compute_params * params, ggml_tensor *
+ }
+ 
+ void ggml_compute_forward_sigmoid(const ggml_compute_params * params, ggml_tensor * dst) {
++    // use_ref keeps the scalar libm path, so a CPU-only test compares the SIMD path against it
++    if (!params->use_ref && dst->src[0]->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        apply_sigmoid_f32(params, dst);
++        return;
++    }
+     unary_op<op_sigmoid>(params, dst);
+ }
+ 
+diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
+index 3918a6f4d..7be3f83ef 100644
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -414,6 +414,43 @@ void ggml_vec_silu_f32(const int n, float * y, const float * x) {
+     }
+ }
+ 
++void ggml_vec_sigmoid_f32(const int n, float * y, const float * x) {
++    int i = 0;
++#if defined(__AVX512F__) && defined(__AVX512DQ__)
++    for (; i + 15 < n; i += 16) {
++        _mm512_storeu_ps(y + i, ggml_v_sigmoid(_mm512_loadu_ps(x + i)));
++    }
++#elif defined(__AVX2__) && defined(__FMA__)
++    for (; i + 7 < n; i += 8) {
++        _mm256_storeu_ps(y + i, ggml_v_sigmoid(_mm256_loadu_ps(x + i)));
++    }
++#elif defined(__SSE2__)
++    for (; i + 3 < n; i += 4) {
++        _mm_storeu_ps(y + i, ggml_v_sigmoid(_mm_loadu_ps(x + i)));
++    }
++#elif defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
++    const int vlen = svcntw();
++    for (; i < n; i += vlen) {
++        const svbool_t pg = svwhilelt_b32_s32(i, n);
++        svst1_f32(pg, y + i, ggml_v_sigmoid(pg, svld1_f32(pg, x + i)));
++    }
++#elif defined(__ARM_NEON) && defined(__aarch64__)
++    for (; i + 3 < n; i += 4) {
++        vst1q_f32(y + i, ggml_v_sigmoid(vld1q_f32(x + i)));
++    }
++#elif defined(__riscv_v_intrinsic)
++    for (int vl; i < n; i += vl) {
++        vl = __riscv_vsetvl_e32m2(n - i);
++        vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
++        vfloat32m2_t vy = ggml_v_sigmoid_m2(vx, vl);
++        __riscv_vse32_v_f32m2(&y[i], vy, vl);
++    }
++#endif
++    for (; i < n; ++i) {
++        y[i] = 1.f / (1.f + expf(-x[i]));
++    }
++}
++
+ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g) {
+     int i = 0;
+ #if defined(__AVX512F__) && defined(__AVX512DQ__)
+diff --git a/ggml/src/ggml-cpu/vec.h b/ggml/src/ggml-cpu/vec.h
+index 59fa88f2c..520da85ee 100644
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -73,6 +73,7 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t *
+ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
+ 
+ void ggml_vec_silu_f32(const int n, float * y, const float * x);
++void ggml_vec_sigmoid_f32(const int n, float * y, const float * x);
+ ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean); //it will also center y ( y = y - mean )
+ ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max);
+ ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max);
+@@ -933,7 +934,6 @@ inline static void ggml_vec_leaky_relu_f16 (const int n, ggml_fp16_t * y, const
+         y[i] = GGML_CPU_FP32_TO_FP16(((v > 0.f) ? v : 0.f) + ns * ((v < 0.0f) ? v : 0.f));
+     }
+ }
+-inline static void ggml_vec_sigmoid_f32 (const int n, float * y, const float * x) { for (int i = 0; i < n; ++i) y[i] = 1.f / (1.f + expf(-x[i])); }
+ inline static void ggml_vec_sigmoid_f16 (const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
+     for (int i = 0; i < n; ++i) {
+         y[i] = GGML_CPU_FP32_TO_FP16(1.f / (1.f + expf(-GGML_CPU_FP16_TO_FP32(x[i]))));
+@@ -1143,6 +1143,16 @@ inline static svfloat32_t ggml_v_silu(svbool_t pg, svfloat32_t x) {
+     return svdiv_f32_x(pg, x, one_plus_exp_neg_x);
+ }
+ 
++// computes sigmoid 1/(1+exp(-x)) in single precision vector
++inline static svfloat32_t ggml_v_sigmoid(svbool_t pg, svfloat32_t x) {
++    const svfloat32_t one = svdup_n_f32_x(pg, 1.0f);
++    const svfloat32_t zero = svdup_n_f32_x(pg, 0.0f);
++    const svfloat32_t neg_x = svsub_f32_x(pg, zero, x);
++    const svfloat32_t exp_neg_x = ggml_v_expf(pg, neg_x);
++    const svfloat32_t one_plus_exp_neg_x = svadd_f32_x(pg, one, exp_neg_x);
++    return svdiv_f32_x(pg, one, one_plus_exp_neg_x);
++}
++
+ #elif defined(__ARM_NEON) && defined(__aarch64__)
+ 
+ // adapted from arm limited optimized routine
+@@ -1182,6 +1192,16 @@ inline static float32x4_t ggml_v_silu(float32x4_t x) {
+     return vdivq_f32(x, one_plus_exp_neg_x);
+ }
+ 
++// computes sigmoid 1/(1+exp(-x)) in single precision vector
++inline static float32x4_t ggml_v_sigmoid(float32x4_t x) {
++    const float32x4_t one = vdupq_n_f32(1.0f);
++    const float32x4_t zero = vdupq_n_f32(0.0f);
++    const float32x4_t neg_x = vsubq_f32(zero, x);
++    const float32x4_t exp_neg_x = ggml_v_expf(neg_x);
++    const float32x4_t one_plus_exp_neg_x = vaddq_f32(one, exp_neg_x);
++    return vdivq_f32(one, one_plus_exp_neg_x);
++}
++
+ #elif defined(__AVX512F__) && defined(__AVX512DQ__)
+ 
+ // adapted from arm limited optimized routine
+@@ -1225,6 +1245,16 @@ inline static __m512 ggml_v_silu(__m512 x) {
+     return _mm512_div_ps(x, one_plus_exp_neg_x);
+ }
+ 
++// computes sigmoid 1/(1+exp(-x)) in single precision vector
++inline static __m512 ggml_v_sigmoid(__m512 x) {
++    const __m512 one = _mm512_set1_ps(1);
++    const __m512 zero = _mm512_setzero_ps();
++    const __m512 neg_x = _mm512_sub_ps(zero, x);
++    const __m512 exp_neg_x = ggml_v_expf(neg_x);
++    const __m512 one_plus_exp_neg_x = _mm512_add_ps(one, exp_neg_x);
++    return _mm512_div_ps(one, one_plus_exp_neg_x);
++}
++
+ #elif defined(__AVX2__) && defined(__FMA__)
+ 
+ // adapted from arm limited optimized routine
+@@ -1280,6 +1310,16 @@ inline static __m256 ggml_v_silu(__m256 x) {
+     return _mm256_div_ps(x, one_plus_exp_neg_x);
+ }
+ 
++// computes sigmoid 1/(1+exp(-x)) in single precision vector
++inline static __m256 ggml_v_sigmoid(__m256 x) {
++    const __m256 one = _mm256_set1_ps(1);
++    const __m256 zero = _mm256_setzero_ps();
++    const __m256 neg_x = _mm256_sub_ps(zero, x);
++    const __m256 exp_neg_x = ggml_v_expf(neg_x);
++    const __m256 one_plus_exp_neg_x = _mm256_add_ps(one, exp_neg_x);
++    return _mm256_div_ps(one, one_plus_exp_neg_x);
++}
++
+ #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON
+ 
+ #if defined(__FMA__)
+@@ -1334,6 +1374,16 @@ inline static __m128 ggml_v_silu(__m128 x) {
+     return _mm_div_ps(x, one_plus_exp_neg_x);
+ }
+ 
++// computes sigmoid 1/(1+exp(-x)) in single precision vector
++inline static __m128 ggml_v_sigmoid(__m128 x) {
++    const __m128 one = _mm_set1_ps(1);
++    const __m128 zero = _mm_setzero_ps();
++    const __m128 neg_x = _mm_sub_ps(zero, x);
++    const __m128 exp_neg_x = ggml_v_expf(neg_x);
++    const __m128 one_plus_exp_neg_x = _mm_add_ps(one, exp_neg_x);
++    return _mm_div_ps(one, one_plus_exp_neg_x);
++}
++
+ #elif defined(__riscv_v_intrinsic)
+ 
+ // adapted from arm limited optimized routine
+@@ -1386,6 +1436,14 @@ inline static vfloat32m2_t ggml_v_silu_m2(vfloat32m2_t x, int vl) {
+     return __riscv_vfdiv_vv_f32m2(x, one_plus_exp_neg_x, vl);
+ }
+ 
++// computes sigmoid 1/(1+exp(-x)) in single precision vector
++inline static vfloat32m2_t ggml_v_sigmoid_m2(vfloat32m2_t x, int vl) {
++    const vfloat32m2_t neg_x = __riscv_vfneg_v_f32m2(x, vl);
++    const vfloat32m2_t exp_neg_x = ggml_v_expf_m2(neg_x, vl);
++    const vfloat32m2_t one_plus_exp_neg_x = __riscv_vfadd_vf_f32m2(exp_neg_x, 1.0f, vl);
++    return __riscv_vfrdiv_vf_f32m2(one_plus_exp_neg_x, 1.0f, vl);
++}
++
+ #endif // __ARM_NEON / __AVX2__ / __SSE2__ / __riscv_v_intrinsic
+ 
+ inline static void ggml_vec_silu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {

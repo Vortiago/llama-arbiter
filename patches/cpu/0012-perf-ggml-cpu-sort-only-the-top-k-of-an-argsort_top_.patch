@@ -1,0 +1,263 @@
+From 2fbd2459b150c058b2bb21cebb5623c946f2822b Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 16:35:53 +0200
+Subject: [PATCH] perf(ggml-cpu): sort only the top k of an argsort_top_k row
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+MoE routing calls ggml_argsort_top_k, which is a full ARGSORT followed
+by a view of the first k ids. The CPU kernel sorted the whole row with
+std::sort, so a 512-expert router sorted 512 ids per token to read 10.
+In the tg profile this ARGSORT costs about 27 us a call, against 3 us
+for the SOFT_MAX on the same row.
+
+ggml_argsort_top_k now stores k in op_params[1] of the argsort node as
+a top-k hint. When the hint is at most a quarter of the row, the CPU
+kernel runs std::partial_sort over the first k ids with the same
+comparator. Above a quarter, it keeps std::sort, because partial_sort
+is heap-based and slower when k nears the row length. The use_ref path
+always sorts the whole row, so test-backend-ops -b CPU checks the hint
+against a full sort.
+
+The first k ids come out in the same descending order as before. The
+rest of the row holds the remaining ids in no particular order, and
+ggml.h documents this contract on ggml_argsort. The graph stays
+ARGSORT + VIEW, so the CUDA, Vulkan, SYCL, Metal and OpenVINO top-k
+fusions still match. Backends that ignore the hint still sort the full
+row.
+
+ggml_argsort_top_k now names the expected and the found k when k is
+larger than the row.
+
+Tests: add ARGSORT_TOP_K cases (512 x 10 for 1, 4 and 512 rows, group
+selection, k at and above a quarter of the row, and k == ne0). Pass the
+sort order to the power-of-two ARGSORT cases, which ran ASC twice.
+
+The idea comes from ik_llama.cpp (MIT): its ggml_top_k sets
+op_params[1], and iqk_argsort calls partial_sort when k is less than
+the row length.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/include/ggml.h        |  4 ++
+ ggml/src/ggml-cpu/ops.cpp  | 22 ++++++++++-
+ ggml/src/ggml.c            |  8 +++-
+ tests/test-backend-ops.cpp | 80 ++++++++++++++++++++++++++++++++------
+ 4 files changed, 100 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 224bdef92..38515320f 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2449,12 +2449,16 @@ extern "C" {
+         GGML_SORT_ORDER_DESC,
+     };
+ 
++    // GGML_OP_ARGSORT: op_params[0] is the order, op_params[1] is a top-k hint (0 means none)
++    // with a hint k > 0, only the first k ids of each row are read: they must come out sorted,
++    // and the rest of the row may hold the remaining ids in any order
+     GGML_API struct ggml_tensor * ggml_argsort(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+             enum ggml_sort_order  order);
+ 
+     // similar to ggml_top_k but implemented as `argsort` + `view`
++    // the k ids are in descending order, and the argsort node carries k as its top-k hint
+     GGML_API struct ggml_tensor * ggml_argsort_top_k(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 2b057da82..39f194ee0 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8733,6 +8733,17 @@ struct cmp_argsort {
+     }
+ };
+ 
++// Sorts the first n_sorted ids of the row in place.
++// The rest of the row keeps the remaining ids in no particular order.
++template<enum ggml_sort_order order>
++static void ggml_argsort_row(int32_t * ids, int64_t n_sorted, int64_t n, const float * data) {
++    if (n_sorted < n) {
++        std::partial_sort(ids, ids + n_sorted, ids + n, cmp_argsort<order>{data});
++    } else {
++        std::sort(ids, ids + n, cmp_argsort<order>{data});
++    }
++}
++
+ static void ggml_compute_forward_argsort_f32(
+     const ggml_compute_params * params,
+     ggml_tensor * dst) {
+@@ -8750,6 +8761,13 @@ static void ggml_compute_forward_argsort_f32(
+ 
+     ggml_sort_order order = (ggml_sort_order) ggml_get_op_params_i32(dst, 0);
+ 
++    // partial_sort is heap-based and slower than introsort when k nears the row length,
++    // so the top-k hint applies only to a k of at most a quarter of the row.
++    // use_ref sorts the whole row, so test-backend-ops -b CPU checks the hint against a full sort.
++    const int32_t top_k    = ggml_get_op_params_i32(dst, 1);
++    const bool    use_hint = !params->use_ref && top_k > 0 && 4*(int64_t) top_k <= ne0;
++    const int64_t n_sorted = use_hint ? top_k : ne0;
++
+     for (int64_t i = ith; i < nr; i += nth) {
+         const float * src_data = (float *)((char *) src0->data + i*nb01);
+ 
+@@ -8761,11 +8779,11 @@ static void ggml_compute_forward_argsort_f32(
+ 
+         switch (order) {
+             case GGML_SORT_ORDER_ASC:
+-                std::sort(dst_data, dst_data + ne0, cmp_argsort<GGML_SORT_ORDER_ASC>{src_data});
++                ggml_argsort_row<GGML_SORT_ORDER_ASC>(dst_data, n_sorted, ne0, src_data);
+                 break;
+ 
+             case GGML_SORT_ORDER_DESC:
+-                std::sort(dst_data, dst_data + ne0, cmp_argsort<GGML_SORT_ORDER_DESC>{src_data});
++                ggml_argsort_row<GGML_SORT_ORDER_DESC>(dst_data, n_sorted, ne0, src_data);
+                 break;
+ 
+             default:
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9bcabdbd3..92a8e2742 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5451,10 +5451,16 @@ struct ggml_tensor * ggml_argsort_top_k(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * a,
+         int                   k) {
+-    GGML_ASSERT(a->ne[0] >= k);
++    if (k > a->ne[0]) {
++        GGML_ABORT("%s: expected k <= ne0 = %" PRId64 ", got k = %d", __func__, a->ne[0], k);
++    }
+ 
+     struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
+ 
++    // Only the first k ids are read, so a backend may leave the rest of the row unsorted.
++    // The graph stays argsort + view, which the backend top-k fusions match.
++    ggml_set_op_params_i32(result, 1, k);
++
+     result = ggml_view_4d(ctx, result,
+                 k, result->ne[1], result->ne[2], result->ne[3],
+                    result->nb[1], result->nb[2], result->nb[3],
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index dc1a67f80..88a9b0036 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6768,6 +6768,18 @@ struct test_concat : public test_case {
+     }
+ };
+ 
++// fills each row of an F32 tensor with a shuffled 0..ne0-1, so that no row holds a tie
++static void init_argsort_rows(ggml_tensor * t, std::default_random_engine & rng) {
++    for (int64_t r = 0; r < ggml_nrows(t); r++) {
++        std::vector<float> data(t->ne[0]);
++        for (int i = 0; i < t->ne[0]; i++) {
++            data[i] = i;
++        }
++        std::shuffle(data.begin(), data.end(), rng);
++        ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
++    }
++}
++
+ // GGML_OP_ARGSORT
+ struct test_argsort : public test_case {
+     const ggml_type type;
+@@ -6806,15 +6818,7 @@ struct test_argsort : public test_case {
+                 std::shuffle(data.begin(), data.end(), rng);
+                 ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
+             } else if (t->type == GGML_TYPE_F32) {
+-                // initialize with unique values to avoid ties
+-                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+-                    std::vector<float> data(t->ne[0]);
+-                    for (int i = 0; i < t->ne[0]; i++) {
+-                        data[i] = i;
+-                    }
+-                    std::shuffle(data.begin(), data.end(), rng);
+-                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+-                }
++                init_argsort_rows(t, rng);
+             } else {
+                 GGML_ABORT("fatal error");
+             }
+@@ -6822,6 +6826,51 @@ struct test_argsort : public test_case {
+     }
+ };
+ 
++// GGML_OP_ARGSORT with the top-k hint of ggml_argsort_top_k
++struct test_argsort_top_k : public test_case {
++    const ggml_type type;
++    const std::array<int64_t, 4> ne;
++    const int k;
++
++    std::string vars() override {
++        return VARS_TO_STR3(type, ne, k);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "ARGSORT_TOP_K";
++    }
++
++    // only the first k ids of the argsort node are defined, so compare the output alone
++    bool run_whole_graph() override { return true; }
++
++    test_argsort_top_k(ggml_type type = GGML_TYPE_F32,
++            std::array<int64_t, 4> ne = {512, 4, 1, 1},
++            int k = 10)
++        : type(type), ne(ne), k(k) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
++        ggml_set_name(a, "a");
++
++        ggml_tensor * out = ggml_cont(ctx, ggml_argsort_top_k(ctx, a, k));
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++
++    // the I32 nodes are outputs, and the view is too small for a full-row fill
++    void initialize_tensors(ggml_context * ctx) override {
++        std::random_device rd;
++        std::default_random_engine rng(rd());
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_F32) {
++                init_argsort_rows(t, rng);
++            }
++        }
++    }
++};
++
+ // GGML_OP_TOP_K
+ struct test_top_k : public test_case {
+     const ggml_type type;
+@@ -11063,8 +11112,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ 
+     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
+         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
+-            test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
+-            test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i, 1, 1, 1}));
++            test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}, order));
++            test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i, 1, 1, 1}, order));
+         }
+         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {16, 10, 10, 10}, order));
+         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {60, 10, 10, 10}, order)); // qwen
+@@ -11079,6 +11128,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
+     }
+ 
++    for (int64_t nrows : {1, 4, 512}) {
++        test_cases.emplace_back(new test_argsort_top_k(GGML_TYPE_F32, {512, nrows, 1, 1}, 10)); // qwen4exp routing
++    }
++    test_cases.emplace_back(new test_argsort_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, 2));
++    test_cases.emplace_back(new test_argsort_top_k(GGML_TYPE_F32, {32, 8, 4, 1}, 2));  // group selection
++    test_cases.emplace_back(new test_argsort_top_k(GGML_TYPE_F32, {40, 22, 1, 1}, 10)); // k at a quarter of the row
++    test_cases.emplace_back(new test_argsort_top_k(GGML_TYPE_F32, {39, 22, 1, 1}, 10)); // k above a quarter of the row
++    test_cases.emplace_back(new test_argsort_top_k(GGML_TYPE_F32, {64, 3, 1, 1}, 64));  // k == ne0
++
+     for (int n = 1; n < 5; ++n) {
+         for (int k = 1; k <= n; ++k) {
+             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
