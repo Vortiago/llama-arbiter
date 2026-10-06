@@ -21,13 +21,15 @@ RUN=${RUN:-$ROOT/run}
 MODELS=${MODELS:-$ROOT/models}
 MODELS2=${MODELS2:-$MODELS}
 
-# Override these in config.local.sh for a model with other filenames.
+# Override these in config.local.sh for a model with other filenames. The
+# draft is ggml-org's MTP GGUF, which carries its own token_embd. The unsloth
+# "shared" draft does not load on llama.cpp master.
 MODEL_Q8=${MODEL_Q8:-$MODELS/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}
 MODEL_Q6=${MODEL_Q6:-$MODELS/UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf}
-DRAFT=${DRAFT:-$MODELS/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}
+DRAFT=${DRAFT:-$MODELS/MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf}
 
 MODEL2_Q8=${MODEL2_Q8:-$MODELS2/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}
-DRAFT2=${DRAFT2:-$MODELS2/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}
+DRAFT2=${DRAFT2:-$MODELS2/MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf}
 
 # --no-mmproj-offload keeps the image encoder in RAM. The gpu backend has under
 # 1 GiB of VRAM spare at ctx 150000, and the encoder runs once per image.

@@ -148,9 +148,11 @@ draft-mtp`. A build that is too old for these flags does not start.
 ### Weights
 
 Keep the weights anywhere. Name them with `MODELS` and `MODEL_Q8` in
-`config.local.sh`. By default those names point to Qwen3-Next at Q8, with an
-MTP draft model and an F16 mmproj. Nothing else in this repository depends on
-that model.
+`config.local.sh`. By default those names point to Qwen3.8-Flash-Next at Q8,
+with an F16 mmproj and ggml-org's MTP draft model,
+`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`. That draft carries its own `token_embd`.
+The unsloth "shared" draft does not load on llama.cpp master. Nothing else in
+this repository depends on that model.
 
 ## Running it elsewhere
 

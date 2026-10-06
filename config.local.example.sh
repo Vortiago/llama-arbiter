@@ -14,13 +14,15 @@
 # export MODELS=/mnt/nvme/models
 # export MODELS2=/mnt/nvme/models-node1
 
-# Where llama-server is. Default: the patched fork built under the checkout.
-# patches/README.md says what the patches do and why.
+# Where llama-server is. Default: the patched llama.cpp that tools/get-llama.sh
+# builds under the checkout. patches/README.md says what the patches do and why.
 # SERVER_MTP=/opt/llama.cpp/build/bin/llama-server
 
 # A different model. MODELS only moves the directory, so a model with another
-# name needs these too. DRAFT is the MTP draft model. With no draft, leave the
-# --model-draft flags out of ARGS.
+# name needs these too. DRAFT is the MTP draft model. Default: ggml-org's
+# mtp-Qwen3.8-Flash-Next-Q8_0.gguf, which carries its own token_embd. The
+# unsloth "shared" draft does not load on llama.cpp master. With no draft,
+# leave the --model-draft flags out of ARGS.
 # MODEL_Q8=$MODELS/my-model-00001-of-00004.gguf
 # MODEL2_Q8=$MODELS2/my-model-00001-of-00004.gguf
 # DRAFT=$MODELS/my-draft.gguf
