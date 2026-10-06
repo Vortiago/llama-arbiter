@@ -6,7 +6,9 @@ its measurement and stops it, so that two builds never share the CPU. The
 `report` command compares every label in the TSV against a reference label.
 
     perf-ab.py prefill  --label B-main --build DIR
-    perf-ab.py generate --label B-main --build DIR
+    perf-ab.py pair     --label B-main --build DIR
+    perf-ab.py generate --label B-main --build DIR [--prompts FILE]
+    perf-ab.py depth    --label B-main --build DIR [--depth N]
     perf-ab.py kernel   --label B-main --build DIR
     perf-ab.py quality  --label B-main --build DIR [--base]
     perf-ab.py report   --ref B-main
@@ -14,6 +16,7 @@ its measurement and stops it, so that two builds never share the CPU. The
 
 import argparse
 import concurrent.futures
+import functools
 import hashlib
 import json
 import os
@@ -107,12 +110,14 @@ def parse_args():
         p.add_argument("--label", required=True)
         p.add_argument("--build", required=True, type=Path,
                        help="a build directory that holds bin/")
-        p.add_argument("--draft", type=Path, default=DRAFT,
-                       help="the MTP draft GGUF, or none to run without speculation")
         p.add_argument("--extra", default="",
                        help="flags added after the role's own, so they win")
-        p.add_argument("--reps", type=int, default=3)
         p.add_argument("--tsv", type=Path, default=TSV)
+        if name in ("prefill", "pair", "generate", "depth"):
+            p.add_argument("--draft", type=Path, default=DRAFT,
+                           help="the MTP draft GGUF, or none to run without speculation")
+        if name != "quality":
+            p.add_argument("--reps", type=int, default=3)
         p.set_defaults(func=func)
         if name in ("prefill", "pair"):
             p.add_argument("--prompt-file", type=Path, default=BENCH / "prompt-8k.txt")
@@ -279,10 +284,9 @@ def run_quality(args):
     command = [str(args.build / "bin/llama-perplexity"), "-m", str(MODEL),
                "-f", str(text), "-t", "32", "--chunks", str(args.chunks), "-c", str(args.ctx),
                "-fa", "on", "--device", "none", *shlex.split(args.extra)]
-    if args.base:
-        command += ["--kl-divergence-base", str(base)]
-    else:
-        command += ["--kl-divergence-base", str(base), "--kl-divergence"]
+    command += ["--kl-divergence-base", str(base)]
+    if not args.base:
+        command.append("--kl-divergence")
     log = subprocess.run(command, check=True, capture_output=True, text=True)
     if args.base:
         return
@@ -293,14 +297,10 @@ def run_quality(args):
 def parse_kld(text):
     """Read the mean KLD and the top-1 agreement out of llama-perplexity's log."""
     found = {}
-    match = re.search(r"Mean\s+KLD:\s+([-\d.]+)", text)
-    if match:
-        found["mean_kld"] = float(match.group(1))
-    match = re.search(r"Same top p:\s+([\d.]+)", text)
-    if match:
-        found["same_top_p"] = float(match.group(1))
     # PPL tells a harmless reshuffle of hard choices from a real loss, which KLD cannot.
-    for name, pattern in (("ppl", r"Mean PPL\(Q\)\s*:\s*([\d.]+)"),
+    for name, pattern in (("mean_kld", r"Mean\s+KLD:\s+([-\d.]+)"),
+                          ("same_top_p", r"Same top p:\s+([\d.]+)"),
+                          ("ppl", r"Mean PPL\(Q\)\s*:\s*([\d.]+)"),
                           ("ppl_base", r"Mean PPL\(base\)\s*:\s*([\d.]+)"),
                           ("ppl_ratio", r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*([\d.]+)"),
                           ("ppl_ratio_unc", r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*[\d.]+\s*±\s*([\d.]+)")):
@@ -389,12 +389,19 @@ def record(args, test, case, rep, metric, value, tokens):
     with open(args.tsv, "a") as out:
         if new:
             out.write("\t".join(COLUMNS) + "\n")
+        load, others = conditions(test, case, rep)
         row = [time.strftime("%Y-%m-%dT%H:%M:%S"), args.label, test, case, str(rep),
                metric, format_value(value), str(tokens), build_id(args.build), args.extra,
-               load_average(), f"{others_cpu():.0f}"]
+               load, f"{others:.0f}"]
         out.write("\t".join(row) + "\n")
     print(f"{args.label:16} {test:9} {case:12} {rep} {metric:12} {format_value(value)}",
           flush=True)
+
+
+@functools.cache
+def conditions(test, case, rep):
+    """Sample the load once for each rep, so every row of that rep shares it."""
+    return load_average(), others_cpu()
 
 
 def load_average():
@@ -410,24 +417,32 @@ def others_cpu():
     before = process_ticks()
     time.sleep(OTHERS_SAMPLE_SECONDS)
     after = process_ticks()
-    ticks = sum(after[pid][0] - before[pid][0] for pid in after
-                if pid in before and not is_bench(after[pid][1]))
+    # Only a process that used CPU needs its command line read.
+    busy = {pid: after[pid] - before[pid] for pid in after
+            if pid in before and after[pid] > before[pid]}
+    ticks = sum(used for pid, used in busy.items() if not is_bench(command_line(pid)))
     return 100 * ticks / os.sysconf("SC_CLK_TCK") / OTHERS_SAMPLE_SECONDS
 
 
 def process_ticks():
-    """Map each pid to its user plus system clock ticks and its command line."""
+    """Map each pid to its user plus system clock ticks."""
     found = {}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            stat = (entry / "stat").read_text()
-            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            found[entry.name] = parse_ticks((entry / "stat").read_text())
         except OSError:
             continue  # the process ended between the listing and the read
-        found[entry.name] = (parse_ticks(stat), command)
     return found
+
+
+def command_line(pid):
+    """Nothing, not an error, for a process that has ended: it counts as not the bench."""
+    try:
+        return (Path("/proc") / pid / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return ""
 
 
 def parse_ticks(stat):
@@ -444,6 +459,7 @@ def format_value(value):
     return f"{value:.4f}" if isinstance(value, float) else str(value)
 
 
+@functools.cache
 def build_id(build):
     """Name a build by the commit its source tree is at."""
     try:
