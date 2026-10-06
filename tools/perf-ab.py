@@ -291,6 +291,14 @@ def parse_kld(text):
     match = re.search(r"Same top p:\s+([\d.]+)", text)
     if match:
         found["same_top_p"] = float(match.group(1))
+    # PPL tells a harmless reshuffle of hard choices from a real loss, which KLD cannot.
+    for name, pattern in (("ppl", r"Mean PPL\(Q\)\s*:\s*([\d.]+)"),
+                          ("ppl_base", r"Mean PPL\(base\)\s*:\s*([\d.]+)"),
+                          ("ppl_ratio", r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*([\d.]+)"),
+                          ("ppl_ratio_unc", r"Mean PPL\(Q\)/PPL\(base\)\s*:\s*[\d.]+\s*±\s*([\d.]+)")):
+        match = re.search(pattern, text)
+        if match:
+            found[name] = float(match.group(1))
     if not found:
         raise RuntimeError("expected Mean KLD and Same top p in the perplexity log, found neither")
     return found
