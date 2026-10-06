@@ -22,10 +22,10 @@ serve the request. It is honoured by get_available_slot the same way it is on
 the OAI endpoints.
 
 diff --git a/tools/server/server-chat.cpp b/tools/server/server-chat.cpp
-index a6fe3c6ba..a6674f66c 100644
+index a3a4ea152..b1bc60570 100644
 --- a/tools/server/server-chat.cpp
 +++ b/tools/server/server-chat.cpp
-@@ -576,7 +576,11 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
+@@ -590,7 +590,11 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
      }
  
      // Pass through common params
