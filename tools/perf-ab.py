@@ -46,6 +46,9 @@ STARTUP_SECONDS = 900
 # A read of 8201 tokens at 40 tok/s takes about 200 s. Twice that is a hang.
 REQUEST_SECONDS = 1800
 
+# A depth fill reads up to 240k tokens once, at 20 to 40 tok/s: up to about 3.5 h.
+FILL_SECONDS = 6 * 3600
+
 COMMON = [
     "--parallel", "1", "--flash-attn", "auto", "--jinja", "--cache-ram", "0",
     "--checkpoint-min-step", "2048", "--ctx-checkpoints", "8",
@@ -197,7 +200,7 @@ def run_depth(args):
     with Server(args, "generate", slot_dir=SLOTS) as server:
         if not (SLOTS / saved).exists():
             timings = server.complete({"prompt": context, "n_predict": 0,
-                                       "cache_prompt": True})["timings"]
+                                       "cache_prompt": True}, timeout=FILL_SECONDS)["timings"]
             record(args, "depth", f"fill-{case}", 0, "prompt_tok_s",
                    timings["prompt_per_second"], timings["prompt_n"])
             server.slot_action("save", saved)
@@ -355,18 +358,18 @@ class Server:
                 time.sleep(2)
         raise RuntimeError(f"llama-server not healthy after {STARTUP_SECONDS} s")
 
-    def complete(self, body):
-        return self.post("/completion", body)
+    def complete(self, body, timeout=REQUEST_SECONDS):
+        return self.post("/completion", body, timeout)
 
     def slot_action(self, action, filename):
         """Save slot 0 to, or restore it from, a file in the slot directory."""
         return self.post(f"/slots/0?action={action}", {"filename": filename})
 
-    def post(self, path, body):
+    def post(self, path, body, timeout=REQUEST_SECONDS):
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}", data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=REQUEST_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
 
 
