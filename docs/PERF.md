@@ -175,6 +175,9 @@ close attention patch as a quality change, and test it with KLD and greedy.
 
 ## Follow-ups for the GPU box
 
+`docs/GPU-FOLLOWUPS.md` lists every item below, and the GPU ideas of Strata
+and upstream, with a priority and a way to test each one.
+
 - **Test every patch in a CUDA build there.** None of these branches was
   built with `-DGGML_CUDA=ON`. Stack3 also changes `ggml.h` and `ggml.c`, which
   every backend shares.
