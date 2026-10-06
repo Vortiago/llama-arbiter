@@ -182,7 +182,8 @@ def shelf_of(name):
     return "base" if name.startswith("base-") else "deep"
 
 
-def adopt_files(names, vouched=(), size=None, store=None, *, tuning):
+def adopt_files(names, vouched=(), size=None, store=None, *, tuning,
+                deep=()):
     """Sort the files the last run left behind, oldest first. A saved
     opening is named after its contents. A conversation's copy is good only
     if the pin file vouches for it. The pin file is asked first, because a
@@ -201,7 +202,9 @@ def adopt_files(names, vouched=(), size=None, store=None, *, tuning):
             parked.append(name)
             continue
         key = opening_key(name)
-        if key and shelf_of(name) == "base":
+        # A deep opening only if the last run said where in a message it
+        # ends: nothing else can match one.
+        if key and (shelf_of(name) == "base" or key in deep):
             openings[key] = name
             bytes_[key] = size(name)
         else:

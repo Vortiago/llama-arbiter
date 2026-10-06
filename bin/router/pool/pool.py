@@ -4,7 +4,8 @@ import queue, threading, time
 from collections import Counter, OrderedDict, deque
 from ..backends import by_place, generates, prefills
 from ..identity import copy_is_current, last_used, short_key, worth_keeping
-from ..protocol.body import common_prefix, deepest_shared, template_route
+from ..protocol.body import (common_prefix, deepest_shared, head_text,
+                             shared_start, start_key, template_route)
 from ..settings import Tuning
 from ..sizing import VISION
 from ..store.backendlog import CacheWatch, read_config, read_vision
@@ -98,6 +99,10 @@ class Pool:
         self.rates_since = None
         # Openings being read now. A session that needs one waits for it.
         self.building = {}
+        # Deep opening key -> (base key, characters of the message it holds).
+        self.starts = {}
+        # Base key -> the last few messages that came after it.
+        self.heads = {}
         self.waiting = 0          # requests with no free slot yet
         self.waiters = {}         # ticket -> the waiting request
         # Turns read and parked, waiting for a generator slot.
@@ -138,6 +143,8 @@ class Pool:
         was = {row["key"]: rank for rank, row in enumerate(remembered)}
         self.loads.update({row["key"]: row.get("loads") or 0
                            for row in remembered})
+        starts = {row["key"]: (row["base"], row["chars"]) for row in remembered
+                  if row.get("base") and isinstance(row.get("chars"), int)}
         names.sort(key=lambda n: was.get(opening_key(n), len(was)))
         kept = self.store.read_pins()
         # Both fields: a row without a conv raised KeyError at startup.
@@ -145,9 +152,11 @@ class Pool:
                    if isinstance(row, dict) and row.get("file") and row.get("conv")}
         openings, sizes, parked, spent = adopt_files(names, set(by_file),
                                                     store=self.store,
-                                                    tuning=self.tuning)
+                                                    tuning=self.tuning,
+                                                    deep=set(starts))
         with self.cv:
             self.openings, self.opening_bytes = openings, sizes
+            self.starts = {key: starts[key] for key in openings if key in starts}
             for name in parked:
                 row = by_file[name]
                 self.pins[row["conv"]] = {
@@ -953,6 +962,24 @@ class Pool:
                     plan = ("wait", base[1], None, None)
                 else:
                     plan = ("read", base[1], None, slot)
+            # Deeper than the system prompt, into the message after it: a
+            # start that message shares with an earlier one.
+            start = None
+            head = head_text(messages, base[0])
+            if head is not None and (stored is None or stored[1] == base[1]):
+                found = self._stored_start(base[1], head)
+                if found:
+                    plan = ("load", found, saved[found], slot)
+                elif not unsaved:
+                    text = shared_start(head, self.heads.get(base[1], ()),
+                                        self.tuning.system_min_chars)
+                    key = text and start_key(base[1], text)
+                    if key and key not in self.building:
+                        start = (key, text)
+                        plan = ("start", key, saved[base[1]], slot)
+                kept = self.heads.setdefault(base[1], deque(maxlen=8))
+                if head not in kept:
+                    kept.append(head)
             # Measurement only, both of these: how deep a fork could have
             # started. `shared` needs the parent to hold a slot, so the rate
             # it shows is a floor. A parked copy restores as an opening does.
@@ -1012,13 +1039,21 @@ class Pool:
             # Next to the finally that pops it, so nothing that raises can
             # sit between. A key left behind makes every later conversation
             # with this system prompt wait build_patience for nothing.
-            if plan[0] == "read":
+            if plan[0] in ("read", "start"):
                 self.building[plan[1]] = time.time()
 
         if plan[0] == "load":
             return self._load_prefix(plan[1], plan[2], be, plan[3])
         if plan[0] == "wait":
             return self._wait_for_opening(plan[1], be, slot, alive)
+        if plan[0] == "start":
+            try:
+                return self._read_start(base, start, messages, system, tools,
+                                        be, slot, path, alive, template)
+            finally:
+                with self.cv:
+                    self.building.pop(plan[1], None)
+                    self.cv.notify_all()
         try:
             return self._read_prefix(base, messages, system, tools, be,
                                      plan[3], path, alive, template)
@@ -1026,6 +1061,71 @@ class Pool:
             with self.cv:
                 self.building.pop(plan[1], None)
                 self.cv.notify_all()
+
+    def _stored_start(self, base_key, head):
+        """The deepest saved opening that runs from this base cut into a
+        message starting as this one does. Held under the lock."""
+        best = None
+        for key, (base, chars) in self.starts.items():
+            if (base == base_key and key in self.openings and len(head) >= chars
+                    and start_key(base, head[:chars]) == key
+                    and (best is None or chars > self.starts[best][1])):
+                best = key
+        return best
+
+    def _read_start(self, base, start, messages, system, tools, be, slot,
+                    path, alive, template):
+        """Load the system prompt, read on into the start the message shares,
+        and keep that as a deep opening. The request was going to read those
+        tokens anyway, so it pays only the save. True when the base loaded,
+        whatever became of the rest."""
+        key, text = start
+        if not self._load_prefix(base[1], self.openings.get(base[1]), be, slot):
+            return False
+        name = f"deep-{key}.park"
+        began = time.time()
+        self.store.link_block(name)
+        try:
+            block = self._render_block(system, tools, messages[:base[0] + 1],
+                                       be, self.link, path, alive, template,
+                                       start=text)
+            read = self.link.prefill(be, block, slot, alive,
+                                     self.tuning.read_timeout) or {}
+            answer = self.link.save(be, slot, name) or {}
+        except Exception as err:
+            print(f"[router] opening {key[:8]} failed to save on "
+                  f"{be['name']}: {err}", flush=True)
+            self.store.drop(name)
+            self.events.write("build", key=short_key(key), shelf="deep",
+                              backend=be["name"], slot=slot, ok=False,
+                              error=str(err)[:120],
+                              secs=round(time.time() - began, 1))
+            return True
+        written = self.store.size(name) or (answer.get("n_written") or 0)
+        with self.cv:
+            self.openings[key] = name
+            self.openings.move_to_end(key)
+            self.opening_bytes[key] = written
+            self.starts[key] = (base[1], len(text))
+            self.note_file("kept opening", key, be, slot, written)
+            dropped = trim_openings(self.openings, self.opening_bytes,
+                                    keep=set(self.building),
+                                    budget=self.tuning.block_budget)
+            for gone in dropped:
+                self.starts.pop(opening_key(gone), None)
+        for extra in dropped:
+            self.store.drop(extra)
+        self.save_openings()
+        timing = read.get("timings") or {}
+        self.events.write("build", key=short_key(key), shelf="deep",
+                          backend=be["name"], slot=slot, ok=True,
+                          secs=round(time.time() - began, 1), bytes=written,
+                          chars=len(text), prompt_n=timing.get("prompt_n"),
+                          cache_n=timing.get("cache_n"))
+        print(f"[router] read and kept opening {key[:8]} on {be['name']} "
+              f"slot {slot}: {len(text)} characters into the message",
+              flush=True)
+        return True
 
     def _wait_for_opening(self, key, be, slot, alive=None):
         """Wait for another request to save the opening, then load it.
@@ -1090,7 +1190,11 @@ class Pool:
         """Write down what each opening has earned, for the next run: the
         shelf order and the load counts."""
         with self.cv:
-            rows = [{"key": key, "file": name, "loads": self.loads.get(key, 0)}
+            rows = [dict({"key": key, "file": name,
+                          "loads": self.loads.get(key, 0)},
+                         **({"base": self.starts[key][0],
+                             "chars": self.starts[key][1]}
+                            if key in self.starts else {}))
                     for key, name in self.openings.items()]
         self.store.write_openings(rows)
         return len(rows)
@@ -1496,7 +1600,7 @@ class Pool:
 
     @staticmethod
     def _render_block(system, tools, head, be, link, path, alive,
-                      template=None):
+                      template=None, start=None):
         """One opening, as the backend's own template renders it: what two
         renderings that differ only after the opening share. /apply-template
         refuses anthropic tool_use and tool_result blocks, so an opening from
@@ -1519,6 +1623,13 @@ class Pool:
                 extra["system"] = system
             else:
                 opening = [{"role": "system", "content": system}] + opening
+        if start is not None:
+            # Into a user message: rendered with a mark after the shared
+            # start, and cut at the mark.
+            mark = "\u2063\u2063mark\u2063\u2063"
+            said = link.render(be, route, dict(extra, messages=opening + [
+                {"role": "user", "content": start + mark}]), alive)
+            return said["prompt"].split(mark)[0]
         full = link.render(be, route,
                            dict(extra,
                                 messages=opening + [{"role": "user",

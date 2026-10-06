@@ -1959,6 +1959,101 @@ class PrefixCase:
         return post.ops()
 
 
+class TheSharedStartOfAMessage(PrefixCase, unittest.TestCase):
+    """Two requests whose first message after the system prompt starts with
+    the same long text. A cut can only fall where a message ends, so without
+    this every one of them reads that text again.
+
+    On production a test audit sends one state a call, and the first 4,800
+    characters of every state are the same rubric. It was 1,000 of the 1,300
+    tokens a call read, about 45 s of a 110 s call."""
+
+    RUBRIC = "Judge the test by these rules.\n" * 120      # 3,720 characters
+
+    def messages(self, case):
+        return [{"role": "system", "content": "rules " * 400},
+                {"role": "user", "content": self.RUBRIC + case}]
+
+    def renders(self):
+        class Render(FakeLink):
+            def render(inner, be, route, payload, alive, timeout=None):
+                inner._note("render", be, route, alive)
+                return {"prompt": "".join(f"<{m['role']}>{m['content']}</>"
+                                          for m in payload["messages"])}
+
+            def prefill(inner, be, blk, slot, alive, timeout=None):
+                inner._note("prefill", be, slot, blk, alive)
+                return {"timings": {"prompt_n": 900, "cache_n": 1700}}
+
+            def save(inner, be, slot, name, timeout=None):
+                inner._note("save", be, slot, name)
+                return {"n_saved": 1, "n_written": 700_000_000}
+
+        return Render()
+
+    def ask(self, conv, case):
+        link = self.renders()
+        self.pool.pins[conv] = pin("cpu", slot=None, inflight=True)
+        self.pool.link = link
+        cuts, messages, system, tools = router.prompt_cuts(
+            json.dumps({"messages": self.messages(case)}))
+        loaded = self.pool.warm_prefix(conv, cuts, messages, system, tools,
+                                       self.cpu, 1, "/v1/chat/completions")
+        return loaded, link
+
+    def setUp(self):
+        super().setUp()
+        cuts, _, _, _ = router.prompt_cuts(
+            json.dumps({"messages": self.messages("x")}))
+        self.base = cuts[0][1]
+        self.pool.openings[self.base] = f"base-{self.base}.park"
+
+    def test_the_first_request_has_nothing_to_share_with(self):
+        loaded, link = self.ask("one", "case one")
+        self.assertTrue(loaded)
+        self.assertEqual(link.files(), [f"base-{self.base}.park"])
+
+    def test_the_second_reads_and_keeps_what_both_start_with(self):
+        self.ask("one", "case one")
+        loaded, link = self.ask("two", "case two")
+        self.assertTrue(loaded)
+        self.assertEqual(link.ops(), ["restore", "render", "prefill", "save"])
+        block = [call for call in link.calls if call[0] == "prefill"][0][3]
+        self.assertTrue(block.endswith(self.RUBRIC), block[-60:])
+        saved = link.files("save")[0]
+        self.assertTrue(saved.startswith("deep-"), saved)
+
+    def test_the_third_loads_it_and_reads_nothing(self):
+        self.ask("one", "case one")
+        _, made = self.ask("two", "case two")
+        loaded, link = self.ask("three", "case three")
+        self.assertTrue(loaded)
+        self.assertEqual(link.ops(), ["restore"])
+        self.assertEqual(link.files(), made.files("save"))
+
+    def test_a_short_shared_start_is_not_worth_a_file(self):
+        self.RUBRIC = "Judge it.\n"
+        self.ask("one", "case one")
+        _, link = self.ask("two", "case two")
+        self.assertEqual(link.files("save"), [])
+
+    def test_it_is_still_there_after_a_restart(self):
+        self.ask("one", "case one")
+        _, made = self.ask("two", "case two")
+        name = made.files("save")[0]
+        (SANDBOX.store.slots / name).write_bytes(b"x")
+        (SANDBOX.store.slots / f"base-{self.base}.park").write_bytes(b"x")
+        self.pool.save_openings()
+        again = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                          store=SANDBOX.store, watch=False)
+        again.adopt(remove=lambda name: None)
+        self.assertIn(name, again.openings.values())
+        self.pool, self.cpu = again, again.backends[0]
+        self.cpu.update(up=True, slots=3, n_ctx=150000, slots_detail=[])
+        _, link = self.ask("four", "case four")
+        self.assertEqual(link.files(), [name])
+
+
 class WarmPrefix(PrefixCase, unittest.TestCase):
     """What a request does about an opening.
 
@@ -2137,8 +2232,9 @@ class AdoptFiles(unittest.TestCase):
         self.assertEqual(spent, [])
 
     def test_a_deeper_opening_is_given_back_to_the_disk(self):
-        """Nothing reads one, so keeping them is 8 GB of a 92% full nvme held
-        by four files that have never been loaded once."""
+        """Unless the last run said how much of a message it holds. Without
+        that nothing can match one, so keeping them is 8 GB of a 92% full
+        nvme held by four files that have never been loaded once."""
         openings, _, _, spent = self.sized(["base-k1.park", "deep-k2.park"])
         self.assertEqual(openings, OrderedDict(k1="base-k1.park"))
         self.assertEqual(spent, ["deep-k2.park"])
