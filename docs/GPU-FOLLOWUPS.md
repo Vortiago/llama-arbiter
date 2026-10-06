@@ -52,22 +52,22 @@ below in order, before you test any item on this page.
 
 ### Build two trees
 
-1. Build the patched tree (the `stack3` of `docs/PERF.md`):
-   `CUDA=1 tools/get-llama.sh`.
+1. Build the patched tree (the `stack4` of `docs/PERF.md`, core plus both
+   optional sets): `CUDA=1 CPU_OPTIONAL="I1 Q1" tools/get-llama.sh`.
 2. Build the extra targets in that tree:
    `cmake --build llama.cpp-mtp/build -j --target llama-bench llama-perplexity test-backend-ops`.
 3. Clone and patch a second tree for the reference (`B-main`):
    `BUILD=0 DIR=$PWD/llama.cpp-main tools/get-llama.sh`.
-4. Remove the CPU series from it, last patch first:
-   `for p in $(ls -r patches/cpu/*.patch); do git -C llama.cpp-main apply -R "$PWD/$p"; done`.
+4. Remove the core CPU patches from it, last patch first:
+   `for p in $(ls -r patches/cpu/core/*.patch); do git -C llama.cpp-main apply -R "$PWD/$p"; done`.
 5. Configure it: `cmake -S llama.cpp-main -B llama.cpp-main/build -DGGML_CUDA=ON`.
 6. Build it:
    `cmake --build llama.cpp-main/build -j --target llama-server llama-bench llama-perplexity test-backend-ops`.
 
 ### Check the ops the series touches
 
-A CUDA build compiles the CPU backend too, and Q1 changes `ggml.c`, which every
-backend shares. `test-backend-ops` compares the card against the CPU backend,
+A CUDA build compiles the CPU backend too, and Q1 and U4 change `ggml.c`, which
+every backend shares. `test-backend-ops` compares the card against the CPU backend,
 so a mismatch here means the patched CPU backend and the card disagree.
 
     llama.cpp-mtp/build/bin/test-backend-ops test -b CUDA0 \
@@ -108,7 +108,7 @@ Then measure each build:
     tools/perf-ab.py depth    --label B-main --build llama.cpp-main/build --depth 131072
     tools/perf-ab.py quality  --label B-main --build llama.cpp-main/build --base
 
-Repeat the first three with `--label stack3 --build llama.cpp-mtp/build`, and
+Repeat the first three with `--label stack4 --build llama.cpp-mtp/build`, and
 `quality` without `--base`. The first `depth` run reads 131072 tokens and parks
 a copy of the slot. Later runs recall that copy. A change to the KV type (N2)
 cannot recall it, so move `BENCH/slots/depth128k.bin` aside before you
@@ -214,7 +214,7 @@ small share of a CPU-only step can be a larger share there.
 | H3 | the MTP draft gate: draft only while its confidence is 0.5 or more | `--spec-draft-p-min 0.5` gave -2.0 to +5.1% on stack2 and changed the greedy replies | Strata gates at 0.5 (`--spec-min-p 0.5`) and measures 1.6 to 1.8x, with 2.4 to 3.2 tokens a verify pass. The cost of a verify differs on the card. | Paired A/B of generate. Compare greedy only in the same mode. |
 | H4 | adaptive draft depth (U5) | -0.2 to +2.3%: a fixed n-max 3 was as fast | the ratio of draft cost to verify cost differs | Branch `perf/U5-adaptive-mtp-depth` on llm-lab. Test only if H3 gains. |
 | H5 | a reduced draft vocabulary (S1) | acceptance -1.9 to -18.1% | Strata gains +15 to 38% for CJK text only | **low**: retest only for a CJK workload |
-| H6 | flags: `--spec-draft-n-max` 2 to 4, `--spec-type ngram-mod,draft-mtp`, generate threads, `-ub` | n-max 3 best, no gain from the n-gram chain, 16 threads best, `-ub 2048` +6.6% for one backend alone, not yet measured with both prefill backends at once | each result measured the CPU box | Run each flag against stack3 on the GPU box. `-ub` is N3. |
+| H6 | flags: `--spec-draft-n-max` 2 to 4, `--spec-type ngram-mod,draft-mtp`, generate threads, `-ub` | n-max 3 best, no gain from the n-gram chain, 16 threads best, `-ub 2048` +6.6% for one backend alone, inconclusive with both prefill backends at once (+4.6% and -0.8% in two rounds), so 512 stays | each result measured the CPU box | Run each flag against stack4 on the GPU box. `-ub` is N3. |
 | H7 | the split between card and RAM, `--n-cpu-moe` | not applicable | one expert layer on the card is 2.49 GiB. With f16 KV (N2 is excluded) there may be no room for one. The CPU series also changes how fast a RAM layer runs. | Try 47 and 46 if VRAM allows with f16 KV, against N1 with the same VRAM. |
 | H8 | X2: four accumulators in the AVX2 `vec_dot_q8_0` | 8k prefill +0.6%, pp512 -3.5%: no gain past drift. Generate was not measured. Not bit-exact. | the CPU experts use this dot at generate, which is all the CPU does there. It applies only if the GPU box's CPU takes the AVX2 path. | Branch `perf/s2-X2-vec-dot-q8_0-4acc` on llm-lab. Paired A/B of generate, then the KLD gate. |
 
@@ -224,25 +224,26 @@ QSA, so its attention window does not apply.
 
 ## Our CPU patches, retested there
 
-The series in `patches/cpu/` changes the CPU backend and its tests. Outside
-them, only Q1 changes shared code: `ggml_argsort_top_k` in `ggml.c`, and a
-comment in `ggml.h`. U4, which is parked and not in the series, changes the
-alignment of allocations in `ggml-base`. With
-`--n-cpu-moe 48` the CPU still runs every expert at generate. Read the
+The patches in `patches/cpu/` change the CPU backend and its tests. Outside
+them, two change shared code. Q1 changes `ggml_argsort_top_k` in `ggml.c`, and
+a comment in `ggml.h`. U4's `core/0012` changes the alignment of large
+allocations in `ggml-base`. With `--n-cpu-moe 48` the CPU still runs every
+expert at generate. Read the
 scheduler output from "Before anything else" before you judge a row: a patch
 gains nothing when its op runs on the card.
 
 | patch | id | runs on the CPU there? | watch for |
 |---|---|---|---|
-| 0003 | X3 | yes: each expert gets 1 to 4 rows a verify | the main gain to expect at generate. Retest the generate thread count with it. |
-| 0006 | M3 | yes, between the expert matmuls | `GGML_CPU_SERIAL_BYTES=0` turns it off for a paired A/B |
-| 0001, 0002 | X1 | rarely: prefill experts run on the card at 32 tokens or more | A/B prefill with `--no-op-offload` (experts on the CPU with X1) against the upload of N3 |
-| 0012, 0013 | Q1 | no: the router's argsort runs on the card | `ggml.c` changed for every backend. The CUDA argsort reads only the sort order. Check `ARGSORT` and `TOP_K` in `test-backend-ops`, a greedy hash equal to `B-main`, and no generate loss (the CUDA top-k MoE fusion must still fire). |
-| 0004 | I4A | only if the recurrent state is in RAM | no change expected with `-ngl 99` |
-| 0005 | I4B | only if `GATED_DELTA_NET` runs on the CPU | no change expected with `-ngl 99` |
-| 0007 to 0011 | W1, W2, I1 | no, with `-ngl 99` | no change expected. I1 is not bit-exact, on the CPU only. |
-| not in the series | K3 | only if the weighted sum of the experts runs on the CPU | branch `perf/s2-K3-cpu-moe-weighted-reduction` on llm-lab. Retest if the scheduler output puts the sum on the CPU. |
-| not in the series | U4, #27478 | its attention part does not. Its 2 MiB alignment and `MADV_HUGEPAGE` touch the CPU buffers of a CUDA build | resident memory, load time and generate. The experts are file-backed with mmap. `--load-mode none` puts them in pinned `CUDA_Host` buffers instead, so the alignment reaches them only with `GGML_CUDA_NO_PINNED=1` as well. |
+| `core/0003` | X3 | yes: each expert gets 1 to 4 rows a verify | the main gain to expect at generate. Retest the generate thread count with it. |
+| `core/0006` | M3 | yes, between the expert matmuls | `GGML_CPU_SERIAL_BYTES=0` turns it off for a paired A/B |
+| `core/0001`, `0002` | X1 | rarely: prefill experts run on the card at 32 tokens or more | A/B prefill with `--no-op-offload` (experts on the CPU with X1) against the upload of N3 |
+| `optional/Q1` | Q1 | no: the router's argsort runs on the card | `ggml.c` changed for every backend. The CUDA argsort reads only the sort order. Check `ARGSORT` and `TOP_K` in `test-backend-ops`, a greedy hash equal to `B-main`, and no generate loss (the CUDA top-k MoE fusion must still fire). |
+| `core/0004` | I4A | only if the recurrent state is in RAM | no change expected with `-ngl 99` |
+| `core/0005` | I4B | only if `GATED_DELTA_NET` runs on the CPU | no change expected with `-ngl 99` |
+| `core/0007` to `0009`, `optional/I1` | W1, W2, I1 | no, with `-ngl 99` | no change expected. I1 is not bit-exact, on the CPU only. |
+| `core/0010` | K3 | only if the weighted sum of the experts runs on the CPU | retest if the scheduler output puts the sum on the CPU |
+| `core/0011` to `0013` | U4, #27478 | its attention part does not. Its 2 MiB alignment and `MADV_HUGEPAGE` touch the CPU buffers of a CUDA build | resident memory, load time and generate. The experts are file-backed with mmap. `--load-mode none` puts them in pinned `CUDA_Host` buffers instead, so the alignment reaches them only with `GGML_CUDA_NO_PINNED=1` as well. |
+| `core/0014` to `0017` | K1 | no: prefill attention runs on the card | no change expected |
 
 ### The removed fit patch
 
