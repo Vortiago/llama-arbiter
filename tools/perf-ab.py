@@ -50,7 +50,6 @@ COMMON = [
     "--checkpoint-min-step", "2048", "--ctx-checkpoints", "8",
     "--no-cache-idle-slots", "--device", "none",
     "--temp", "1.0", "--top-p", "0.95", "--top-k", "20", "--min-p", "0.0",
-    "--spec-type", "draft-mtp", "--spec-draft-n-max", "3",
 ]
 
 # The flags of bin/cpu-prefill.sh and bin/cpu-generate.sh, one slot each.
@@ -81,7 +80,12 @@ DEPTH_EXTENSION_CHARS = 8000
 DEPTH_REPLY_TOKENS = 256
 
 COLUMNS = ["time", "label", "test", "case", "rep", "metric", "value", "tokens",
-           "build", "flags"]
+           "build", "flags", "load", "others_cpu"]
+
+# The box also runs other people's containers. A rep taken while one of them
+# compiles reads slow, so each row carries the load it was measured under.
+BENCH_PROCESSES = ("llama-server", "llama-bench", "llama-perplexity", "perf-ab.py")
+OTHERS_SAMPLE_SECONDS = 0.5
 
 
 def main():
@@ -99,7 +103,8 @@ def parse_args():
         p.add_argument("--label", required=True)
         p.add_argument("--build", required=True, type=Path,
                        help="a build directory that holds bin/")
-        p.add_argument("--draft", type=Path, default=DRAFT)
+        p.add_argument("--draft", type=Path, default=DRAFT,
+                       help="the MTP draft GGUF, or none to run without speculation")
         p.add_argument("--extra", default="",
                        help="flags added after the role's own, so they win")
         p.add_argument("--reps", type=int, default=3)
@@ -119,6 +124,8 @@ def parse_args():
             p.add_argument("--base", action="store_true",
                            help="write the base logits rather than compare to them")
             p.add_argument("--chunks", type=int, default=20)
+            p.add_argument("--ctx", type=int, default=512,
+                           help="tokens per chunk; each context size has its own base logits")
 
     p = sub.add_parser("report")
     p.add_argument("--ref", required=True)
@@ -234,10 +241,10 @@ def parse_bench(output):
 
 
 def run_quality(args):
-    base = BENCH / "kld-base.bin"
+    base = BENCH / ("kld-base.bin" if args.ctx == 512 else f"kld-base-c{args.ctx}.bin")
     text = BENCH / "wiki.test.raw"
     command = [str(args.build / "bin/llama-perplexity"), "-m", str(MODEL),
-               "-f", str(text), "-t", "32", "--chunks", str(args.chunks),
+               "-f", str(text), "-t", "32", "--chunks", str(args.chunks), "-c", str(args.ctx),
                "-fa", "on", "--device", "none", *shlex.split(args.extra)]
     if args.base:
         command += ["--kl-divergence-base", str(base)]
@@ -247,7 +254,7 @@ def run_quality(args):
     if args.base:
         return
     for metric, value in parse_kld(log.stdout + log.stderr).items():
-        record(args, "quality", "wiki", 0, metric, value, args.chunks)
+        record(args, "quality", f"wiki-c{args.ctx}", 0, metric, value, args.chunks)
 
 
 def parse_kld(text):
@@ -264,6 +271,13 @@ def parse_kld(text):
     return found
 
 
+def draft_flags(draft):
+    """Name the MTP draft, or nothing when the draft is the word none."""
+    if str(draft) == "none":
+        return []
+    return ["--model-draft", str(draft), "--spec-type", "draft-mtp", "--spec-draft-n-max", "3"]
+
+
 class Server:
     """One llama-server on PORT, started for a measurement and stopped after it."""
 
@@ -271,8 +285,8 @@ class Server:
         self.log_path = BENCH / "run" / f"{args.label}-{role}.log"
         slots = ["--slot-save-path", f"{slot_dir}/"] if slot_dir else []
         self.command = [str(args.build / "bin/llama-server"), "--model", str(MODEL),
-                        "--model-draft", str(args.draft), "--ctx-size", str(CTX),
-                        *COMMON, *ROLE_FLAGS[role], *slots, *shlex.split(args.extra),
+                        "--ctx-size", str(CTX), *COMMON, *draft_flags(args.draft),
+                        *ROLE_FLAGS[role], *slots, *shlex.split(args.extra),
                         "--host", "127.0.0.1", "--port", str(PORT)]
         self.process = None
 
@@ -334,10 +348,54 @@ def record(args, test, case, rep, metric, value, tokens):
         if new:
             out.write("\t".join(COLUMNS) + "\n")
         row = [time.strftime("%Y-%m-%dT%H:%M:%S"), args.label, test, case, str(rep),
-               metric, format_value(value), str(tokens), build_id(args.build), args.extra]
+               metric, format_value(value), str(tokens), build_id(args.build), args.extra,
+               load_average(), f"{others_cpu():.0f}"]
         out.write("\t".join(row) + "\n")
     print(f"{args.label:16} {test:9} {case:12} {rep} {metric:12} {format_value(value)}",
           flush=True)
+
+
+def load_average():
+    return Path("/proc/loadavg").read_text().split()[0]
+
+
+def others_cpu():
+    """Return the CPU percent that processes outside the bench use now.
+
+    ps reports CPU averaged over a process's whole life, so a compile that
+    has just started would not show. Two /proc samples half a second apart do.
+    """
+    before = process_ticks()
+    time.sleep(OTHERS_SAMPLE_SECONDS)
+    after = process_ticks()
+    ticks = sum(after[pid][0] - before[pid][0] for pid in after
+                if pid in before and not is_bench(after[pid][1]))
+    return 100 * ticks / os.sysconf("SC_CLK_TCK") / OTHERS_SAMPLE_SECONDS
+
+
+def process_ticks():
+    """Map each pid to its user plus system clock ticks and its command line."""
+    found = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue  # the process ended between the listing and the read
+        found[entry.name] = (parse_ticks(stat), command)
+    return found
+
+
+def parse_ticks(stat):
+    """Read utime plus stime from a /proc/<pid>/stat line."""
+    fields = stat[stat.rindex(")") + 2:].split()
+    return int(fields[11]) + int(fields[12])
+
+
+def is_bench(command):
+    return any(name in command for name in BENCH_PROCESSES)
 
 
 def format_value(value):
