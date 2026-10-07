@@ -100,6 +100,23 @@ ratio 0.998 ± 0.005.
 `ggml_backend_sched_split_graph`. If upstream changes that rule, this
 copy must follow it.
 
+### sched-reserve-keeps-the-scheduler.patch
+
+Not required. A port of upstream #28872.
+
+With `--backend-sampling`, llama-server's slot reset detaches the sampler
+after every request, so the next one sets `sched_need_reserve`, and
+`sched_reserve()` destroyed and rebuilt the whole backend scheduler: every
+compute buffer and the pinned host input buffer, freed and allocated again.
+The patch re-reserves on the existing scheduler.
+
+Measured on koishi's gpu backend layout, a cached 1000-token prefix plus 10
+to 50 new tokens per request, three rounds: time to first token rose by 332
+to 377 ms per plain request with backend sampling against without it, and
+by 40 to 56 ms with the patch. A run of grammar requests never paid it,
+because a grammar turns backend sampling off. Outputs, grammar
+probabilities and perplexity identical.
+
 ### anthropic-apply-template.patch
 
 `/apply-template` reads openai-shaped messages only. A `/v1/messages` client
