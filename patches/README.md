@@ -75,6 +75,31 @@ The anthropic endpoint converts a request body through a whitelist. It drops
 every field that is not on that list, including `id_slot`. A router in front of
 the server therefore cannot say which slot a request must use.
 
+### moe-sum-where-the-experts-run.patch
+
+Not required. It speeds up a backend that keeps its experts in RAM and the
+rest on a card.
+
+The weighting of the expert outputs by the router and their sum have no
+weight, so the scheduler places them by their neighbours, and its
+expand-gpu-up pass put them on the card. Every layer then copied all the
+used experts' rows over PCIe: at 512 tokens and 10 experts, 50 MB, where
+the sum is 5 MB. The patch puts them on the backend that runs the experts'
+matmul. A backend with its experts on the card, or op offload of a large
+batch, keeps them there.
+
+Measured on koishi (RTX A4000 on PCIe gen3 x8, experts in RAM, op offload
+off), three alternating rounds: prompt 8.38 / 8.39 / 8.47 ms a token
+against 7.48 / 7.55 / 7.51 (+10.7%); a 4-token verify step 134.5 to 131.6
+ms, within noise. Over 20 chunks the outputs moved by mean KLD 0.045
+against the unpatched GPU run, less than a CPU-only run of the same model
+(0.047): the size of any change of summation order on this model. PPL
+ratio 0.998 ± 0.005.
+
+`weight_op_backend` repeats the rule of pass 1 of
+`ggml_backend_sched_split_graph`. If upstream changes that rule, this
+copy must follow it.
+
 ### anthropic-apply-template.patch
 
 `/apply-template` reads openai-shaped messages only. A `/v1/messages` client
