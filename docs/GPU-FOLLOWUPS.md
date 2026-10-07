@@ -41,6 +41,7 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
 | optional I1 alone, Q1 alone | CPU run, node 0 quiet, 3 rounds B / I1 / Q1 (agent optsets) | prompt 19.79 / 19.84 / 19.56; verify 323.2 / 314.8 / 310.8 | I1: prompt 22.01 / 18.58 / 18.02, verify 316.1 / 307.5 / 312.1. Q1: prompt 19.14 / 18.93 / 20.07, verify 310.8 / 309.1 / 305.1 | no end-to-end gain beyond the baseline's spread (verify 12.4 ms). Q1 was faster at verify in every round, by 6 to 12 ms |
 | quality of I1 and Q1 | 20 chunks of 512, KLD against the deployed build, which is deterministic (base against base: KLD 0, 100% same top) | PPL 11.5921 | I1: KLD 0.0449, same top 89.3%, PPL 11.7051 (the SIMD sigmoid alone: KLD 0.0451). Q1: KLD 0.0017, same top 99.3%, PPL 11.5974, identical for 3 chunks | I1: KLD at the level of any change of summation order here (a CPU-only run is 0.047 from a GPU run), so quality does not rule it out; its end-to-end speed gain is unproven. Q1 not bit-exact (router ties, unverified), small |
 | MoE weighted sum where the experts run (agent moesum, `exp/moesum` 5ee87eeb4, `src/llama-graph.cpp`) | GPU run, node 0 quiet, 3 rounds, 1024-token prompt | prompt 8.38 / 8.39 / 8.47 ms/token; verify 136.5 / 132.9 / 134.1 ms | prompt 7.48 / 7.55 / 7.51; verify 131.6 / 130.4 / 132.8 | prefill +10.7% (2000 tokens: 8.42 -> 7.57). Verify about 2%, within noise. The boundary copy per layer at 512 tokens fell from 50 MB to 5 MB. 20 chunks: KLD 0.0447, same top 89.8%, PPL ratio 0.998 ± 0.005, against the GPU run; a CPU-only run gives KLD 0.0471, same top 89.0%. Ready to deploy as `patches/moe-sum-where-the-experts-run.patch` |
+| Q8_0 expert rows read once for up to 4 tokens, with prefetch (agent kern4, `core/0020`) | CPU run, node 0 quiet, 3 rounds; kernel benchmark at the model's shapes | verify 311.9 / 311.2 / 309.6 ms; 4-token gate / down 597-604 / 612-622 us | verify 303.8 / 305.2 / 307.5; gate / down 543-557 / 547-559 | bit-exact. Kernel +9-10%, verify +1.7 to 2.8%. AVX-512BW was slower (568-588 us). Ready to deploy |
 | N1 expert cache, #29887, 1500 MiB | GPU run, ctx 150000, 3 prompts x 2 rounds | 14.5-14.8 / 18.9-20.2 / 16.9-18.7 tok/s | 1.8-1.9 / 2.1 / 2.0 tok/s | rejected: 0.00% hits on this card |
 | `--spec-draft-p-min 0.5` (H3) | gpu backend, temperature 1.0, 2 rounds | see `--backend-sampling` baseline | 12.9-13.4 / 17.3-17.6 / 15.3-16.3 tok/s | rejected: -2 to -5% |
 | threads 14 / 16 / 17 / 18 (`-t` = `-tb`) | CPU run and GPU run, node 0 quiet, two passes in reversed order | 18: GPU prompt 8.41, 8.37 ms/token; CPU prompt 20.27, 19.61 | GPU prompt 17: 8.69, 8.72; 16: 9.16, 9.02. CPU prompt 17: 20.25, 20.40; 14: 24.09, 23.51 | keep 18. Verify: no count beats the spread (up to 21 ms CPU, 4 ms GPU). A 4-token verify runs on the `-tb` pool, so `-t` alone changes nothing there |
@@ -65,6 +66,9 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
 - This model is sensitive to the order of f32 sums: a CPU-only run and a GPU
   run of the same build differ by mean KLD 0.047 and 11% of top tokens over
   20 chunks. Judge a change's KLD against that line, not against 0.
+- The live model's experts are a file mmap on 4 KiB pages (`FilePmdMapped`
+  0 kB), where the kernel benchmark's buffers likely sit on huge pages. Not
+  yet tested.
 - Load on node 1 moves node-0 numbers: the same CPU-run setting read prompts
   at 19.6 to 20.3 ms/token with node 1 busy and 18.7 to 18.8 with it idle.
   Compare only inside one session's alternating rounds.
