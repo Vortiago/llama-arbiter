@@ -197,6 +197,7 @@ class Turn:
             warm = bool(conv) and pool.holds_slot(conv)
             pool.note_stage(conv, "prefill", be["name"], slot, work)
             pool.ensure_parked(be, conv)
+            pool.take_slot(be, slot, conv)
             if pool.forget_stale_park(conv, cuts):
                 pool.events.write("start_over", conv=short, reason="stale_copy",
                                   client=client.kind, path=ask.path)

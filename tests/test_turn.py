@@ -526,6 +526,37 @@ class ACacheIsWrittenToDiskOnce(unittest.TestCase):
         self.assertIsNone(pool.parker)         # no worker was even started
 
 
+class ASlotHoldsOneConversation(unittest.TestCase):
+    """A turn that takes a slot overwrites what was in it. A pin that still
+    claimed the slot was saved again before every later turn on that
+    backend, with another conversation's cache in it: on koishi, 3861
+    copies of 229 conversations in one day, 3.3 TB written."""
+
+    def resident(self, pool):
+        pool.pins["old"] = parked_copy("old.park")
+        pool.pins["old"].update(slot=0, tokens=50_000)   # worth a copy
+
+    def test_the_turn_that_takes_a_slot_ends_the_old_claim(self):
+        pool = one_backend()
+        self.resident(pool)
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient())
+
+        self.assertIsNone(pool.pins["old"]["slot"])
+
+    def test_a_claim_that_ended_is_not_saved_again(self):
+        pool = one_backend()
+        self.resident(pool)
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient())
+        pool.pins["old"]["parked"] = None      # the budget took its copy
+        pool.link.calls.clear()
+        pool.turn(router.Ask("/v1/chat/completions", prompt(20), "c2"),
+                  FakeClient())
+
+        self.assertNotIn(("save", "cpu", "old.park"), pool.link.calls)
+
+
 class AStreamSaysNothingAfterItsLastWord(unittest.TestCase):
     """A keep-alive chunk written after the stream's terminator stays on the
     connection, and the next request on that connection reads it as its own

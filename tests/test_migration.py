@@ -4502,6 +4502,15 @@ class TheHandoffCanBeTurnedOff(unittest.TestCase):
         post = linked(self.pool, FakeLink(written=200_000_000))
         self.assertIs(self.pool.hand_off("a", self.cpu, 1000), self.gpu)
 
+    def test_the_slot_it_moves_into_holds_nobody_else_after(self):
+        """The restore overwrites the generator's slot. A claim left on it
+        was copied again before later turns, with this cache inside."""
+        self.pool.tuning = replace(SANDBOX.tuning, handoff=True)
+        self.pool.pins["old"] = pin("gpu0_0", slot=0, parked="old.park")
+        linked(self.pool, FakeLink(written=200_000_000))
+        self.assertIs(self.pool.hand_off("a", self.cpu, 1000), self.gpu)
+        self.assertIsNone(self.pool.pins["old"]["slot"])
+
 
 class TheRightPingForTheProtocol(unittest.TestCase):
     """Each protocol has its own keep-alive, and a client only accepts its own.

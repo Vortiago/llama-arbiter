@@ -740,6 +740,21 @@ class Pool:
             del self.holds[key]
             self.holds_depth.pop(key, None)
 
+    def take_slot(self, be, slot, conv):
+        """This conversation's cache goes into this slot, so no other is in
+        it any more. ensure_parked has copied whatever was worth a copy. A
+        claim left standing was saved again before every later turn on the
+        backend, with this conversation's cache under the other's name."""
+        with self.cv:
+            self._end_claims(be, slot, conv)
+
+    def _end_claims(self, be, slot, conv):
+        """take_slot, held under the lock."""
+        for name, record in self.pins.items():
+            if (name != conv and record.get("backend") == be["name"]
+                    and record.get("slot") == slot):
+                record["slot"] = None
+
     def holds_slot(self, conv):
         """True when the router knows which slot holds this conversation."""
         with self.cv:
@@ -1335,6 +1350,7 @@ class Pool:
         with self.cv:
             record = self.pins.get(conv)
             if record:
+                self._end_claims(target, free, conv)
                 record["backend"] = target["name"]
                 record["slot"] = free
                 # Both: `slot` is where the cache is, `using` is what this
