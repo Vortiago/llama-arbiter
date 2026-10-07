@@ -89,7 +89,8 @@
 #
 # "prefill" can also list the paths an instance reads for. It is then the
 # generator for every other path. At least one instance must read every path.
-# koishi runs gpu0_0 with "prefill": ["/v1/systemone"]. It first went back
+# koishi runs gpu0_0 with "prefill": true: it reads every path, about twice
+# as fast as a cpu socket. Before that it read /v1/systemone only. It first went back
 # to false: the gpu read 120-token questions at 9.4 tokens/s, because each
 # batch copied the experts over PCIe. With GGML_OP_OFFLOAD_MIN_BATCH high
 # (bin/qwen-mtp.sh) it reads them at about 68, against 37 on a cpu socket.
