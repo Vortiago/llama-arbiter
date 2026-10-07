@@ -16,6 +16,10 @@ ARGS=(
   --n-cpu-moe "${N_CPU_MOE:-48}"
                        # Attention and KV on the card, experts in RAM. VRAM is
                        # the limit, not RAM. Raise it for a smaller card.
+  --cpu-moe-draft      # The draft's experts too, as the model's are: 2.5 GiB
+                       # of VRAM. The ggml-org draft adds a 644 MiB output
+                       # head, and with its experts on the card the draft
+                       # context did not fit at ctx 150000.
   --ctx-size "${CTX:-150000}"
                        # Sized to this card's 16 GiB at f16 KV, about 36.5 KiB
                        # a token. Every backend must use the same CTX (see
