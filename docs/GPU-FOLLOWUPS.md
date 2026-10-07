@@ -48,6 +48,7 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
 | MTP draft `hnorm` over all four streams, as vLLM, SGLang and TensorRT-LLM do (R6, agent hnorm, `exp/hnorm` a7e9b19c0) | test server in the gpu backend's layout, 10 prompts x temperature 0 and 1.0, 3 rounds | acceptance 0.682 (temp 0), 0.578 (temp 1.0); 19.22 / 17.27 tok/s aggregate | acceptance 0.645, 0.543; 18.54-18.63 / 16.63-16.71 tok/s | rejected: the reference form accepts fewer drafts here (-3.5% generate). Outputs identical. Lead: something else in llama.cpp's draft path may differ from the reference (the MTP block's rope_theta 1e7 is unchecked) |
 | keep the scheduler on re-reserve, #28872 ported (R1, agent schedreuse, `patches/sched-reserve-keeps-the-scheduler.patch`) | test server in the gpu backend's layout, 1000-token cached prefix + 10-50 new tokens a request, 3 rounds, medians | time to first token with backend sampling: plain 1331-1374 ms, alternating with grammar 1352-1371 ms; without backend sampling 966-1002 / 962-976 | plain 1013-1036 ms, alternating 1020-1056 | about 300 ms saved per request after a plain one; backend sampling now costs 40-80 ms of time to first token instead of 330-380. Identical outputs. Ready to deploy. #29986 (R14): no effect here |
 | the MoE sum patch + core/0020 + core/0021 + core/0022 together (agent integrate, `exp/integrate`) | test server in the gpu backend's layout, 3 rounds; profiler GPU and CPU runs, 3 rounds | server: generate 17.41 / 17.28 / 17.26 tok/s, 148.9-150.2 ms a verify step, 2000-token read 108.6-110.2 tok/s. GPU run: prompt 8.25 ms/token, verify 124.6 ms. CPU run: verify 315.5 ms | server: 18.38 / 18.22 / 18.28 tok/s, 133.9-135.1 ms a step, 121.5-123.1 tok/s. GPU run: 7.36, 112.1. CPU run: 308.5 | generate +5.6% (per step -10%; acceptance 0.540 -> 0.497 because the text differs), prompt read +11.9%. GPU-run KLD 0.0447, all from the MoE sum; CPU run bit-identical. Tool calls and grammar answers correct; one question's grammar_mass moved 0.68 -> 0.39. Ready to deploy |
+| Strata GPU kernels (N10, agent stratakern): #413 DeltaNet 3 heads a warp, #188 GDN prefetch, #187 indexer keys read once; and a concat fix | GPU run, verify steps, 3 rounds; nsys kernel trace; test-backend-ops | verify 123.8 / 124.6 / 125.3 ms; card kernel time 24.3 ms a step | verify 127.1 / 123.3 / 123.5 ms; 23.3 ms | #413 slower (4 tokens 25.6 -> 29.9 us), reverted; #188 no change; #187 exact, gains only at long context (kv 32768: 190 -> 115 us); concat exact, 945 -> 97 us a step. End to end within the spread. Kept as core/0023-0025 |
 | N1 expert cache, #29887, 1500 MiB | GPU run, ctx 150000, 3 prompts x 2 rounds | 14.5-14.8 / 18.9-20.2 / 16.9-18.7 tok/s | 1.8-1.9 / 2.1 / 2.0 tok/s | rejected: 0.00% hits on this card |
 | `--spec-draft-p-min 0.5` (H3) | gpu backend, temperature 1.0, 2 rounds | see `--backend-sampling` baseline | 12.9-13.4 / 17.3-17.6 / 15.3-16.3 tok/s | rejected: -2 to -5% |
 | threads 14 / 16 / 17 / 18 (`-t` = `-tb`) | CPU run and GPU run, node 0 quiet, two passes in reversed order | 18: GPU prompt 8.41, 8.37 ms/token; CPU prompt 20.27, 19.61 | GPU prompt 17: 8.69, 8.72; 16: 9.16, 9.02. CPU prompt 17: 20.25, 20.40; 14: 24.09, 23.51 | keep 18. Verify: no count beats the spread (up to 21 ms CPU, 4 ms GPU). A 4-token verify runs on the `-tb` pool, so `-t` alone changes nothing there |
@@ -70,6 +71,15 @@ of 400 KB); card-to-host 1.1 ms; host time in CUDA calls while the card idles
 10.5 ms (graph launches 114 us each, 5.4 ms; 404 stream syncs). The CPU and
 llama.cpp take the other 105 ms. The first two steps after a prompt take
 about 210 ms each: they build the CUDA graphs for the new batch shape.
+
+### Where the card's 24 ms of a verify step go (nsys, kernel level)
+
+Dense Q8_0 matrix-vector products (MMVQ) take 61%, at 340 to 400 GB/s for
+the large weights, near the A4000's 448 GB/s; the small-K hyper-connection
+`hc_up` runs at about 145 GB/s (2.35 ms a step). Then `quantize_q8_1` 4.7%
+(665 calls), the F32 router matmul 3.7% (16 blocks), GATED_DELTA_NET 3.1%,
+GET_ROWS 2.0%, the indexer 0.3%. The kernels Strata tuned are a small share
+here at short context.
 
 ### Facts about this box
 

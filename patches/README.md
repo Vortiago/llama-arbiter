@@ -5,8 +5,8 @@ ggml-org master `8e1642198`, the commit that `llama-ref` names.
 
 - The server patches in this directory change `llama-server`. Three of them
   are required.
-- The CPU speed patches in `cpu/` make Qwen3.8-Flash-Next faster on the CPU
-  backend. None of them is required. `cpu/core/` applies by default, and each
+- The speed patches in `cpu/` make Qwen3.8-Flash-Next faster on the CPU
+  backend; from `core/0021` on, some change the scheduler and the CUDA backend. None of them is required. `cpu/core/` applies by default, and each
   set in `cpu/optional/` applies only when `CPU_OPTIONAL` names it.
 
 `tools/get-llama.sh` checks out that commit and applies the server patches in
@@ -248,6 +248,9 @@ and 12.2% on tg128, so a smaller single-run change is not a result.
 | `core/0020` | N2 | A Q8_0 expert with 1 to 4 rows reads each weight row once for all its rows, with a software prefetch 4 KiB ahead, instead of once per row. | koishi, node 0: 4-token expert matmul +9 to 10%; verify step 310.9 to 305.5 ms mean (+1.7 to 2.8%, beyond the spread in two of three A/Bs) | bit-exact (27000 outputs; PPL identical) |
 | `core/0021` | | upstream #29796 rebased: on one device, a stream synchronize returns at once when nothing was submitted since the last one. | no gain alone on koishi | exact |
 | `core/0022` | N3 | The scheduler queues the copies between host memory and a backend's own buffer on that backend's stream: host-to-card copies run ahead of the graph launch, and the card-to-host copies of one split share one synchronize. An event lets the call return once the host memory it reads is free. | with 0021, a 4-token verify step about 2% faster on koishi; 404 syncs a step fell to 78 | exact. Tested on one card only |
+| `core/0023` | | `test-backend-ops` cases for the GPU verify path at the model's shapes: GDN with 3 value heads per q/k head, the dense Q8_0 weights, the indexer at kv 256, 8192 and 32768. | | tests only |
+| `core/0024` | | CUDA `concat` of a non-contiguous source runs one thread per element; one 256-thread block per row left 249 threads idle. The DeltaNet conv-state concat went 25.5 to 2.6 us a call. | koishi: 945 to 97 us of card time a verify step, below the 1-3 ms spread end to end | exact (a copy) |
+| `core/0025` | | The CUDA vector lightning indexer reads its keys once for all the batches of a block (Strata #187). | kv 32768 (about 128K context): 190 to 115 us; the same at short context | exact |
 | `optional/I1/0001, 0002` | I1 | A SIMD sigmoid, which the gated `dsv4_hc_pre` now uses row by row. | *paired* on stack2: pp512 +2.4%, 8k prefill +1.7% | at most 1.2e-7 per op. KLD 0.020, same top token 96.0%, PPL ratio 0.9972 ± 0.0037 at 512 |
 | `optional/Q1/0001, 0002` | Q1 | `ggml_argsort_top_k` passes k as a hint, and the CPU kernel sorts only the top k of a row. The MoE router sorted 512 ids to read 10. | *paired* on stack2: generate +0.9 to +3.2%, tg128 +1.3% | bit-exact (1047 cases). KLD 0.002, same top token 99.5%, PPL ratio 0.9984 ± 0.0015 at 512 |
 
