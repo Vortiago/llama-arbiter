@@ -39,10 +39,23 @@ patches only. Generate is three chat prompts of 256 tokens at temperature
   Q8_0. The build with the cache off matched the pin within drift. Not
   worth keeping on this card. #29887 needs upstream 6753a033f first now: it
   was rebased after this page checked it.
-- **CPU prefill, old fork against the pin** (the readers' own logs, median
-  tok/s): 5 to 64 token batches 14.1 to 19.3, 64 to 256 tokens 20.9 to
-  22.4 on node 1. A /v1/systemone call of 16 questions went from about 37 s
-  a case to about 26 s, with the router fixes of the same day in it.
+- **CPU prefill, old fork against the pin**, one CPU-only server on an idle
+  node 0, 18 threads: 120-token prompts 26.9 to 37.1 tok/s (+38%), 2000-token
+  prompts 35.4 to 50.3 (+42%). A /v1/systemone call of 16 questions went
+  from about 37 s a case to about 26 s, with the router fixes of the same
+  day in it.
+- **Prefill uploads the experts, and on this link that is the whole cost.**
+  The same prompts on the GPU backend: 9.8 and 30 tok/s with the default
+  `GGML_OP_OFFLOAD_MIN_BATCH` of 32, against 68 and 112 with it at 1000000,
+  where the experts run on the CPU and the rest on the card. That is about
+  twice a CPU-only reader on the same socket. `bin/qwen-mtp.sh` now sets it.
+  This settles N3 and N4 for koishi: a larger ubatch or a prefetch only
+  hides an upload it is cheaper not to make. X1 is the CPU patch that gains.
+- **N6, `--backend-sampling`:** +2 to +5% generate at temperature 1.0, the
+  same acceptance. A grammar request falls back to the CPU sampler, and a
+  /v1/systemone readout came back the same. On in `bin/qwen-mtp.sh`.
+- **H3, `--spec-draft-p-min 0.5`:** 2 to 5% slower. Acceptance rose, but
+  the draft ran less. Off.
 
 ## Sizes that decide most of this
 
