@@ -3,6 +3,14 @@
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
+# Never copy the experts to the card. A batch of 32 tokens or more ran its
+# experts there, which uploads nearly all 120 GB of them for each ubatch. On
+# koishi's PCIe gen3 x8 the upload set the pace: 120-token prompts read at
+# 9.8 tok/s and 2000-token ones at 30, against 68 and 112 with the experts on
+# the CPU and the rest on the card. A generate step is 4 tokens and never
+# uploaded. A card on a faster link may want this back at 32.
+export GGML_OP_OFFLOAD_MIN_BATCH=${GGML_OP_OFFLOAD_MIN_BATCH:-1000000}
+
 MODEL=$MODEL_Q8
 SERVER=$SERVER_MTP
 ALIAS=qwen3.8-flash-next-mtp
