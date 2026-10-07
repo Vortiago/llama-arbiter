@@ -82,10 +82,11 @@ for set in "${optional_sets[@]}"; do
     die "expected an optional CPU set in CPU_OPTIONAL, got $set. patches/cpu/optional/ holds: ${known_sets[*]:-none}"
 done
 
-# The router does not work without these three. patches/README.md says why.
-# The rest are worth having and are not worth stopping for.
+# The router does not work without the first three, and a CUDA build does not
+# start the MTP draft without the fourth. patches/README.md says why. The rest
+# are worth having and are not worth stopping for.
 REQUIRED=(slot-state-carries-checkpoints slots-report-the-prompt-size
-          anthropic-pass-id-slot)
+          anthropic-pass-id-slot qwen4exp-mtp-keeps-kpool-inputs)
 
 required() {
   local want name=${1%.patch}
