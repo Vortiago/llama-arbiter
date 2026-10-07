@@ -42,6 +42,7 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
 | quality of I1 and Q1 | 20 chunks of 512, KLD against the deployed build, which is deterministic (base against base: KLD 0, 100% same top) | PPL 11.5921 | I1: KLD 0.0449, same top 89.3%, PPL 11.7051 (the SIMD sigmoid alone: KLD 0.0451). Q1: KLD 0.0017, same top 99.3%, PPL 11.5974, identical for 3 chunks | I1: KLD at the level of any change of summation order here (a CPU-only run is 0.047 from a GPU run), so quality does not rule it out; its end-to-end speed gain is unproven. Q1 not bit-exact (router ties, unverified), small |
 | MoE weighted sum where the experts run (agent moesum, `exp/moesum` 5ee87eeb4, `src/llama-graph.cpp`) | GPU run, node 0 quiet, 3 rounds, 1024-token prompt | prompt 8.38 / 8.39 / 8.47 ms/token; verify 136.5 / 132.9 / 134.1 ms | prompt 7.48 / 7.55 / 7.51; verify 131.6 / 130.4 / 132.8 | prefill +10.7% (2000 tokens: 8.42 -> 7.57). Verify about 2%, within noise. The boundary copy per layer at 512 tokens fell from 50 MB to 5 MB. 20 chunks: KLD 0.0447, same top 89.8%, PPL ratio 0.998 ± 0.005, against the GPU run; a CPU-only run gives KLD 0.0471, same top 89.0%. Ready to deploy as `patches/moe-sum-where-the-experts-run.patch` |
 | Q8_0 expert rows read once for up to 4 tokens, with prefetch (agent kern4, `core/0020`) | CPU run, node 0 quiet, 3 rounds; kernel benchmark at the model's shapes | verify 311.9 / 311.2 / 309.6 ms; 4-token gate / down 597-604 / 612-622 us | verify 303.8 / 305.2 / 307.5; gate / down 543-557 / 547-559 | bit-exact. Kernel +9-10%, verify +1.7 to 2.8%. AVX-512BW was slower (568-588 us). Ready to deploy |
+| #29796 rebased (fewer CUDA syncs), and split input copies queued between host and card (agent verifygpu, `exp/verifygpu` a5ff2d62b, 268a09ba9) | GPU run, node 0 quiet, 3 rounds; a callback-free tool, verify steps 2-31 | verify 128.5 / 124.3, 125.7 / 124.5, 126.8 / 125.6 ms | #29796 alone: the same. With the queued copies: 124.9 / 122.4, 123.1 / 122.2, 125.6 / 123.6 | generate about +2% (syncs 404 -> 78 a step), exact (PPL identical). #29796 alone: no gain. A host gate thread: no further steady gain, on hold |
 | N1 expert cache, #29887, 1500 MiB | GPU run, ctx 150000, 3 prompts x 2 rounds | 14.5-14.8 / 18.9-20.2 / 16.9-18.7 tok/s | 1.8-1.9 / 2.1 / 2.0 tok/s | rejected: 0.00% hits on this card |
 | `--spec-draft-p-min 0.5` (H3) | gpu backend, temperature 1.0, 2 rounds | see `--backend-sampling` baseline | 12.9-13.4 / 17.3-17.6 / 15.3-16.3 tok/s | rejected: -2 to -5% |
 | threads 14 / 16 / 17 / 18 (`-t` = `-tb`) | CPU run and GPU run, node 0 quiet, two passes in reversed order | 18: GPU prompt 8.41, 8.37 ms/token; CPU prompt 20.27, 19.61 | GPU prompt 17: 8.69, 8.72; 16: 9.16, 9.02. CPU prompt 17: 20.25, 20.40; 14: 24.09, 23.51 | keep 18. Verify: no count beats the spread (up to 21 ms CPU, 4 ms GPU). A 4-token verify runs on the `-tb` pool, so `-t` alone changes nothing there |
@@ -55,6 +56,15 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
   copies and waits 23%.
 - At 4 tokens the expert matmul reads its weights at about 84 GB/s, against
   about 128 GB/s in theory for one socket.
+
+### Where a verify step goes on the card (nsys, deployed build, GPU run)
+
+Per 4-token step of about 143 ms: CUDA graph execution 23.4 ms (48 per-layer
+graphs, about 75 nodes each); host-to-card copies 3.3 ms (48 expert outputs
+of 400 KB); card-to-host 1.1 ms; host time in CUDA calls while the card idles
+10.5 ms (graph launches 114 us each, 5.4 ms; 404 stream syncs). The CPU and
+llama.cpp take the other 105 ms. The first two steps after a prompt take
+about 210 ms each: they build the CUDA graphs for the new batch shape.
 
 ### Facts about this box
 
