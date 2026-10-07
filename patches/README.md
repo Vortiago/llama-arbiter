@@ -20,10 +20,9 @@ top of the one before it, and an optional set applies only on top of core.
 Each server patch is a separate change, so that each one can be read on its
 own and offered upstream on its own. Each applies to `8e1642198` on its own.
 
-Four of them are required. The router does not work without
+Three of them are required. The router does not work without
 `slot-state-carries-checkpoints`, `slots-report-the-prompt-size` or
-`anthropic-pass-id-slot`. A CUDA build does not start the MTP draft without
-`qwen4exp-mtp-keeps-kpool-inputs`.
+`anthropic-pass-id-slot`.
 
 ### slot-state-carries-checkpoints.patch
 
@@ -75,25 +74,6 @@ it does not move. `n_prompt_tokens` keeps its existing meaning.
 The anthropic endpoint converts a request body through a whitelist. It drops
 every field that is not on that list, including `id_slot`. A router in front of
 the server therefore cannot say which slot a request must use.
-
-### qwen4exp-mtp-keeps-kpool-inputs.patch
-
-**Required** for the MTP draft on a CUDA build.
-
-The `qwen4exp` graph builds the k-pool inputs of the sparse attention for
-every graph, and `set_input` writes all of them. The graph of the ggml-org MTP
-draft reads none of `k_idxs`, `new_pool_idxs`, `new_pool_rep` and
-`new_pool_pos`. The scheduler gives a tensor that no op reads no buffer, so
-the first decode aborted in `ggml_backend_buffer_get_type` with
-`GGML_ASSERT(buffer) failed`. The server tests that decode at startup, so the
-backend never started.
-
-The patch adds those four to the graph, as the code already does for the other
-k-pool inputs ("keep them allocated even when no op reads them").
-
-Seen on koishi, a CUDA build, both with the draft on the card and with
-`--device none --device-draft none`. Without the draft the server started.
-With the patch it starts and the draft is accepted.
 
 ### anthropic-apply-template.patch
 
