@@ -19,7 +19,10 @@ ARGS=(
   --cpu-moe-draft      # The draft's experts too, as the model's are: 2.5 GiB
                        # of VRAM. The ggml-org draft adds a 644 MiB output
                        # head, and with its experts on the card the draft
-                       # context did not fit at ctx 150000.
+                       # context did not fit at ctx 150000. It costs 4 to 5%
+                       # of generate speed: 14.4/19.0/17.0 against
+                       # 15.1/19.8/17.8 tok/s at ctx 130000 on koishi, the
+                       # same acceptance, two alternating rounds.
   --ctx-size "${CTX:-150000}"
                        # Sized to this card's 16 GiB at f16 KV, about 36.5 KiB
                        # a token. Every backend must use the same CTX (see
