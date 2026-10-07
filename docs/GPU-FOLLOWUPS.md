@@ -16,46 +16,50 @@ RAM. The CPU box runs about 250k context.
 
 ## Results on koishi
 
-koishi is the GPU box: two Xeon Gold 6150 sockets of 18 cores, an RTX A4000
-16 GiB, ctx 150000. Measured on 7 October 2026 with the pin, core CPU
-patches only. Generate is three chat prompts of 256 tokens at temperature
-0, through one test server on node 0, in alternating rounds.
+koishi is the GPU box: two Xeon Gold 6150 sockets of 18 cores (AVX-512
+F/BW/VL, no VNNI), an RTX A4000 16 GiB on PCIe gen3 x8, ctx 150000. Every row
+is one A/B in one session, the rounds alternating. "CPU run" is a CPU-only
+server bound to node 0; "GPU run" is the gpu backend's layout (experts in RAM,
+the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
+1024- or 2000-token prompt, and steps of 4 tokens (an MTP verify).
 
-- **The link is PCIe gen3 x8**, about 8 GB/s, not the 25 GB/s this page
-  plans with. Every upload costs three times more than estimated below.
-- **The ggml-org draft must be the 30 September upload.** The 9 September
-  file gives the MTP layer a compress ratio of 0, so it runs dense, reads
-  none of the k-pool inputs, and the server aborts at load with
-  `GGML_ASSERT(buffer) failed`. The new file gives it 4.
-- **The draft does not fit on the card with its experts at ctx 150000.**
-  Its output head adds 644 MiB. `bin/qwen-mtp.sh` now passes
-  `--cpu-moe-draft`, which frees 2.5 GiB. That costs 4 to 5% of generate,
-  measured at ctx 130000 where both fit (14.4/19.0/17.0 against
-  15.1/19.8/17.8 tok/s, the same acceptance).
-- **N1, #29887, loses by ten times.** The free VRAM gave a 1500 MiB cache,
-  about 6 experts a layer against 10 used a token. The hit rate was 0.00%,
-  it uploaded 1.5 TB in the test, and generate fell from 15 to 20 tok/s to
-  about 2. A cache that hits needs about 64 experts a layer, about 15 GB at
-  Q8_0. The build with the cache off matched the pin within drift. Not
-  worth keeping on this card. #29887 needs upstream 6753a033f first now: it
-  was rebased after this page checked it.
-- **CPU prefill, old fork against the pin**, one CPU-only server on an idle
-  node 0, 18 threads: 120-token prompts 26.9 to 37.1 tok/s (+38%), 2000-token
-  prompts 35.4 to 50.3 (+42%). A /v1/systemone call of 16 questions went
-  from about 37 s a case to about 26 s, with the router fixes of the same
-  day in it.
-- **Prefill uploads the experts, and on this link that is the whole cost.**
-  The same prompts on the GPU backend: 9.8 and 30 tok/s with the default
-  `GGML_OP_OFFLOAD_MIN_BATCH` of 32, against 68 and 112 with it at 1000000,
-  where the experts run on the CPU and the rest on the card. That is about
-  twice a CPU-only reader on the same socket. `bin/qwen-mtp.sh` now sets it.
-  This settles N3 and N4 for koishi: a larger ubatch or a prefetch only
-  hides an upload it is cheaper not to make. X1 is the CPU patch that gains.
-- **N6, `--backend-sampling`:** +2 to +5% generate at temperature 1.0, the
-  same acceptance. A grammar request falls back to the CPU sampler, and a
-  /v1/systemone readout came back the same. On in `bin/qwen-mtp.sh`.
-- **H3, `--spec-draft-p-min 0.5`:** 2 to 5% slower. Acceptance rose, but
-  the draft ran less. Off.
+### Deployed
+
+| change | conditions | baseline | with it | change |
+|---|---|---|---|---|
+| pin + core CPU patches (PR #3) vs the old fork | CPU-only server, node 0 idle, 120 / 2000-token prompts | 25.1-28.9 / 34.8-36.0 tok/s | 34.6-39.3 / 50.2-50.3 tok/s | prefill +38 / +42% |
+| `GGML_OP_OFFLOAD_MIN_BATCH=1000000` on the gpu backend | GPU run, idle, 120 / 2000-token prompts | 8.8-11.0 / 29.5-30.0 tok/s | 61.7-75.8 / 111.5-112.1 tok/s | prefill 4-7x |
+| `--cpu-moe-draft` (needed to fit ctx 150000) | gpu backend at ctx 130000, generate, 3 prompts x 2 rounds | 15.0-15.2 / 19.7-20.0 / 17.5-18.0 tok/s | 14.4-14.5 / 18.9-19.1 / 16.8-17.1 | generate -4 to -5% |
+| `--backend-sampling` | gpu backend, temperature 1.0, 3 prompts x 2 rounds | 13.2-13.6 / 18.0-18.1 / 16.5-16.7 tok/s | 13.5-14.6 / 18.7-19.4 / 16.9-17.1 | generate +2 to +5% |
+| `core/0018`: chunk work when the process is on one node | CPU run, node 0 idle, 2 rounds | verify 322.1, 316.5 ms; prompt 19.56, 19.18 ms/token | verify 304.0, 304.5 ms; prompt 19.21, 19.39 | generate +5%, prompt the same. PPL identical |
+
+### Measured, not deployed
+
+| change | conditions | baseline | with it | verdict |
+|---|---|---|---|---|
+| optional I1 + Q1 | CPU run, node 0 quiet, 3 rounds | prompt 19.51 / 19.56 / 19.62 ms/token; verify 317.0 / 317.2 / 318.5 ms | prompt 18.10 / 18.35 / 18.52; verify 302.8 / 301.8 / 301.9 | prefill +7%, generate +5%. PPL 9.7310 -> 9.8584 (3 chunks of 512; I1 is not exact). Split I1 and Q1 before deciding |
+| N1 expert cache, #29887, 1500 MiB | GPU run, ctx 150000, 3 prompts x 2 rounds | 14.5-14.8 / 18.9-20.2 / 16.9-18.7 tok/s | 1.8-1.9 / 2.1 / 2.0 tok/s | rejected: 0.00% hits on this card |
+| `--spec-draft-p-min 0.5` (H3) | gpu backend, temperature 1.0, 2 rounds | see `--backend-sampling` baseline | 12.9-13.4 / 17.3-17.6 / 15.3-16.3 tok/s | rejected: -2 to -5% |
+| 36 threads (hyperthreads) for the experts | test-backend-ops, model shapes, box busy | 4-token matmul 0.83-0.86 ms | 10.9-12.1 ms | rejected |
+
+### Where the time goes (op-profile, GPU run, ctx 150000, idle)
+
+- 2000-token prompt, 9.2 ms a token: the CPU expert matmuls take 82% (gate
+  29%, down 28%, up 25%). The card, the copies and the waits take 17%.
+- A 4-token verify step, 145 ms: the CPU expert matmuls take 74%, the card,
+  copies and waits 23%.
+- At 4 tokens the expert matmul reads its weights at about 84 GB/s, against
+  about 128 GB/s in theory for one socket.
+
+### Facts about this box
+
+- The ggml-org draft must be the 30 September upload. The 9 September file
+  gives the MTP layer a compress ratio of 0, and the server aborts at load
+  with `GGML_ASSERT(buffer) failed`.
+- #29887 now needs upstream 6753a033f first: it was rebased after this page
+  checked it.
+- CUDA graphs are captured per GPU split, that is per layer between two CPU
+  expert phases.
 
 ## Sizes that decide most of this
 
