@@ -72,7 +72,9 @@ sleep 2
 # be waited on for forty minutes and then resumed.
 up=0
 for _ in $(seq 480); do
-  curl -s -m 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { up=1; break; }
+  # -f: a loading llama-server answers /health with 503, and plain -s
+  # took that for up. A backend that then died at load was put in service.
+  curl -sf -m 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { up=1; break; }
   kill -0 "$started" 2>/dev/null || break
   sleep 5
 done
