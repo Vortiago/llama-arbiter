@@ -598,12 +598,14 @@ class Pool:
 
         parked = self.park_all(only=name) if quiet else 0
         # A save that timed out or was refused leaves a cache only in a slot.
-        # The caller must know, or restart-backend.sh kills it anyway.
+        # The caller must know, or restart-backend.sh kills it anyway. One
+        # park_all skips as not worth a copy is not left: nobody kept it.
         with self.cv:
             left = sum(1 for p in self.pins.values()
                        if p["backend"] == name and p["slot"] is not None
                        and not p["inflight"] and not p.get("parking")
-                       and not copy_is_current(p))
+                       and not copy_is_current(p)
+                       and worth_keeping(p, self.tuning))
         print(f"[router] {name} is drained: "
               f"{'quiet' if quiet else 'still busy'}, {parked} cache(s) parked"
               + (f", {left} still only in a slot" if left else ""), flush=True)

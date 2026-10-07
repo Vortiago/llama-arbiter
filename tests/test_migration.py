@@ -2884,6 +2884,15 @@ class DrainABackend(unittest.TestCase):
         self.assertEqual(self.pool.pins["a"]["parked"], "a.park")
         self.assertEqual(post.ops()[0], "save")
 
+    def test_a_cache_too_small_to_keep_is_not_left_behind(self):
+        """park_all skips it on purpose: reading it again is cheaper than a
+        copy. Counted as left, it made every drain answer 409, and
+        restart-backend.sh would not restart the backend at all."""
+        self.pool.pins["small"] = pin("gpu", slot=0, tokens=20)
+        linked(self.pool, self.saver())
+        report = self.pool.drain("gpu")
+        self.assertEqual(report["left"], 0)
+
     def test_draining_leaves_the_other_backend_alone(self):
         self.pool.pins["b"] = pin("cpu", slot=1)
         post = linked(self.pool, self.saver())
