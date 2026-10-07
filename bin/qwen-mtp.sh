@@ -23,6 +23,10 @@ ARGS=(
                        # of generate speed: 14.4/19.0/17.0 against
                        # 15.1/19.8/17.8 tok/s at ctx 130000 on koishi, the
                        # same acceptance, two alternating rounds.
+  --backend-sampling   # Sample on the card: +2 to +5% generate at temperature
+                       # 1.0 on koishi, the same acceptance. llama.cpp turns it
+                       # off for a request with a grammar, and the grammar
+                       # readout of /v1/systemone came back the same.
   --ctx-size "${CTX:-150000}"
                        # Sized to this card's 16 GiB at f16 KV, about 36.5 KiB
                        # a token. Every backend must use the same CTX (see
