@@ -413,8 +413,10 @@ class TwoInstancesMustAgree(LiveCase):
         self.assertIsNone(self.refuse(target, 0))
 
     def test_a_state_too_big_for_the_target_is_refused(self):
+        # Only the context differs from the test above, so any refusal is one
+        # for size. Its log wording is llama.cpp's to change.
         target = self.start("tiny", slots=1, ctx=512, unified=True, flash=True)
-        self.assertIn("failed to find", self.refuse(target, 0) or "")
+        self.assertIsNotNone(self.refuse(target, 0))
 
     def test_a_slot_count_the_source_does_not_have_is_fine(self):
         target = self.start("wide", slots=4, unified=True, flash=True)

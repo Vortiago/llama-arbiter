@@ -1,0 +1,98 @@
+From e9bceb3936c80b6d0f362454c15b7c62e34c71b4 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 15:47:52 +0200
+Subject: [PATCH] perf(ggml): align large allocations to 2 MiB and hint
+ MADV_HUGEPAGE on Linux
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On Linux, ggml_aligned_malloc now aligns an allocation of 4 MiB or more
+to 2 MiB and hints it with MADV_HUGEPAGE, so the kernel can back it with
+transparent huge pages. This covers the CPU KV cache, the recurrent
+state and the compute buffers. Mmapped weights do not pass through this
+function. If the 2 MiB alignment fails, the allocation falls back to the
+ordinary alignment.
+
+glibc serves a request below its dynamic mmap threshold from the heap,
+and that threshold rises to 32 MiB after a large free. A 4 to 32 MiB
+buffer can therefore sit on the heap, and the hint then marks heap pages
+that malloc reuses later. That can raise RSS through khugepaged. With
+defrag=madvise, the first touch of a large KV cache can also stall in
+direct compaction. Measure startup time and compact_stall in
+/proc/vmstat before keeping this commit.
+
+Changes from upstream: the madvise call sits under #ifdef
+MADV_HUGEPAGE, because some libc headers do not define it.
+<sys/mman.h> moves to the other includes. The comment above
+GGML_LARGE_ALLOC_* states the heap caveat in place of the note on an
+unexplained mechanism.
+
+ggml.c is in ggml-base, so this affects the host buffers of every
+backend. It is a separate commit so it can be measured and dropped on
+its own.
+
+Ported from upstream llama.cpp PR #27478 (the ggml.c part).
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9bcabdbd3..6330b1df6 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -38,6 +38,10 @@
+ #include <syscall.h>
+ #endif
+ 
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
+ #if defined(__APPLE__)
+ #include <unistd.h>
+ #include <mach/mach.h>
+@@ -329,6 +333,13 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
+ #endif
+ 
+ 
++#if defined(__linux__)
++// An allocation of GGML_LARGE_ALLOC_MIN_SIZE or more is aligned to the 2 MiB huge page size and hinted with MADV_HUGEPAGE.
++// glibc can serve a request below its dynamic mmap threshold (up to 32 MiB) from the heap, so the hint can also mark heap pages.
++#define GGML_LARGE_ALLOC_MIN_SIZE (4ull << 20)
++#define GGML_LARGE_ALLOC_ALIGN    (2ull << 20)
++#endif
++
+ void * ggml_aligned_malloc(size_t size) {
+ #if defined(__s390x__)
+     const int alignment = 256;
+@@ -364,6 +375,24 @@ void * ggml_aligned_malloc(size_t size) {
+             result = EFAULT;
+             break;
+     }
++  #elif defined(__linux__)
++    // Align large allocations to 2 MiB and hint the kernel, so that it can back them with transparent huge pages.
++    // Note: the alignment is applied to every allocation over the threshold, also when THP is not available.
++    int result;
++    if (size >= GGML_LARGE_ALLOC_MIN_SIZE) {
++        result = posix_memalign(&aligned_memory, GGML_LARGE_ALLOC_ALIGN, size);
++        if (result == 0 && aligned_memory != NULL) {
++#ifdef MADV_HUGEPAGE // some libc headers do not define it
++            (void) madvise(aligned_memory, size, MADV_HUGEPAGE);
++#endif
++        } else {
++            // The larger alignment can fail where the ordinary one succeeds.
++            // Fall back so this is never worse than the previous behaviour.
++            result = posix_memalign(&aligned_memory, alignment, size);
++        }
++    } else {
++        result = posix_memalign(&aligned_memory, alignment, size);
++    }
+   #else
+     int result = posix_memalign(&aligned_memory, alignment, size);
+   #endif

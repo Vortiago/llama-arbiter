@@ -1,0 +1,81 @@
+From a7169fdb83c55c918939578e67bc4807e96e9a75 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 21:37:17 +0200
+Subject: [PATCH] refactor(ggml-cpu): name the live-cell test of the sparse
+ prefill mask scan
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The scalar scan and the debug contract check now share one helper,
+ggml_fa_mask_cell_live, and one named constant for the F16 exponent bits.
+The debug check names the expected bound and the found count when a mask
+row breaks the n_kv_max contract.
+
+Only the scalar tail and the debug build change. The objdump of the
+Release libggml-cpu.so (AVX2) is identical before and after this commit.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/ops.cpp | 22 +++++++++++++++-------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index b7cfca2d5..5b4f086cb 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9576,18 +9576,23 @@ static int64_t ggml_fa_sparse_n_head_blocks(int64_t rk2) {
+     return (rk2 + hb_max - 1)/hb_max;
+ }
+ 
++// An F16 is finite unless all its exponent bits are set. The masked value, -INFINITY, is 0xFC00.
++static constexpr uint16_t ggml_fa_f16_exp_bits = 0x7C00;
++
++// True when a query row can see the KV cell whose F16 mask value is h.
++static inline bool ggml_fa_mask_cell_live(ggml_fp16_t h) {
++    return (h & ggml_fa_f16_exp_bits) != ggml_fa_f16_exp_bits;
++}
++
+ // The ascending list of KV cells that any of the n_rows mask rows can see.
+ // Nothing (-1) when the union does not fit in cap, which means a row broke the n_kv_max contract.
+ static int64_t ggml_fa_sparse_compact_rows(
+         const ggml_fp16_t * const * rows, int n_rows, int64_t n_kv,
+         int32_t * list, int64_t cap) {
+-    // An F16 is finite unless all its exponent bits are set. The masked value, -INFINITY, is 0xFC00.
+-    static constexpr uint16_t exp_bits = 0x7C00;
+-
+     int64_t n = 0;
+     int64_t i = 0;
+ #if defined(__AVX2__)
+-    const __m256i exp_bits_v = _mm256_set1_epi16((short) exp_bits);
++    const __m256i exp_bits_v = _mm256_set1_epi16((short) ggml_fa_f16_exp_bits);
+     for (; i + 16 <= n_kv; i += 16) {
+         __m256i dead = _mm256_set1_epi16(-1);
+         for (int t = 0; t < n_rows; ++t) {
+@@ -9612,7 +9617,7 @@ static int64_t ggml_fa_sparse_compact_rows(
+     for (; i < n_kv; ++i) {
+         bool live = false;
+         for (int t = 0; t < n_rows; ++t) {
+-            live |= (rows[t][i] & exp_bits) != exp_bits;
++            live |= ggml_fa_mask_cell_live(rows[t][i]);
+         }
+         if (live) {
+             if (n == cap) {
+@@ -9655,9 +9660,12 @@ static void ggml_compute_forward_flash_attn_ext_sparse_compact(
+         for (int t = 0; t < n_rows; ++t) {
+             int64_t n_live = 0;
+             for (int64_t i = 0; i < n_kv; ++i) {
+-                n_live += (rows[t][i] & 0x7C00) != 0x7C00;
++                n_live += ggml_fa_mask_cell_live(rows[t][i]);
++            }
++            if (n_live > n_kv_max) {
++                GGML_ABORT("expected at most n_kv_max = %d live cells in mask row %lld, got %lld",
++                        n_kv_max, (long long) (iq1 + t), (long long) n_live);
+             }
+-            GGML_ASSERT(n_live <= n_kv_max);
+         }
+ #endif
+ 

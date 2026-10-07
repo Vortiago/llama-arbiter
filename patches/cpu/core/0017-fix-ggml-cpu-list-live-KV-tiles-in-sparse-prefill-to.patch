@@ -1,0 +1,553 @@
+From 3b504821c353ec3f577d31fb386d353ea0044e42 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Tue, 6 Oct 2026 08:39:12 +0200
+Subject: [PATCH] fix(ggml-cpu): list live KV tiles in sparse prefill to match
+ the tiled path bit for bit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The sparse prefill path packed the live cells of a token group into
+64-wide tiles. Its online softmax then summed other tiles than the dense
+tiled path, so the result was only close to it. On Qwen3.8-Flash-Next
+Q8_0 (wiki.test.raw, -c 4608, 2 chunks) the cell lists gave a mean KLD
+of 0.005041 and a same top p of 99.066% against the U4 build.
+
+Phase 1 now lists the aligned 64-cell tiles in which any of the group's
+8 rows sees a cell. Phase 2 packs a listed tile as the tiled path does,
+so each row sums the same tiles, with the same lanes and the same FMA
+order. A tile the list drops is dead for every row of the group, and the
+tiled path skips a dead tile for a row without changing S, M or VKQ.
+
+A list now holds at most every tile, so it cannot overflow. The size
+helper loses the n_kv_max argument, and the fallback for an overflowed
+list and the debug check of the hint contract go.
+
+test_flash_attn_ext_sparse_exact outputs the hinted op minus the same op
+without the hint, on a mask built as qwen4exp builds its QSA mask
+(init_tensor_kq_mask_qsa). The CPU must give exactly zero.
+
+Checks, with the dump and cmp harness on the CPU backend:
+- The 5 new cases dump exactly +0.0 at 32 and 16 threads, and all 5 take
+  the sparse path. The cell list libraries give nonzero output in 4 of 5
+  (max abs 2.6e-08 to 6.0e-08). The fifth sees only tile 0.
+- All 5338 FLASH_ATTN_EXT cases are bit-exact against the U4 libraries,
+  at 32 and at 16 threads.
+- llama-perplexity with the settings above writes a KL divergence base
+  file byte-identical to the U4 one. The KLD statistics match those of
+  U4 against itself.
+
+The live tile fraction on that model is 0.942 (48 ops), against a live
+cell fraction of 0.694 for the cell lists, so this path reads more K/V
+than the cell lists did.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/common.h   |  13 +--
+ ggml/src/ggml-cpu/ggml-cpu.c |   2 +-
+ ggml/src/ggml-cpu/ops.cpp    | 154 ++++++++++++++---------------------
+ tests/test-backend-ops.cpp   | 121 +++++++++++++++++++++++++++
+ 4 files changed, 190 insertions(+), 100 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/common.h b/ggml/src/ggml-cpu/common.h
+index 9984ec8a0..4e3a218be 100644
+--- a/ggml/src/ggml-cpu/common.h
++++ b/ggml/src/ggml-cpu/common.h
+@@ -13,7 +13,8 @@
+ // KV block size for the single query (decode) path. The tiled path needs GGML_FA_TILE_Q query rows, so it cannot serve this case.
+ #define GGML_FA_KQ_BLK  32
+ 
+-// Sparse prefill (n_kv_max hint): one list of live KV cells per group of GGML_FA_SPARSE_GROUP_Q query tokens.
++// Sparse prefill (n_kv_max hint): one list of live KV tiles per group of GGML_FA_SPARSE_GROUP_Q query tokens.
++// A tile is the tiled path's aligned block of GGML_FA_TILE_KV cells, so each row sums the same tiles in the same order.
+ // A unit stacks the group's tokens and up to GGML_FA_SPARSE_ROWS/GGML_FA_SPARSE_GROUP_Q query heads of one KV head.
+ #define GGML_FA_SPARSE_GROUP_Q 8
+ #define GGML_FA_SPARSE_ROWS    96
+@@ -24,9 +25,9 @@ static inline size_t ggml_fa_sparse_wdata_per_thread(int64_t DK, int64_t DV) {
+     return (size_t) (GGML_FA_SPARSE_ROWS*(DK + GGML_FA_TILE_KV + DV) + GGML_FA_SPARSE_GROUP_Q*GGML_FA_TILE_KV + GGML_FA_TILE_KV*(DV + DK)) + CACHE_LINE_SIZE_F32;
+ }
+ 
+-// The hint bounds each mask row by n_kv_max live cells, so the union of a group never exceeds GROUP_Q*n_kv_max.
+-static inline int64_t ggml_fa_sparse_list_cap(int64_t n_kv, int64_t n_kv_max) {
+-    return MIN(n_kv, (int64_t) GGML_FA_SPARSE_GROUP_Q*n_kv_max);
++// A list holds at most every tile, so it never overflows, whatever the mask.
++static inline int64_t ggml_fa_sparse_n_tiles(int64_t n_kv) {
++    return (n_kv + GGML_FA_TILE_KV - 1)/GGML_FA_TILE_KV;
+ }
+ 
+ // One list per token group and per mask sequence (mask ne[3]).
+@@ -35,10 +36,10 @@ static inline int64_t ggml_fa_sparse_n_lists(int64_t n_q, int64_t n_mask_seq) {
+ }
+ 
+ // The plan and the kernel both size the work buffer with this: per thread scratch, then the counts, then the lists.
+-static inline size_t ggml_fa_sparse_wsize(int64_t DK, int64_t DV, int64_t n_q, int64_t n_kv, int64_t n_kv_max, int64_t n_mask_seq, int n_threads) {
++static inline size_t ggml_fa_sparse_wsize(int64_t DK, int64_t DV, int64_t n_q, int64_t n_kv, int64_t n_mask_seq, int n_threads) {
+     const int64_t n_lists = ggml_fa_sparse_n_lists(n_q, n_mask_seq);
+     return sizeof(float)*ggml_fa_sparse_wdata_per_thread(DK, DV)*n_threads +
+-           sizeof(int32_t)*(size_t) (n_lists*(1 + ggml_fa_sparse_list_cap(n_kv, n_kv_max)));
++           sizeof(int32_t)*(size_t) (n_lists*(1 + ggml_fa_sparse_n_tiles(n_kv)));
+ }
+ 
+ #ifdef __cplusplus
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 753b3c08a..9d747f242 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3370,7 +3370,7 @@ struct ggml_cplan ggml_graph_plan(
+                         // Sparse prefill (n_kv_max hint): the kernel takes this path only if the work buffer holds it.
+                         const int32_t n_kv_max = ggml_get_op_params_i32(node, 4);
+                         if (n_kv_max > 0 && node->src[3] != NULL) {
+-                            const size_t sparse = ggml_fa_sparse_wsize(DK, DV, node->src[0]->ne[1], node->src[1]->ne[1], n_kv_max, node->src[3]->ne[3], n_tasks);
++                            const size_t sparse = ggml_fa_sparse_wsize(DK, DV, node->src[0]->ne[1], node->src[1]->ne[1], node->src[3]->ne[3], n_tasks);
+                             fa = MAX(fa, sparse);
+                         }
+ 
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 5b4f086cb..de19fd19f 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9543,7 +9543,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+ }
+ 
+ // Sparse prefill (n_kv_max hint): the CUDA sparse gate, plus a prefill batch, an F16 mask shared by all heads
+-// and a work buffer that holds the cell lists. Every thread computes the same answer.
++// and a work buffer that holds the tile lists. Every thread computes the same answer.
+ static bool ggml_fa_sparse_prefill_supported(const ggml_compute_params * params, const ggml_tensor * dst) {
+     const ggml_tensor * q    = dst->src[0];
+     const ggml_tensor * k    = dst->src[1];
+@@ -9567,7 +9567,7 @@ static bool ggml_fa_sparse_prefill_supported(const ggml_compute_params * params,
+            k->ne[0] <= 256 && v->ne[0] <= 256 &&
+            k->ne[2] == v->ne[2] && k->ne[3] == v->ne[3] &&
+            k->ne[1] >= 4096 &&
+-           params->wsize >= ggml_fa_sparse_wsize(k->ne[0], v->ne[0], q->ne[1], k->ne[1], n_kv_max, mask->ne[3], params->nth);
++           params->wsize >= ggml_fa_sparse_wsize(k->ne[0], v->ne[0], q->ne[1], k->ne[1], mask->ne[3], params->nth);
+ }
+ 
+ // Query heads of one KV head split into the fewest blocks of at most ROWS/GROUP_Q heads.
+@@ -9584,57 +9584,49 @@ static inline bool ggml_fa_mask_cell_live(ggml_fp16_t h) {
+     return (h & ggml_fa_f16_exp_bits) != ggml_fa_f16_exp_bits;
+ }
+ 
+-// The ascending list of KV cells that any of the n_rows mask rows can see.
+-// Nothing (-1) when the union does not fit in cap, which means a row broke the n_kv_max contract.
+-static int64_t ggml_fa_sparse_compact_rows(
+-        const ggml_fp16_t * const * rows, int n_rows, int64_t n_kv,
+-        int32_t * list, int64_t cap) {
+-    int64_t n = 0;
+-    int64_t i = 0;
++// True when any of the n_rows mask rows can see a KV cell in [i0, i1).
++static bool ggml_fa_sparse_any_live(const ggml_fp16_t * const * rows, int n_rows, int64_t i0, int64_t i1) {
++    int64_t i = i0;
+ #if defined(__AVX2__)
+     const __m256i exp_bits_v = _mm256_set1_epi16((short) ggml_fa_f16_exp_bits);
+-    for (; i + 16 <= n_kv; i += 16) {
+-        __m256i dead = _mm256_set1_epi16(-1);
++    for (; i + 16 <= i1; i += 16) {
+         for (int t = 0; t < n_rows; ++t) {
+-            const __m256i h = _mm256_loadu_si256((const __m256i *) (rows[t] + i));
+-            dead = _mm256_and_si256(dead, _mm256_cmpeq_epi16(_mm256_and_si256(h, exp_bits_v), exp_bits_v));
+-        }
+-        // movemask gives two bits per 16 bit lane: keep the low one.
+-        const uint32_t live = ~(uint32_t) _mm256_movemask_epi8(dead) & 0x55555555u;
+-        if (live == 0) {
+-            continue;
+-        }
+-        for (int b = 0; b < 16; ++b) {
+-            if (live & (1u << (2*b))) {
+-                if (n == cap) {
+-                    return -1;
+-                }
+-                list[n++] = (int32_t) (i + b);
++            const __m256i h    = _mm256_loadu_si256((const __m256i *) (rows[t] + i));
++            const __m256i dead = _mm256_cmpeq_epi16(_mm256_and_si256(h, exp_bits_v), exp_bits_v);
++            if (_mm256_movemask_epi8(dead) != -1) {
++                return true;
+             }
+         }
+     }
+ #endif
+-    for (; i < n_kv; ++i) {
+-        bool live = false;
++    for (; i < i1; ++i) {
+         for (int t = 0; t < n_rows; ++t) {
+-            live |= ggml_fa_mask_cell_live(rows[t][i]);
+-        }
+-        if (live) {
+-            if (n == cap) {
+-                return -1;
++            if (ggml_fa_mask_cell_live(rows[t][i])) {
++                return true;
+             }
+-            list[n++] = (int32_t) i;
++        }
++    }
++    return false;
++}
++
++// The ascending first cells of the aligned KV tiles in which any of the n_rows mask rows can see a cell.
++// A tile, not a cell: a row then sums the same tiles, with the same lanes, as on the tiled path, so it is bit-exact.
++static int64_t ggml_fa_sparse_live_tiles(const ggml_fp16_t * const * rows, int n_rows, int64_t n_kv, int32_t * list) {
++    int64_t n = 0;
++    for (int64_t ic = 0; ic < n_kv; ic += GGML_FA_TILE_KV) {
++        if (ggml_fa_sparse_any_live(rows, n_rows, ic, MIN(ic + GGML_FA_TILE_KV, n_kv))) {
++            list[n++] = (int32_t) ic;
+         }
+     }
+     return n;
+ }
+ 
+-// Sparse prefill, phase 1: one cell list per group of GGML_FA_SPARSE_GROUP_Q query tokens and per mask sequence.
++// Sparse prefill, phase 1: one tile list per group of GGML_FA_SPARSE_GROUP_Q query tokens and per mask sequence.
+ // All KV heads share a list, so the mask is scanned once per group, not once per head.
+ static void ggml_compute_forward_flash_attn_ext_sparse_compact(
+         const ggml_compute_params * params,
+         const ggml_tensor * dst,
+-        int32_t * counts, int32_t * lists, int64_t cap) {
++        int32_t * counts, int32_t * lists, int64_t n_tiles) {
+     const ggml_tensor * q    = dst->src[0];
+     const ggml_tensor * k    = dst->src[1];
+     const ggml_tensor * mask = dst->src[3];
+@@ -9654,37 +9646,12 @@ static void ggml_compute_forward_flash_attn_ext_sparse_compact(
+             rows[t] = (const ggml_fp16_t *) ((const char *) mask->data + (iq1 + t)*mask->nb[1] + im3*mask->nb[3]);
+         }
+ 
+-#ifndef NDEBUG
+-        // The hint contract: no row sees more than n_kv_max cells, or the union can overflow the list.
+-        const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+-        for (int t = 0; t < n_rows; ++t) {
+-            int64_t n_live = 0;
+-            for (int64_t i = 0; i < n_kv; ++i) {
+-                n_live += ggml_fa_mask_cell_live(rows[t][i]);
+-            }
+-            if (n_live > n_kv_max) {
+-                GGML_ABORT("expected at most n_kv_max = %d live cells in mask row %lld, got %lld",
+-                        n_kv_max, (long long) (iq1 + t), (long long) n_live);
+-            }
+-        }
+-#endif
+-
+-        counts[il] = (int32_t) ggml_fa_sparse_compact_rows(rows, n_rows, n_kv, lists + il*cap, cap);
++        counts[il] = (int32_t) ggml_fa_sparse_live_tiles(rows, n_rows, n_kv, lists + il*n_tiles);
+     }
+ }
+ 
+-// True when every list of phase 1 fits. A list that overflowed sends the whole op to the tiled path.
+-static bool ggml_fa_sparse_lists_fit(const int32_t * counts, int64_t n_lists) {
+-    for (int64_t il = 0; il < n_lists; ++il) {
+-        if (counts[il] < 0) {
+-            return false;
+-        }
+-    }
+-    return true;
+-}
+-
+-// Dev only, drop before upstreaming: GGML_FA_SPARSE_STATS=1 logs the union per token group of each sparse prefill op.
+-static void ggml_fa_sparse_log_stats(const int32_t * counts, int64_t n_lists, int64_t n_kv) {
++// Dev only, drop before upstreaming: GGML_FA_SPARSE_STATS=1 logs the live tiles per token group of each sparse prefill op.
++static void ggml_fa_sparse_log_stats(const int32_t * counts, int64_t n_lists, int64_t n_tiles) {
+     static const bool enabled = getenv("GGML_FA_SPARSE_STATS") != nullptr;
+     if (!enabled || n_lists == 0) {
+         return;
+@@ -9698,22 +9665,21 @@ static void ggml_fa_sparse_log_stats(const int32_t * counts, int64_t n_lists, in
+     }
+ 
+     const double mean = (double) total/n_lists;
+-    GGML_LOG_INFO("fa sparse: n_kv %lld, %lld lists, union mean %.1f (%.3f of n_kv), max %lld\n",
+-            (long long) n_kv, (long long) n_lists, mean, mean/n_kv, (long long) most);
++    GGML_LOG_INFO("fa sparse: %lld tiles, %lld lists, live tiles mean %.1f (%.3f of all), max %lld\n",
++            (long long) n_tiles, (long long) n_lists, mean, mean/n_tiles, (long long) most);
+ }
+ 
+-// Prefetch the rows of the next gathered tile: a cell list jumps around a K/V cache far larger than the L2.
+-static void ggml_fa_sparse_prefetch_rows(const char * base, const int32_t * idx, int n, size_t nb_row, size_t row_size) {
++// Prefetch the rows of the next live tile: the list jumps over dead tiles, which defeats the stream prefetcher.
++static void ggml_fa_sparse_prefetch_rows(const char * row0, int n, size_t nb_row, size_t row_size) {
+ #if defined(__GNUC__)
+     for (int c = 0; c < n; ++c) {
+-        const char * row = base + (int64_t) idx[c]*nb_row;
++        const char * row = row0 + (int64_t) c*nb_row;
+         for (size_t off = 0; off < row_size; off += CACHE_LINE_SIZE) {
+             __builtin_prefetch(row + off);
+         }
+     }
+ #else
+-    GGML_UNUSED(base);
+-    GGML_UNUSED(idx);
++    GGML_UNUSED(row0);
+     GGML_UNUSED(n);
+     GGML_UNUSED(nb_row);
+     GGML_UNUSED(row_size);
+@@ -9722,12 +9688,13 @@ static void ggml_fa_sparse_prefetch_rows(const char * base, const int32_t * idx,
+ 
+ // Sparse prefill, phase 2: one unit is (iq3, token group, KV head, head block).
+ // The unit stacks its rows as r = token*HB + head, so the heads of a token share its mask row,
+-// and each gathered K/V tile serves all GROUP_Q*HB rows. The softmax and output code is the tiled one.
++// and each packed K/V tile serves all GROUP_Q*HB rows. The tile, softmax and output code is the tiled one,
++// so each row gives the tiled path's bits: a tile the list drops is one the tiled path skips for that row.
+ static void ggml_compute_forward_flash_attn_ext_sparse(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+         int64_t unit,
+-        const int32_t * counts, const int32_t * lists, int64_t cap) {
++        const int32_t * counts, const int32_t * lists, int64_t n_tiles) {
+     const ggml_tensor * q     = dst->src[0];
+     const ggml_tensor * k     = dst->src[1];
+     const ggml_tensor * v     = dst->src[2];
+@@ -9774,9 +9741,9 @@ static void ggml_compute_forward_flash_attn_ext_sparse(
+     const int     n_tok  = (int) MIN((int64_t) G, neq1 - iq1_0);
+     const int     n_head = (int) MIN(HB, rk2 - hb*HB);
+ 
+-    const int64_t   il      = (iq3 % mask->ne[3])*n_groups + ig;
+-    const int32_t * list    = lists + il*cap;
+-    const int64_t   n_cells = counts[il];
++    const int64_t   il     = (iq3 % mask->ne[3])*n_groups + ig;
++    const int32_t * list   = lists + il*n_tiles;
++    const int64_t   n_live = counts[il];
+ 
+     float * Q_f32  = (float *) params->wdata + params->ith*ggml_fa_sparse_wdata_per_thread(DK, DV);
+     float * KQ     = Q_f32  + GGML_FA_SPARSE_ROWS*DK;
+@@ -9812,30 +9779,31 @@ static void ggml_compute_forward_flash_attn_ext_sparse(
+     const char * k_base = (const char *) k->data + ik2*nbk2 + ik3*nbk3;
+     const char * v_base = (const char *) v->data + ik2*nbv2 + ik3*nbv3;
+ 
+-    for (int64_t j0 = 0; j0 < n_cells; j0 += KV) {
+-        const int       nc  = (int) MIN((int64_t) KV, n_cells - j0);
+-        const int32_t * idx = list + j0;
++    for (int64_t it = 0; it < n_live; ++it) {
++        const int64_t ic = list[it];
++        const int     nc = (int) MIN((int64_t) KV, nek1 - ic);
+ 
+-        const int nc_next = (int) MIN((int64_t) KV, n_cells - j0 - KV);
+-        if (nc_next > 0) {
+-            ggml_fa_sparse_prefetch_rows(k_base, idx + KV, nc_next, nbk1, DK*nbk0);
+-            ggml_fa_sparse_prefetch_rows(v_base, idx + KV, nc_next, nbv1, DV*nbv0);
++        if (it + 1 < n_live) {
++            const int64_t ic_next = list[it + 1];
++            const int     nc_next = (int) MIN((int64_t) KV, nek1 - ic_next);
++            ggml_fa_sparse_prefetch_rows(k_base + ic_next*nbk1, nc_next, nbk1, DK*nbk0);
++            ggml_fa_sparse_prefetch_rows(v_base + ic_next*nbv1, nc_next, nbv1, DV*nbv0);
+         }
+ 
+         // One mask row per token. A padded column is -inf, so the softmax gives it zero weight.
+         for (int t = 0; t < n_tok; ++t) {
+             float * mask_row = mask32 + t*KV;
+             for (int c = 0; c < nc; ++c) {
+-                mask_row[c] = GGML_CPU_FP16_TO_FP32(mask_rows[t][idx[c]]);
++                mask_row[c] = GGML_CPU_FP16_TO_FP32(mask_rows[t][ic + c]);
+             }
+             for (int c = nc; c < KV; ++c) {
+                 mask_row[c] = -INFINITY;
+             }
+         }
+ 
+-        // Gather K transposed, K_f32[dk][c], zero padded so the GEMM always runs KV columns.
++        // Pack K transposed, K_f32[dk][c], zero padded so the GEMM always runs KV columns.
+         for (int c = 0; c < nc; ++c) {
+-            const char * k_data = k_base + (int64_t) idx[c]*nbk1;
++            const char * k_data = k_base + (ic + c)*nbk1;
+             if (kv_type == GGML_TYPE_F16) {
+                 const ggml_fp16_t * k_f16 = (const ggml_fp16_t *) k_data;
+                 for (int64_t dk = 0; dk < DK; dk++) {
+@@ -9894,9 +9862,9 @@ static void ggml_compute_forward_flash_attn_ext_sparse(
+             S[r] += ggml_vec_soft_max_f32(KV, kq_row, kq_row, Mnew);
+         }
+ 
+-        // Gather V to contiguous F32, zero padded.
++        // Pack V to contiguous F32, zero padded.
+         for (int c = 0; c < nc; ++c) {
+-            const char * v_data = v_base + (int64_t) idx[c]*nbv1;
++            const char * v_data = v_base + (ic + c)*nbv1;
+             if (kv_type == GGML_TYPE_F16) {
+                 ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, V32 + c*DV, DV);
+             } else {
+@@ -10140,18 +10108,18 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+ 
+         int32_t * sparse_counts  = nullptr;
+         int32_t * sparse_lists   = nullptr;
+-        int64_t   sparse_cap     = 0;
++        int64_t   sparse_n_tiles = 0;
+         int64_t   sparse_n_lists = 0;
+ 
+         if (use_sparse) {
+             const ggml_tensor * mask = dst->src[3];
+ 
+-            sparse_cap     = ggml_fa_sparse_list_cap(nek1, ggml_get_op_params_i32(dst, 4));
++            sparse_n_tiles = ggml_fa_sparse_n_tiles(nek1);
+             sparse_n_lists = ggml_fa_sparse_n_lists(neq1, mask->ne[3]);
+             sparse_counts  = (int32_t *) ((float *) params->wdata + nth*ggml_fa_sparse_wdata_per_thread(DK, DV));
+             sparse_lists   = sparse_counts + sparse_n_lists;
+ 
+-            ggml_compute_forward_flash_attn_ext_sparse_compact(params, dst, sparse_counts, sparse_lists, sparse_cap);
++            ggml_compute_forward_flash_attn_ext_sparse_compact(params, dst, sparse_counts, sparse_lists, sparse_n_tiles);
+         }
+ 
+         if (ith == 0) {
+@@ -10160,16 +10128,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+ 
+         ggml_barrier(params->threadpool);
+ 
+-        if (use_sparse && ggml_fa_sparse_lists_fit(sparse_counts, sparse_n_lists)) {
++        if (use_sparse) {
+             if (ith == 0) {
+-                ggml_fa_sparse_log_stats(sparse_counts, sparse_n_lists, nek1);
++                ggml_fa_sparse_log_stats(sparse_counts, sparse_n_lists, sparse_n_tiles);
+             }
+ 
+             const int64_t n_groups = (neq1 + GGML_FA_SPARSE_GROUP_Q - 1)/GGML_FA_SPARSE_GROUP_Q;
+             const int64_t n_units  = neq3*n_groups*nek2*ggml_fa_sparse_n_head_blocks(neq2/nek2);
+ 
+             for (int64_t unit = ith; unit < n_units; unit = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+-                ggml_compute_forward_flash_attn_ext_sparse(params, dst, unit, sparse_counts, sparse_lists, sparse_cap);
++                ggml_compute_forward_flash_attn_ext_sparse(params, dst, unit, sparse_counts, sparse_lists, sparse_n_tiles);
+             }
+             return;
+         }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index bfde78890..b70384cbd 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -284,6 +284,61 @@ static void init_tensor_kq_mask_sparse_pools(ggml_tensor * tensor, int64_t n_kv_
+     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+ }
+ 
++// A mask built the way qwen4exp builds its QSA mask: 0 for a cell a row sees, -inf for the rest, no other value.
++// Row i1 is the token in cell kv_head + i1, as in a later ubatch, and the cells after the ubatch are padding.
++// A row sees its top pools of 4 complete cells, scored by a shared base plus per row noise so adjacent rows overlap,
++// and the cells of its own incomplete pool. A row with fewer complete pools than the budget sees all of them.
++static void init_tensor_kq_mask_qsa(ggml_tensor * tensor, int64_t n_kv_max, int64_t kv_head) {
++    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
++
++    static constexpr int64_t pool = 4;
++
++    const int64_t ne0      = tensor->ne[0];
++    const int64_t ne1      = tensor->ne[1];
++    const int64_t n_slices = tensor->ne[2]*tensor->ne[3];
++    const int64_t n_top    = (n_kv_max - (pool - 1))/pool;
++    GGML_ASSERT(n_top > 0 && kv_head + ne1 <= ne0);
++
++    std::vector<float>       data_f32(ggml_nelements(tensor), -INFINITY);
++    std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
++
++    std::mt19937 gen(0x05A0);
++    std::normal_distribution<float> noise(0.0f, 1.0f);
++
++    std::vector<float>   base(ne0/pool);
++    std::vector<float>   score;
++    std::vector<int64_t> order;
++
++    for (int64_t slice = 0; slice < n_slices; ++slice) {
++        for (float & b : base) {
++            b = 2.0f*noise(gen);
++        }
++        for (int64_t i1 = 0; i1 < ne1; ++i1) {
++            const int64_t pos     = kv_head + i1;
++            const int64_t n_pools = (pos + 1)/pool;
++
++            score.resize(n_pools);
++            order.resize(n_pools);
++            for (int64_t p = 0; p < n_pools; ++p) {
++                score[p] = base[p] + noise(gen);
++                order[p] = p;
++            }
++            const int64_t n_pick = std::min(n_top, n_pools);
++            std::partial_sort(order.begin(), order.begin() + n_pick, order.end(),
++                    [&](int64_t a, int64_t b) { return score[a] > score[b]; });
++
++            float * row = data_f32.data() + (slice*ne1 + i1)*ne0;
++            for (int64_t j = 0; j < n_pick; ++j) {
++                std::fill(row + order[j]*pool, row + (order[j] + 1)*pool, 0.0f);
++            }
++            std::fill(row + n_pools*pool, row + pos + 1, 0.0f);
++        }
++    }
++
++    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
++    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
++}
++
+ // generate a lower triangular matrix
+ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+     GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+@@ -8309,6 +8364,65 @@ struct test_flash_attn_ext_sparse_pools : public test_flash_attn_ext {
+     }
+ };
+ 
++// The n_kv_max hint must not change the result: the output is the hinted op minus the same op without the hint,
++// on a QSA mask (see init_tensor_kq_mask_qsa). On the CPU both sum the same tiles in the same order, so it is zero.
++struct test_flash_attn_ext_sparse_exact : public test_flash_attn_ext {
++    const int64_t kv_head;
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "FLASH_ATTN_EXT";
++    }
++
++    std::string vars() override {
++        return test_flash_attn_ext::vars() + ",mask_qsa=1,kv_head=" + std::to_string(kv_head) + ",hint_exact=1";
++    }
++
++    test_flash_attn_ext_sparse_exact(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
++                                     bool sinks, ggml_type type_KV, int64_t n_kv_max, int64_t kv_head)
++        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV,
++                              {0, 1, 2, 3}, true, false, n_kv_max),
++          kv_head(kv_head) {}
++
++    bool run_whole_graph() override {
++        return true;
++    }
++
++    // The largest difference either backend found.
++    double err(const float * a, const float * b, size_t n) override {
++        double result = 0.0;
++        for (size_t i = 0; i < n; ++i) {
++            result = std::max(result, (double) fabsf(a[i]));
++            result = std::max(result, (double) fabsf(b[i]));
++        }
++        return result;
++    }
++
++    // Exact on the CPU only: another backend may round its sparse and dense kernels differently.
++    double max_err(ggml_backend_t backend) override {
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
++        return strcmp(ggml_backend_reg_name(reg), "CPU") == 0 ? 0.0 : 1e-3;
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * hinted = test_flash_attn_ext::build_graph(ctx);
++
++        ggml_tensor * dense = ggml_flash_attn_ext(ctx, hinted->src[0], hinted->src[1], hinted->src[2], hinted->src[3], 1.0f/sqrtf(hsk), 0.0f, 0.0f);
++        ggml_flash_attn_ext_add_sinks(dense, hinted->src[4]);
++        ggml_prec_set_acc(dense, prec);
++
++        ggml_tensor * diff = ggml_sub(ctx, hinted, dense);
++        ggml_set_name(diff, "diff");
++
++        return diff;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        test_flash_attn_ext::initialize_tensors(ctx);
++        init_tensor_kq_mask_qsa(ggml_get_tensor(ctx, "m"), n_kv_max, kv_head);
++    }
++};
++
+ // GGML_OP_CROSS_ENTROPY_LOSS
+ struct test_cross_entropy_loss : public test_case {
+     const ggml_type type;
+@@ -11501,6 +11615,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 1, {13, 1}, 4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 2, {12, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 512));
+     test_cases.emplace_back(new test_flash_attn_ext_sparse_pools(256, 256, 2, {12, 1}, 8192, 100, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
++    // the n_kv_max hint changes no bit on QSA masks: the qwen4exp ubatch at n_kv 4608, a deep partial group with
++    // sinks and padding, rows with fewer pools than the budget, F32 K/V with 16 heads per KV head, two mask sequences
++    test_cases.emplace_back(new test_flash_attn_ext_sparse_exact(256, 256, 2, {12, 1}, 4608, 512, false, GGML_TYPE_F16, 2051, 4096));
++    test_cases.emplace_back(new test_flash_attn_ext_sparse_exact(256, 256, 2, {12, 1}, 8192, 100, true,  GGML_TYPE_F16, 2051, 7000));
++    test_cases.emplace_back(new test_flash_attn_ext_sparse_exact(128, 128, 4, { 1, 1}, 4096,  64, false, GGML_TYPE_F16,  515,    0));
++    test_cases.emplace_back(new test_flash_attn_ext_sparse_exact(128, 128, 2, {16, 1}, 4096,  72, false, GGML_TYPE_F32,  515, 3000));
++    test_cases.emplace_back(new test_flash_attn_ext_sparse_exact(256, 256, 1, {12, 2}, 4096,  64, false, GGML_TYPE_F16, 2051, 2048));
+     // the sparse prefill gate: ALiBi and softcap keep the tiled path
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  64, true, false, 8.0f, 0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  64, true, false, 0,    10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));

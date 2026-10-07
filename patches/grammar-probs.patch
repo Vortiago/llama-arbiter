@@ -36,9 +36,27 @@ counters sit between the two.
 Three gates on n_probs had to learn about a request that asks for none: the
 call to populate_token_probs, and the partial and final result builders.
 
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index d9c508049..bf0f34235 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -858,6 +858,11 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
+ 
+ // helpers
+ 
++void common_sampler_apply_grammar(struct common_sampler * gsmpl, llama_token_data_array * cur_p) {
++    GGML_ASSERT(gsmpl);
++    llama_sampler_apply(gsmpl->grmr, cur_p);
++}
++
+ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
+     const auto tm = gsmpl->tm();
+ 
+diff --git a/common/sampling.h b/common/sampling.h
+index 7ebae3df8..b3cde4ca8 100644
 --- a/common/sampling.h
 +++ b/common/sampling.h
-@@ -100,6 +100,12 @@
+@@ -103,6 +103,12 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
  // the .sorted flag of the result indicates whether the returned candidates are sorted
  llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort);
  
@@ -51,81 +69,11 @@ call to populate_token_probs, and the partial and final result builders.
  // get the last accepted token
  llama_token common_sampler_last(const struct common_sampler * gsmpl);
  
---- a/common/sampling.cpp
-+++ b/common/sampling.cpp
-@@ -728,6 +728,11 @@
- 
- // helpers
- 
-+void common_sampler_apply_grammar(struct common_sampler * gsmpl, llama_token_data_array * cur_p) {
-+    GGML_ASSERT(gsmpl);
-+    llama_sampler_apply(gsmpl->grmr, cur_p);
-+}
-+
- llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
-     const auto tm = gsmpl->tm();
- 
---- a/tools/server/server-task.h
-+++ b/tools/server/server-task.h
-@@ -74,6 +74,9 @@
- 
-     bool timings_per_token   = false;
-     bool post_sampling_probs = false;
-+    // Report the distribution over the tokens the grammar allows, rather
-+    // than the whole vocabulary before it or the one survivor after it.
-+    bool grammar_probs      = false;
- 
-     struct common_params_sampling sampling;
-     struct common_params_speculative speculative;
-@@ -299,6 +302,7 @@
- struct completion_token_output {
-     llama_token tok;
-     float prob;
-+    float grammar_mass = -1.0f;   // < 0 when grammar_probs was not asked for
-     std::string text_to_send;
-     struct prob_info {
-         llama_token tok;
---- a/tools/server/server-task.cpp
-+++ b/tools/server/server-task.cpp
-@@ -284,7 +284,7 @@
-     for (const auto & p : probs) {
-         std::string txt(p.text_to_send);
-         txt.resize(validate_utf8(txt));
--        out.push_back(json {
-+        json entry = json {
-             {"id",           p.tok},
-             {"token",        txt},
-             {"bytes",        str_to_bytes(p.text_to_send)},
-@@ -296,7 +296,11 @@
-                 post_sampling_probs ? "top_probs" : "top_logprobs",
-                 p.to_json(post_sampling_probs)
-             },
--        });
-+        };
-+        if (p.grammar_mass >= 0.0f) {
-+            entry["grammar_mass"] = p.grammar_mass;
-+        }
-+        out.push_back(entry);
-     }
-     return out;
- }
---- a/tools/server/server-schema.cpp
-+++ b/tools/server/server-schema.cpp
-@@ -190,6 +190,11 @@
-     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
-         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
- 
-+    add((new field_bool("grammar_probs", params.grammar_probs))
-+        ->set_desc("Return the probabilities of the tokens the grammar allows, "
-+                   "scaled to sum to one, and the share they held of the "
-+                   "distribution before the grammar was applied"));
-+
-     //
-     // Speculative decoding params
-     //
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 809be94cd..9e815ed9e 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -1880,7 +1880,10 @@
+@@ -1854,7 +1854,10 @@ private:
                  return false;
              }
  
@@ -137,7 +85,7 @@ call to populate_token_probs, and the partial and final result builders.
  
              bool use_backend_sampling = task.params.sampling.backend_sampling;
  
-@@ -2057,6 +2060,61 @@
+@@ -2031,6 +2034,61 @@ private:
      void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
          const size_t n_probs_request = slot.task->params.sampling.n_probs;
  
@@ -199,7 +147,7 @@ call to populate_token_probs, and the partial and final result builders.
          if (post_sampling) {
              const auto * cur_p = common_sampler_get_candidates(slot.smpl.get(), true);
              const size_t max_probs = cur_p->size;
-@@ -2167,7 +2225,7 @@
+@@ -2141,7 +2199,7 @@ private:
          res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
  
          // populate res.probs_output
@@ -208,7 +156,7 @@ call to populate_token_probs, and the partial and final result builders.
              res->prob_output = tkn; // copy the token probs
          }
  
-@@ -2222,7 +2280,7 @@
+@@ -2196,7 +2254,7 @@ private:
          res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
  
          // populate res.probs_output
@@ -217,7 +165,7 @@ call to populate_token_probs, and the partial and final result builders.
              if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
                  const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
  
-@@ -3959,8 +4017,6 @@
+@@ -4064,8 +4122,6 @@ private:
  
              slot.i_batch = -1;
  
@@ -226,7 +174,7 @@ call to populate_token_probs, and the partial and final result builders.
              // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
              const int64_t t_now = ggml_time_us();
  
-@@ -3979,10 +4035,17 @@
+@@ -4084,10 +4140,17 @@ private:
              result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
              result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
  
@@ -245,3 +193,67 @@ call to populate_token_probs, and the partial and final result builders.
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 27ecafb7a..315e871a2 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -190,6 +190,11 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
+         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
+ 
++    add((new field_bool("grammar_probs", params.grammar_probs))
++        ->set_desc("Return the probabilities of the tokens the grammar allows, "
++                   "scaled to sum to one, and the share they held of the "
++                   "distribution before the grammar was applied"));
++
+     //
+     // Speculative decoding params
+     //
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index a5c33c056..6fc7ef8c4 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -284,7 +284,7 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
+     for (const auto & p : probs) {
+         std::string txt(p.text_to_send);
+         txt.resize(validate_utf8(txt));
+-        out.push_back(json {
++        json entry = json {
+             {"id",           p.tok},
+             {"token",        txt},
+             {"bytes",        str_to_bytes(p.text_to_send)},
+@@ -296,7 +296,11 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
+                 post_sampling_probs ? "top_probs" : "top_logprobs",
+                 p.to_json(post_sampling_probs)
+             },
+-        });
++        };
++        if (p.grammar_mass >= 0.0f) {
++            entry["grammar_mass"] = p.grammar_mass;
++        }
++        out.push_back(entry);
+     }
+     return out;
+ }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 752595b0f..fc4db4072 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -75,6 +75,9 @@ struct task_params {
+ 
+     bool timings_per_token   = false;
+     bool post_sampling_probs = false;
++    // Report the distribution over the tokens the grammar allows, rather
++    // than the whole vocabulary before it or the one survivor after it.
++    bool grammar_probs      = false;
+ 
+     struct common_params_sampling sampling;
+     struct common_params_speculative speculative;
+@@ -331,6 +334,7 @@ using server_task_result_ptr = std::unique_ptr<server_task_result>;
+ struct completion_token_output {
+     llama_token tok;
+     float prob;
++    float grammar_mass = -1.0f;   // < 0 when grammar_probs was not asked for
+     std::string text_to_send;
+     struct prob_info {
+         llama_token tok;

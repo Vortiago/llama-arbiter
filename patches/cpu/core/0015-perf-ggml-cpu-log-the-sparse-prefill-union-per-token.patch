@@ -1,0 +1,66 @@
+From f8b3dadd76ed006ca7771371d30240036ce69488 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 16:40:42 +0200
+Subject: [PATCH] perf(ggml-cpu): log the sparse prefill union per token group
+ (dev only)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With GGML_FA_SPARSE_STATS set, thread 0 logs the mean and the largest
+union per group of 8 query tokens for each sparse prefill op, against
+n_kv. The union decides the gain of the sparse path (2051 cells when
+adjacent tokens pick the same pools, up to 8x that when they pick
+independently), so it is the first number to measure at depth.
+
+Drop this commit before upstreaming.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/ops.cpp | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 98cd83edf..b7cfca2d5 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9675,6 +9675,25 @@ static bool ggml_fa_sparse_lists_fit(const int32_t * counts, int64_t n_lists) {
+     return true;
+ }
+ 
++// Dev only, drop before upstreaming: GGML_FA_SPARSE_STATS=1 logs the union per token group of each sparse prefill op.
++static void ggml_fa_sparse_log_stats(const int32_t * counts, int64_t n_lists, int64_t n_kv) {
++    static const bool enabled = getenv("GGML_FA_SPARSE_STATS") != nullptr;
++    if (!enabled || n_lists == 0) {
++        return;
++    }
++
++    int64_t total = 0;
++    int64_t most  = 0;
++    for (int64_t il = 0; il < n_lists; ++il) {
++        total += counts[il];
++        most   = std::max<int64_t>(most, counts[il]);
++    }
++
++    const double mean = (double) total/n_lists;
++    GGML_LOG_INFO("fa sparse: n_kv %lld, %lld lists, union mean %.1f (%.3f of n_kv), max %lld\n",
++            (long long) n_kv, (long long) n_lists, mean, mean/n_kv, (long long) most);
++}
++
+ // Prefetch the rows of the next gathered tile: a cell list jumps around a K/V cache far larger than the L2.
+ static void ggml_fa_sparse_prefetch_rows(const char * base, const int32_t * idx, int n, size_t nb_row, size_t row_size) {
+ #if defined(__GNUC__)
+@@ -10134,6 +10153,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         ggml_barrier(params->threadpool);
+ 
+         if (use_sparse && ggml_fa_sparse_lists_fit(sparse_counts, sparse_n_lists)) {
++            if (ith == 0) {
++                ggml_fa_sparse_log_stats(sparse_counts, sparse_n_lists, nek1);
++            }
++
+             const int64_t n_groups = (neq1 + GGML_FA_SPARSE_GROUP_Q - 1)/GGML_FA_SPARSE_GROUP_Q;
+             const int64_t n_units  = neq3*n_groups*nek2*ggml_fa_sparse_n_head_blocks(neq2/nek2);
+ 

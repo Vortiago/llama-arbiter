@@ -1,0 +1,491 @@
+From a1873f23d8bc059a111125c5db5a642531032b9c Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 13:43:02 +0200
+Subject: [PATCH] perf(ggml-cpu): fuse the MoE weighted reduction
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+build_moe_ffn ends each MoE layer with MUL(experts, weights), one VIEW per
+used expert and an ADD chain ((v0 + v1) + v2) + ... On the CPU each MUL
+and ADD is a separate pass over [n_embd, n_expert_used, n_tokens] floats
+with a full thread-pool barrier after it, and the MUL with a [1, k, T]
+operand runs its broadcast one element at a time.
+
+ggml_cpu_try_fuse_ops now matches this pattern, in both the
+experts * weights and the (experts * expert_scale) * weights forms, and
+runs one kernel that writes the last ADD's tensor. The kernel splits the
+work over (token, block of 64 columns), so one decode token still spreads
+over the threads. It replaces the k MUL and ADD barriers (k + 1 with the
+expert scale) with one, or two when it stages the weights, and it removes
+the weighted [n_embd, k, T] intermediate.
+
+The result is bit-exact with the unfused nodes. Each product is rounded
+as the MUL rounds it, and the sum runs in expert order as the ADD chain
+does. The products pass through a stack buffer behind a compiler barrier,
+so GCC (-ffp-contract=fast by default) cannot contract a product and its
+add into an FMA. MSVC has no such barrier here, and its default
+/fp:precise does not contract.
+
+The allocator can place the last ADD's buffer over the weights tensor,
+because the unfused MUL is its last consumer. On Qwen3.8-Flash-Next this
+happens in the prompt graphs. CUDA prevents this in graph_optimize with
+add_alloc_dep. The CPU backend has no graph_optimize hook, and callers
+outside ggml_backend_sched would not get one, so the kernel copies the
+weights and the expert scale to the work buffer behind one barrier before
+any thread writes dst. ggml_graph_plan reserves 2 floats per row for a
+MUL whose src1 has the [1, k, T] shape of the weights, with 2 <= k <= 15.
+The fusion is skipped when the buffer overlaps the experts.
+
+The matcher is a C port of ggml_cuda_match_moe_weighted_reduction
+(ggml-cuda.cu). ik_llama.cpp has the same fusion as GGML_OP_MUL_MULTI_ADD,
+added in ik_llama.cpp PR #858 ("Fused mul + multi_add op"). test_moe_reduce
+gets k = 10 cases at n_embd 2560 for 1, 4 and 512 tokens.
+
+On perf/stack2 the fusion meets the serial runs of tiny ops. A MUL that
+fits GGML_CPU_SERIAL_BYTES and starts the pattern runs the fused kernel on
+thread 0 alone. The other threads then walk the covered MUL and ADD nodes
+one by one, so they agree on the barriers only if each covered node is
+serial too. ggml_cpu_node_is_serial now gets the fused span from
+ggml_cpu_serial_fusion_span and requires every covered node to fit, as it
+already did for RMS_NORM + MUL. With nth = 1 the kernel skips its staging
+barrier, because the other threads wait at the barrier after the run. The
+matcher uses ggml_cpu_ranges_overlap from the gated_delta_net fusion in
+place of a second copy.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 216 +++++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cpu/ops.cpp    |  97 ++++++++++++++++
+ ggml/src/ggml-cpu/ops.h      |   7 ++
+ tests/test-backend-ops.cpp   |   5 +
+ 4 files changed, 315 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 8a78d9334..e35aa7a95 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3144,6 +3144,23 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
+ #endif
+ }
+ 
++// The long form of the MoE weighted reduction spans 2*k + 1 nodes, and ggml_can_fuse_subgraph()
++// accepts at most 31 nodes, so k <= 15. The short form spans 2*k nodes and keeps the same limit.
++// Larger values use the per-operation path.
++#define GGML_CPU_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS 15
++
++// the [1, k, n_tokens] weights or expert scale operand of a MoE weighted reduction MUL
++static bool ggml_cpu_moe_is_weights(const struct ggml_tensor * mul, const struct ggml_tensor * t) {
++    return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[0] == 1 &&
++        t->ne[1] == mul->ne[1] && t->ne[2] == mul->ne[2] && t->ne[3] == mul->ne[3];
++}
++
++// Work buffer for the weights and the expert scale of a fused MoE weighted reduction, one float
++// each per row of the MUL. The fused kernel copies them there when dst overlaps them.
++static size_t ggml_cpu_moe_weights_stage_size(const struct ggml_tensor * mul) {
++    return 2*sizeof(float)*ggml_nrows(mul);
++}
++
+ struct ggml_cplan ggml_graph_plan(
+           const struct ggml_cgraph * cgraph,
+                                int   n_threads,
+@@ -3212,6 +3229,14 @@ struct ggml_cplan ggml_graph_plan(
+                             cur = ggml_type_size(GGML_TYPE_F32) * node->src[1]->ne[0] * n_tasks;
+                         }
+                     } break;
++                case GGML_OP_MUL:
++                    {
++                        // a MUL that a fused MoE weighted reduction may cover, for the weights it stages
++                        if (node->ne[1] >= 2 && node->ne[1] <= GGML_CPU_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS &&
++                                ggml_cpu_moe_is_weights(node, node->src[1])) {
++                            cur = ggml_cpu_moe_weights_stage_size(node);
++                        }
++                    } break;
+                 case GGML_OP_COUNT_EQUAL:
+                     {
+                         cur = ggml_type_size(node->type)*n_tasks;
+@@ -3477,6 +3502,147 @@ static int ggml_cpu_try_gdn_cache_fusion(
+     return skip;
+ }
+ 
++struct ggml_cpu_moe_weighted_reduction_match {
++    const struct ggml_tensor * experts;
++    const struct ggml_tensor * expert_scale;
++    const struct ggml_tensor * weights;
++    struct ggml_tensor *       dst;
++    int                        node_count;
++    bool                       stage_weights; // dst overlaps the weights or the expert scale
++};
++
++static bool ggml_cpu_moe_is_experts(const struct ggml_tensor * mul, const struct ggml_tensor * t) {
++    return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_are_same_shape(t, mul);
++}
++
++// split a MUL into its [n_embd, k, n_tokens] operand and its [1, k, n_tokens] broadcast operand
++// (ggml_mul gives dst the shape of src[0], so only src[1] can broadcast)
++static bool ggml_cpu_moe_split_mul(const struct ggml_tensor * mul, const struct ggml_tensor ** full, const struct ggml_tensor ** broadcast) {
++    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) ||
++            !ggml_cpu_moe_is_experts(mul, mul->src[0]) || !ggml_cpu_moe_is_weights(mul, mul->src[1])) {
++        return false;
++    }
++    *full      = mul->src[0];
++    *broadcast = mul->src[1];
++    return true;
++}
++
++// Matches the MoE weighted reduction that build_moe_ffn emits, in either form:
++//   (experts * expert_scale) * weights, or experts * weights,
++// followed by one VIEW per expert and the ADD chain ((v0 + v1) + v2) + ...
++// C port of ggml_cuda_match_moe_weighted_reduction.
++static bool ggml_cpu_match_moe_weighted_reduction(
++        const struct ggml_cgraph * cgraph,
++        const int node_n,
++        const struct ggml_cplan * cplan,
++        struct ggml_cpu_moe_weighted_reduction_match * match) {
++    const struct ggml_tensor * first        = cgraph->nodes[node_n];
++    const struct ggml_tensor * weighted     = first;
++    const struct ggml_tensor * experts      = NULL;
++    const struct ggml_tensor * expert_scale = NULL;
++    const struct ggml_tensor * weights      = NULL;
++    int                        mul_count    = 1;
++
++    if (node_n + 1 < cgraph->n_nodes) {
++        const struct ggml_tensor * second = cgraph->nodes[node_n + 1];
++        const struct ggml_tensor * scaled = NULL;
++        const struct ggml_tensor * second_weights = NULL;
++        if (ggml_cpu_moe_split_mul(second, &scaled, &second_weights) && scaled == first &&
++                ggml_cpu_moe_split_mul(first, &experts, &expert_scale)) {
++            weighted  = second;
++            weights   = second_weights;
++            mul_count = 2;
++        }
++    }
++
++    if (experts == NULL && !ggml_cpu_moe_split_mul(first, &experts, &weights)) {
++        return false;
++    }
++
++    const int     n_expert_used = (int) weighted->ne[1];
++    const int64_t n_tokens      = weighted->ne[2]*weighted->ne[3];
++    if (n_expert_used < 2 || n_expert_used > GGML_CPU_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS) {
++        return false;
++    }
++
++    const int node_count = 2*n_expert_used + mul_count - 1;
++    if (node_n + node_count > cgraph->n_nodes) {
++        return false;
++    }
++
++    enum ggml_op               ops[2*GGML_CPU_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS + 1];
++    const struct ggml_tensor * views[GGML_CPU_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS];
++    const struct ggml_tensor * previous = NULL;
++    int n_views = 0;
++    int n_adds  = 0;
++
++    for (int i = 0; i < mul_count; ++i) {
++        ops[i] = GGML_OP_MUL;
++    }
++    for (int offset = mul_count; offset < node_count; ++offset) {
++        const struct ggml_tensor * candidate = cgraph->nodes[node_n + offset];
++        ops[offset] = candidate->op;
++
++        if (candidate->op == GGML_OP_VIEW) {
++            if (n_views >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
++                    candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
++                    candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
++                    candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
++                    candidate->view_offs != (size_t) n_views*weighted->nb[1]) {
++                return false;
++            }
++            views[n_views++] = candidate;
++            continue;
++        }
++
++        if (candidate->op != GGML_OP_ADD || n_views < 2 || n_adds + 1 >= n_views) {
++            return false;
++        }
++        const struct ggml_tensor * lhs = n_adds == 0 ? views[0] : previous;
++        const struct ggml_tensor * rhs = views[n_adds + 1];
++        if (candidate->src[0] != lhs || candidate->src[1] != rhs || candidate->type != GGML_TYPE_F32) {
++            return false;
++        }
++        previous = candidate;
++        ++n_adds;
++    }
++
++    if (n_views != n_expert_used || n_adds != n_expert_used - 1 || previous == NULL) {
++        return false;
++    }
++    if (!ggml_is_contiguous(previous) || previous->ne[0] != weighted->ne[0] ||
++            previous->ne[1] != n_tokens || previous->ne[2] != 1 || previous->ne[3] != 1) {
++        return false;
++    }
++
++    const int output_idx = node_n + node_count - 1;
++    if (!ggml_can_fuse_subgraph(cgraph, node_n, node_count, ops, &output_idx, 1)) {
++        return false;
++    }
++
++    // The CPU backend has no graph_optimize hook to keep the inputs allocated until dst, as CUDA does
++    // with add_alloc_dep, and callers outside ggml_backend_sched have none either. So the allocator can
++    // place dst over a weights tensor that the unfused MUL was the last to read. The fused kernel then
++    // copies the weights and the expert scale to the work buffer before it writes dst.
++    struct ggml_tensor * dst = cgraph->nodes[output_idx];
++    if (ggml_cpu_ranges_overlap(dst, experts)) {
++        return false;
++    }
++    const bool stage_weights = ggml_cpu_ranges_overlap(dst, weights) ||
++        (expert_scale && ggml_cpu_ranges_overlap(dst, expert_scale));
++    if (stage_weights && cplan->work_size < ggml_cpu_moe_weights_stage_size(weighted)) {
++        return false;
++    }
++
++    match->experts      = experts;
++    match->expert_scale = expert_scale;
++    match->weights      = weights;
++    match->dst          = dst;
++    match->node_count   = node_count;
++    match->stage_weights = stage_weights;
++    return true;
++}
++
+ // Try to fuse the current node with subsequent nodes for better performance.
+ // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
+ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+@@ -3523,6 +3689,15 @@ static int ggml_cpu_try_fuse_ops(
+         }
+     }
+ 
++    if (node->op == GGML_OP_MUL) {
++        struct ggml_cpu_moe_weighted_reduction_match match;
++        if (ggml_cpu_match_moe_weighted_reduction(cgraph, node_n, cplan, &match)) {
++            ggml_compute_forward_moe_weighted_reduction(params, match.experts, match.expert_scale, match.weights, match.dst,
++                match.stage_weights);
++            return match.node_count - 1;
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -3597,17 +3772,38 @@ static bool ggml_cpu_node_fits_serial(const struct ggml_tensor * node) {
+     return ggml_cpu_op_can_run_serial(node) && ggml_cpu_node_serial_size(node) <= ggml_cpu_serial_bytes;
+ }
+ 
++// The number of nodes, node_n included, that ggml_cpu_try_fuse_ops runs together with node_n, for
++// the ops a serial run can start with. GATED_DELTA_NET never runs serially, so its fusion is left out.
++static int ggml_cpu_serial_fusion_span(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_cplan * cplan) {
++    if (ggml_cpu_disable_fusion) {
++        return 1;
++    }
++
++    const struct ggml_tensor * node = cgraph->nodes[node_n];
++    if (node->op == GGML_OP_RMS_NORM) {
++        const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
++        return ggml_can_fuse(cgraph, node_n, fuse_ops, 2) ? 2 : 1;
++    }
++    if (node->op == GGML_OP_MUL) {
++        struct ggml_cpu_moe_weighted_reduction_match match;
++        return ggml_cpu_match_moe_weighted_reduction(cgraph, node_n, cplan, &match) ? match.node_count : 1;
++    }
++    return 1;
++}
++
+ // Every thread evaluates this for every node, so all threads agree on where the barriers are.
+-static bool ggml_cpu_node_is_serial(const struct ggml_cgraph * cgraph, int node_n) {
++static bool ggml_cpu_node_is_serial(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_cplan * cplan) {
+     if (!ggml_cpu_node_fits_serial(cgraph->nodes[node_n])) {
+         return false;
+     }
+ 
+-    // ggml_cpu_try_fuse_ops runs a fused node together with its first node, so both must fit
+-    if (cgraph->nodes[node_n]->op == GGML_OP_RMS_NORM && !ggml_cpu_disable_fusion) {
+-        const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+-        if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
+-            return ggml_cpu_node_fits_serial(cgraph->nodes[node_n + 1]);
++    // ggml_cpu_try_fuse_ops runs a fused node together with its first node, so every node it covers must
++    // fit. The other threads then walk the covered nodes one by one and find each of them serial too.
++    const int span = ggml_cpu_serial_fusion_span(cgraph, node_n, cplan);
++    for (int i = node_n + 1; i < node_n + span; i++) {
++        const struct ggml_tensor * covered = cgraph->nodes[i];
++        if (!ggml_op_is_empty(covered->op) && !ggml_cpu_node_fits_serial(covered)) {
++            return false;
+         }
+     }
+ 
+@@ -3618,10 +3814,10 @@ static bool ggml_cpu_node_is_computed(const struct ggml_tensor * node) {
+     return !ggml_op_is_empty(node->op) && (node->flags & GGML_TENSOR_FLAG_COMPUTE);
+ }
+ 
+-static bool ggml_cpu_next_node_is_serial(const struct ggml_cgraph * cgraph, int node_n) {
++static bool ggml_cpu_next_node_is_serial(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_cplan * cplan) {
+     for (int i = node_n + 1; i < cgraph->n_nodes; i++) {
+         if (ggml_cpu_node_is_computed(cgraph->nodes[i])) {
+-            return ggml_cpu_node_is_serial(cgraph, i);
++            return ggml_cpu_node_is_serial(cgraph, i, cplan);
+         }
+     }
+     return false;
+@@ -3680,7 +3876,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         }
+ 
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+-        const bool is_serial = use_serial && ggml_cpu_node_is_serial(cgraph, node_n);
++        const bool is_serial = use_serial && ggml_cpu_node_is_serial(cgraph, node_n, cplan);
+         if (!is_serial) {
+             node_n += ggml_cpu_compute_node(cgraph, node_n, &params, cplan);
+         } else if (state->ith == 0) {
+@@ -3689,7 +3885,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         // A run of serial nodes needs one barrier, after its last node. The abort check stays
+         // next to that barrier: the other threads may already have passed any node inside the run.
+-        if (is_serial && ggml_cpu_next_node_is_serial(cgraph, node_n)) {
++        if (is_serial && ggml_cpu_next_node_is_serial(cgraph, node_n, cplan)) {
+             continue;
+         }
+ 
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index e970b4f6a..132fd5ce7 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -4214,6 +4214,103 @@ void ggml_compute_forward_rms_norm_mul_fused(
+     }
+ }
+ 
++// y = (x * scale) * weight, rounded like the unfused MUL nodes
++static void ggml_moe_weighted_expert_row(const int64_t n, float * y, const float * x, const float * scale, const float weight) {
++    if (scale) {
++        const float s = *scale; // a local, since y may alias scale
++        for (int64_t i = 0; i < n; ++i) {
++            y[i] = (x[i] * s) * weight;
++        }
++    } else {
++        for (int64_t i = 0; i < n; ++i) {
++            y[i] = x[i] * weight;
++        }
++    }
++}
++
++// Fused MUL + VIEW + ADD chain at the end of build_moe_ffn: dst[:, t] = sum over k of experts[:, k, t] * weights[k, t],
++// with an optional expert_scale MUL before the weights. The sum runs in expert order, as the ADD chain does.
++// stage_weights: dst overlaps the weights or the expert scale, so copy them to wdata before any thread writes dst.
++void ggml_compute_forward_moe_weighted_reduction(
++        const ggml_compute_params * params,
++        const ggml_tensor * experts,
++        const ggml_tensor * expert_scale,
++        const ggml_tensor * weights,
++        ggml_tensor * dst,
++        bool stage_weights) {
++
++    GGML_ASSERT(experts->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(experts) && ggml_is_contiguous(weights) && ggml_is_contiguous(dst));
++    GGML_ASSERT(expert_scale == nullptr || ggml_is_contiguous(expert_scale));
++
++    const int64_t n_embd        = experts->ne[0];
++    const int64_t n_expert_used = experts->ne[1];
++    const int64_t n_tokens      = experts->ne[2]*experts->ne[3];
++
++    // Work units are (token, column block), so a single token still spreads over the threads.
++    constexpr int64_t n_cols_per_unit = 64;
++    const int64_t n_units_per_token = (n_embd + n_cols_per_unit - 1)/n_cols_per_unit;
++    const int64_t n_units = n_tokens*n_units_per_token;
++    const int64_t dr      = (n_units + params->nth - 1)/params->nth;
++    const int64_t u0      = std::min(dr*params->ith, n_units);
++    const int64_t u1      = std::min(u0 + dr, n_units);
++
++    const float * x  = (const float *) experts->data;
++    const float * s  = expert_scale ? (const float *) expert_scale->data : nullptr;
++    const float * w  = (const float *) weights->data;
++    float       * y  = (float *) dst->data;
++
++    if (stage_weights) {
++        const int64_t n_rows = n_expert_used*n_tokens;
++        GGML_ASSERT(params->wsize >= 2*sizeof(float)*n_rows);
++
++        float * staged_w = (float *) params->wdata;
++        float * staged_s = staged_w + n_rows;
++
++        const int64_t dr_rows = (n_rows + params->nth - 1)/params->nth;
++        const int64_t r0      = std::min(dr_rows*params->ith, n_rows);
++        const int64_t r1      = std::min(r0 + dr_rows, n_rows);
++        memcpy(staged_w + r0, w + r0, (r1 - r0)*sizeof(float));
++        if (s) {
++            memcpy(staged_s + r0, s + r0, (r1 - r0)*sizeof(float));
++        }
++        // A serial run calls this on thread 0 alone (nth = 1) while the other threads wait at the
++        // barrier after the run, so a barrier here would pair with theirs.
++        if (params->nth > 1) {
++            ggml_barrier(params->threadpool);
++        }
++
++        w = staged_w;
++        s = s ? staged_s : nullptr;
++    }
++
++    float product[n_cols_per_unit];
++
++    for (int64_t u = u0; u < u1; ++u) {
++        const int64_t t    = u/n_units_per_token;
++        const int64_t i0   = (u % n_units_per_token)*n_cols_per_unit;
++        const int64_t n    = std::min(n_cols_per_unit, n_embd - i0);
++        const int64_t row0 = t*n_expert_used;
++
++        float * acc = y + t*n_embd + i0;
++        ggml_moe_weighted_expert_row(n, acc, x + row0*n_embd + i0, s ? s + row0 : nullptr, w[row0]);
++
++        for (int64_t k = 1; k < n_expert_used; ++k) {
++            const int64_t row = row0 + k;
++            ggml_moe_weighted_expert_row(n, product, x + row*n_embd + i0, s ? s + row : nullptr, w[row]);
++            // The products pass through memory, so the compiler cannot contract a product and its add
++            // into an FMA (GCC contracts by default). That keeps dst bit-exact with the unfused nodes.
++#if defined(__GNUC__)
++            __asm__ __volatile__("" : : "r"(product) : "memory");
++#endif
++            for (int64_t i = 0; i < n; ++i) {
++                acc[i] = acc[i] + product[i];
++            }
++        }
++    }
++}
++
+ static void ggml_compute_forward_rms_norm_back_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 18110507f..299329c90 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -44,6 +44,13 @@ void ggml_compute_forward_silu_back(const struct ggml_compute_params * params, s
+ void ggml_compute_forward_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
++void ggml_compute_forward_moe_weighted_reduction(
++        const struct ggml_compute_params * params,
++        const struct ggml_tensor * experts,
++        const struct ggml_tensor * expert_scale,
++        const struct ggml_tensor * weights,
++        struct ggml_tensor * dst,
++        bool stage_weights);
+ void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index dc1a67f80..ab62b2c6a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11570,6 +11570,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
+     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
++    // k = 10 at n_embd 2560 (10 of 512 experts), for decode, a small batch and a prefill ubatch.
++    test_cases.emplace_back(new test_moe_reduce(2560, 10, 1));
++    test_cases.emplace_back(new test_moe_reduce(2560, 10, 4));
++    test_cases.emplace_back(new test_moe_reduce(2560, 10, 512));
++    test_cases.emplace_back(new test_moe_reduce(2560, 10, 512, false, true));
+ 
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

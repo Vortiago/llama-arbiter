@@ -21,13 +21,15 @@ RUN=${RUN:-$ROOT/run}
 MODELS=${MODELS:-$ROOT/models}
 MODELS2=${MODELS2:-$MODELS}
 
-# Override these in config.local.sh for a model with other filenames.
+# Override these in config.local.sh for a model with other filenames. The
+# draft is ggml-org's MTP GGUF, which carries its own token_embd. The unsloth
+# "shared" draft does not load on llama.cpp master.
 MODEL_Q8=${MODEL_Q8:-$MODELS/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}
 MODEL_Q6=${MODEL_Q6:-$MODELS/UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf}
-DRAFT=${DRAFT:-$MODELS/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}
+DRAFT=${DRAFT:-$MODELS/MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf}
 
 MODEL2_Q8=${MODEL2_Q8:-$MODELS2/Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf}
-DRAFT2=${DRAFT2:-$MODELS2/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}
+DRAFT2=${DRAFT2:-$MODELS2/MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf}
 
 # --no-mmproj-offload keeps the image encoder in RAM. The gpu backend has under
 # 1 GiB of VRAM spare at ctx 150000, and the encoder runs once per image.
@@ -58,26 +60,77 @@ backend_names() { backend_rows | awk '{print $1}'; }
 backend_row() { backend_rows | awk -v n="$1" '$1 == n'; }
 
 source "$ROOT/bin/cores.sh"
-# THREADS_ENV keeps the caller's THREADS. A script that moves NODE after this
-# (qwen-mtp-cpu.sh) recounts from it.
+# THREADS_ENV keeps the caller's THREADS, which bin/restart-backend.sh passes
+# on in place of the count below.
 THREADS_ENV=${THREADS:-}
 THREADS=${THREADS:-$(cores_on_node "$NODE")}
 
 # --preferred, not --membind: spill to the other node instead of failing.
 NUMACTL=(--cpunodebind="$NODE" --preferred="$NODE")
 
+# NUMA_MODE=off on a single-node machine. There is no remote node to bind away
+# from, and `--numa` is not free: llama.cpp then sets MADV_RANDOM and skips
+# MAP_POPULATE. launch() and prime() run through NUMA_PREFIX, which is empty
+# when there is nothing to bind.
+NUMA_MODE=${NUMA_MODE:-numactl}
+if [[ $NUMA_MODE == off ]]; then
+  NUMA_ARGS=()
+  NUMA_PREFIX=()
+else
+  NUMA_ARGS=(--numa "$NUMA_MODE")
+  NUMA_PREFIX=(numactl "${NUMACTL[@]}" --)
+fi
+
+# This build is GGML_OPENMP=ON, so --poll is never read and an idle worker
+# spins for GOMP_SPINCOUNT instead. Three instances on one 32-core socket spin
+# 48 threads, which takes cores from the one that has work. PASSIVE makes an
+# idle worker sleep. Exported, so the llama-server that launch() execs reads it.
+export OMP_WAIT_POLICY=${OMP_WAIT_POLICY:-PASSIVE}
+export GOMP_SPINCOUNT=${GOMP_SPINCOUNT:-0}
+
 SAMPLING=(--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0)
 MTP_ARGS=(--model-draft "$DRAFT" --spec-type draft-mtp --spec-draft-n-max 3)
 
-# vision_args <mmproj-file> -- empty if the file is absent or VISION=0
+# vision_args <mmproj-file>: empty if the file is absent or VISION=0
 vision_args() {
   [[ ${VISION:-1} == 1 && -f $1 ]] && printf '%s\n' --mmproj "$1" --no-mmproj-offload
+}
+
+# kv_args <slots>: the KV flags for that many slots. A state file records
+# n_stream (src/llama-kv-cache.cpp, n_stream = unified ? 1 : n_seq_max), and a
+# restore refuses a file that disagrees. One slot needs nothing; more than one
+# must be unified, or its states will not move between backends.
+kv_args() {
+  if (( $1 > 1 )); then
+    printf '%s\n' --kv-unified --kv-unified-per-slot "${CTX:-150000}"
+  else
+    printf '%s\n' --ctx-size "${CTX:-150000}"
+  fi
+}
+
+# tools_args: a podman sandbox for the tool calls --agent makes, and the MCP
+# servers in MCP_CONFIG. Empty when TOOLS_CONTAINER is unset or not running.
+# A backend that answers without tools is worth more than one that will not
+# start: a unit that made this fatal restarted 6448 times.
+TOOLS_CONTAINER=${TOOLS_CONTAINER:-}
+MCP_CONFIG=${MCP_CONFIG:-}
+tools_args() {
+  [[ -n $TOOLS_CONTAINER ]] || return 0
+  if ! podman container inspect "$TOOLS_CONTAINER" \
+       --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+    echo "${0##*/}: container '$TOOLS_CONTAINER' is not running," \
+         "starting without a tools sandbox" >&2
+    return 0
+  fi
+  printf '%s\n' --tools-runtime "podman-container:$TOOLS_CONTAINER"
+  [[ -n $MCP_CONFIG && -f $MCP_CONFIG ]] && printf '%s\n' --mcp-servers-config "$MCP_CONFIG"
+  return 0
 }
 
 # --agent gives any client shell and file access, and there is no API key.
 # The backends listen on localhost. Only the router is public.
 COMMON=(
-  --numa numactl
+  "${NUMA_ARGS[@]}"
   --parallel 1
   --flash-attn auto
   --jinja
@@ -95,8 +148,9 @@ COMMON=(
   # rewound without one at or below the point where a prompt stops matching.
   # At the default 8192, a 49,533 token prompt held four, the lowest at 17,271.
   # A turn sharing 17,270 tokens found none below it and re-read all 49,533.
-  # At 2048 it re-reads at most 2048.
-  --checkpoint-min-step 2048
+  # At 2048 it re-reads at most 2048. CKPT_STEP and CKPT_N move both for a
+  # sweep through bin/restart-backend.sh.
+  --checkpoint-min-step "${CKPT_STEP:-2048}"
   # Keep the list short, because llama.cpp only applies the spacing above when
   # the list is full (server-context.cpp, create_checkpoint). Held at 64 it
   # never filled, so nothing was ever spaced: every prompt leaves a pair 4 and
@@ -105,7 +159,7 @@ COMMON=(
   # of a 12 GiB saved slot, all inside one kilotoken.
   # 23,713 restores in the logs: 99.6% took the 3rd checkpoint or newer, and
   # the deepest walk went back 2,552 tokens. Eight at 2048 apart spans 16k.
-  --ctx-checkpoints 8
+  --ctx-checkpoints "${CKPT_N:-8}"
   --no-cache-idle-slots  # Otherwise llama.cpp copies every idle slot into its
                          # RAM cache when a task starts and, under --kv-unified,
                          # CLEARS the slot the router has just restored.
@@ -118,9 +172,8 @@ COMMON=(
 
 die() { echo "${0##*/}: $*" >&2; exit 1; }
 
-# Read the weights once, so the server maps pages already in memory. Under
-# --numa, llama.cpp sets MADV_RANDOM and skips MAP_POPULATE, and never does
-# this itself. PRIME_SKIP names shards not worth reading. The default is the
+# Read the weights once, so the server maps pages already in memory: under
+# --numa it never does this itself (see NUMA_MODE above). PRIME_SKIP names shards not worth reading. The default is the
 # shard with the 50 GiB per_layer_token_embd tensor, which --lazy-mode leaves
 # on disk. Best effort: a missing DRAFT or oddly named shards must not stop a
 # backend from starting.
@@ -137,14 +190,15 @@ prime() {
   done
   shopt -u nullglob
   (( ${#keep[@]} )) || { echo "${0##*/}: nothing to prime for $MODEL" >&2; return 0; }
-  numactl "${NUMACTL[@]}" -- cat "${keep[@]}" > /dev/null 2>&1 || true
+  "${NUMA_PREFIX[@]}" cat "${keep[@]}" > /dev/null 2>&1 || true
   return 0
 }
 
 launch() {
   mkdir -p "$RUN/slots"
   # Without this check the backend exits 127 in a log nobody reads yet.
-  command -v numactl >/dev/null || die "numactl is not installed, and every backend is started through it"
+  [[ $NUMA_MODE == off ]] || command -v numactl >/dev/null ||
+    die "numactl is not installed, and every backend is started through it. NUMA_MODE=off skips it."
   [[ -x $SERVER ]] || die "no llama-server at $SERVER (set SERVER_MTP in config.local.sh)"
   [[ -f $MODEL  ]] || die "no model at $MODEL (set MODELS, or MODEL_Q8, in config.local.sh)"
 
@@ -152,7 +206,7 @@ launch() {
   # last statement of a function returns 1 from it.
   if [[ ${PRIME:-1} == 1 ]]; then prime; fi
 
-  exec numactl "${NUMACTL[@]}" -- "$SERVER" \
+  exec "${NUMA_PREFIX[@]}" "$SERVER" \
     --model "$MODEL" \
     --alias "$ALIAS" \
     --threads "$THREADS" \
