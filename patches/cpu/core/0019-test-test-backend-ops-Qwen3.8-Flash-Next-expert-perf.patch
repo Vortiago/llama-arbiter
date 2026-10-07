@@ -1,0 +1,46 @@
+From 71e9586dee7c9aeb0a065d39d2fb0dfad39aa12f Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 11:54:58 +0200
+Subject: [PATCH] test(test-backend-ops): Qwen3.8-Flash-Next expert perf cases,
+ and a thread count
+
+Perf cases at the model's own MUL_MAT_ID shapes, Q8_0: 512 experts, 10
+used, gate and up 2560 -> 640, down 640 -> 2560, at 1, 4 and 512 tokens.
+
+GGML_TEST_THREADS sets the CPU backend's threads. The default of half the
+hardware threads spans both sockets of a two-node machine, where a backend
+runs on one.
+---
+ tests/test-backend-ops.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b70384cbd..222da4c58 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11902,6 +11902,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // Qwen3.8-Flash-Next experts at Q8_0: 512 of them, 10 used a token. gate and
++    // up are 2560 -> 640, down is 640 -> 2560. 1 token is a plain decode, 4 an
++    // MTP verify at n-max 3, 512 a prefill ubatch.
++    for (int n : {1, 4, 512}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
+@@ -12984,7 +12992,9 @@ int main(int argc, char ** argv) {
+         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+         if (ggml_backend_set_n_threads_fn) {
+-            ggml_backend_set_n_threads_fn(backend.get(), std::max<int>(1, N_THREADS/2));
++            ggml_backend_set_n_threads_fn(backend.get(), getenv("GGML_TEST_THREADS")
++                                              ? std::max(1, atoi(getenv("GGML_TEST_THREADS")))
++                                              : std::max<int>(1, N_THREADS/2));
+         }
+ 
+         size_t free, total;  // NOLINT
