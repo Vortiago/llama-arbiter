@@ -1,0 +1,41 @@
+From 0d74939e6bd885bfd17687922ba19ab7a019329a Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 15:26:09 +0200
+Subject: [PATCH] test(test-backend-ops): add Q8_0 MUL_MAT_ID cases with many
+ rows per expert
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add two small Q8_0 cases where most experts get 4 or more routed rows,
+which the CPU llamafile_sgemm path for MUL_MAT_ID takes:
+
+- 16 experts, top-8, m = 198, n = 300, k = 512: about 150 rows per
+  expert, so the rows split into several sgemm calls, and m is not a
+  multiple of 4 or of the 64-row work item.
+- 64 experts, top-4, broadcast b, m = 101, n = 64, k = 256, m_v = 128:
+  strided experts, and experts above and below 4 rows side by side.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ tests/test-backend-ops.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d8893025e..c27b907d3 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10657,6 +10657,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
+     }
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
++    // Q8_0 experts with several routed rows (the CPU llamafile_sgemm path): m not a multiple
++    // of 4 or 64, more than 64 rows per expert, and strided experts with a broadcast b.
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, 8, false, 198, 300, 512));
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 64, 4, true,  101,  64, 256, 1.0f, 128));
+ 
+     // multiple blocks per row: exercises the block-stride loop and the
+     // per-expert base offset, which k == 256 alone leaves untested

@@ -118,8 +118,11 @@ Two things to know before sending a large state:
 
 ### A patched llama.cpp
 
-Three of the patches in `patches/` are required. The router does not work
-without them:
+The backends run ggml-org llama.cpp master `8e1642198`, the commit that
+`patches/llama-ref` names, with two sets of patches.
+
+The server patches in `patches/` change `llama-server`. Three of them are
+required. The router does not work without them:
 
 | patch | what it makes possible |
 |---|---|
@@ -127,19 +130,42 @@ without them:
 | `slots-report-the-prompt-size` | The dashboard can compute "still to read". |
 | `anthropic-pass-id-slot` | The router can name a slot on `/v1/messages`. |
 
-To clone llama.cpp, apply the patches and build the server, run:
+The CPU speed patches in `patches/cpu/` make the CPU backend faster. The
+router does not need them. They come in two tiers:
+
+- **Core** applies by default: X1, X3, I4A, I4B, M3, W1, W2, K3, U4 and K1.
+  Each gives the same output bits as the base, except U4, whose batch-1 decode
+  attention sums in another order.
+- **Optional** applies only when `CPU_OPTIONAL` names it: I1, a SIMD sigmoid,
+  and Q1, a partial sort for the MoE router. Each moves the output a little,
+  with no measurable loss in perplexity.
+
+The machine is a 32-core EPYC with no GPU. There, core plus I1 and Q1 read an
+8k prompt at 59.4 to 60.9 tok/s, against 44.0 without the patches. After a restore of a saved
+128k slot they read on 32 threads at 38.4 and 38.9 tok/s, against 19.2 and
+19.8. `patches/README.md` says what each
+patch does, what it gains, and whether its output is exact.
+
+To clone llama.cpp, check out that commit, apply the server patches and the
+core CPU patches, and build the server, run:
 
     tools/get-llama.sh
 
 The script builds `llama-server` at the path that `SERVER_MTP` uses by default.
-A machine with an nvidia card needs no further configuration for it. Three
-variables change what the script does:
+A machine with an nvidia card needs no further configuration for it. The CPU
+patches change the CPU backend, which a CUDA build compiles too, so a CUDA
+build takes them as well. These variables change what the script does:
 
+- `CPU_OPTIONAL="I1 Q1"` also applies the optional CPU sets it names.
 - `BUILD=0` stops before cmake.
 - `CUDA=0` and `CMAKE_ARGS` build it another way.
-- `LLAMA_REF` pins an upstream commit, if the tip has moved under the patches.
+- `LLAMA_REF=<commit>` checks out another commit. An empty `LLAMA_REF` keeps
+  the commit that the checkout is on.
 
 Run the script again at any time. It skips a patch that is already applied.
+To write `patches/cpu/` again from a llama.cpp branch, run
+`tools/export-cpu-patches.sh`. `tools/README.md` says how to name the
+optional sets.
 
 The launch scripts also pass `--agent`, `--no-cache-idle-slots`,
 `--ctx-checkpoints`, `--checkpoint-min-step`, `--n-cpu-moe` and `--spec-type
@@ -148,9 +174,11 @@ draft-mtp`. A build that is too old for these flags does not start.
 ### Weights
 
 Keep the weights anywhere. Name them with `MODELS` and `MODEL_Q8` in
-`config.local.sh`. By default those names point to Qwen3-Next at Q8, with an
-MTP draft model and an F16 mmproj. Nothing else in this repository depends on
-that model.
+`config.local.sh`. By default those names point to Qwen3.8-Flash-Next at Q8,
+with an F16 mmproj and ggml-org's MTP draft model,
+`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`. That draft carries its own `token_embd`.
+The unsloth "shared" draft does not load on llama.cpp master. Nothing else in
+this repository depends on that model.
 
 ## Running it elsewhere
 

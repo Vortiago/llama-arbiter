@@ -1,0 +1,4 @@
+# Machine-local files that every new worktree needs to start: see the
+# comment on them in .gitignore.
+config.local.sh
+backends.local.json

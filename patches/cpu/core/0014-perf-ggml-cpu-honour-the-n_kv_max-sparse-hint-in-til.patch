@@ -1,0 +1,728 @@
+From a36982fd26ecf121e858d2ef4745f4f80249b36a Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 16:40:29 +0200
+Subject: [PATCH] perf(ggml-cpu): honour the n_kv_max sparse hint in tiled
+ flash attention prefill
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+With the n_kv_max hint, a long prefill now gathers only the KV cells that
+its queries can see, as CUDA, Vulkan and Metal already do. Before, the
+tiled path skipped a 64x64 tile only when all 64 rows masked it. Qwen QSA
+rows keep different pools, so the work stayed dense, and the mask was
+scanned and K/V repacked once per query head.
+
+The new path runs in two phases.
+
+Phase 1 builds one ascending list per group of 8 query tokens (the CUDA
+ncols1) and per mask sequence: the cells that any of the 8 rows can see.
+An AVX2 scan reads 16 F16 mask cells per load, with a scalar tail and a
+scalar fallback. All KV heads share a list, so the mask is read once per
+token group, not once per head.
+
+Phase 2 hands out units of (token group, KV head, head block) with the
+threadpool chunk counter. A head block holds at most 12 query heads, so
+the 8 tokens and 12 heads of Qwen QSA form one 96-row Q block. The unit
+gathers K/V for 64 listed cells at a time, once for all its heads, and
+runs the tiled path's simd_gemm, online softmax, sinks and output code.
+The work per unit grows with the union per group, not with n_kv. The
+union is a subset of the dense cells, so the FLOPs never rise.
+
+The gate is the CUDA one (F16 mask with ne[2] == 1, no ALiBi, no
+softcap, n_kv >= 4096) on top of the tiled path's own (at least 64 query
+rows, F32 Q, F16 or F32 K/V). This first version also needs head sizes
+up to 256 and K/V with the same head counts. DeepSeek (512) and the MLA
+shape (576/512) keep the tiled path. Decode and MTP verify (fewer than
+64 rows) do not change.
+
+The plan reserves the per-thread scratch and the lists through one size
+helper in common.h, ggml_fa_sparse_wsize. The kernel takes the path only
+if the work buffer holds that size. Each list holds min(n_kv, 8*n_kv_max)
+cells, because the hint bounds each row by n_kv_max. A debug build
+asserts that bound per row. In a release build, a list that overflows
+sends the whole op back to the tiled path.
+
+The output is numerically close to the tiled path, not bit-exact: the
+online softmax rescales at different tile boundaries. KQ itself does not
+change, because simd_gemm accumulates each element in the same order.
+Ops outside the gate run the old code and stay bit-exact.
+
+Tests: eval cases for a partial token group, sinks, two mask sequences,
+F32 K/V, head blocks of 1, 8 and 7+6 query heads, large logits and a
+pool-shaped QSA-like mask, plus two gate cases (ALiBi and softcap) that
+must keep the tiled path. Perf cases for 256/256 gqa 12 at kv 4096,
+32768 and 131072, with a random mask (worst-case union), a pool-shaped
+mask and the dense tiled path to compare.
+
+Credits: CUDA sparse flash attention (ggml-org #29298 and earlier),
+Vulkan #28105, Metal #28098, and the gather idea of ik_llama.cpp #2404.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/common.h   |  29 +++
+ ggml/src/ggml-cpu/ggml-cpu.c |  11 +-
+ ggml/src/ggml-cpu/ops.cpp    | 426 ++++++++++++++++++++++++++++++++++-
+ tests/test-backend-ops.cpp   | 105 +++++++++
+ 4 files changed, 562 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/common.h b/ggml/src/ggml-cpu/common.h
+index d46aa1f5e..9984ec8a0 100644
+--- a/ggml/src/ggml-cpu/common.h
++++ b/ggml/src/ggml-cpu/common.h
+@@ -5,6 +5,7 @@
+ #include "ggml-cpu-impl.h"
+ #include "ggml-impl.h"
+ #include "simd-mappings.h"
++#include "ops.h"
+ 
+ #define GGML_FA_TILE_Q  64
+ #define GGML_FA_TILE_KV 64
+@@ -12,6 +13,34 @@
+ // KV block size for the single query (decode) path. The tiled path needs GGML_FA_TILE_Q query rows, so it cannot serve this case.
+ #define GGML_FA_KQ_BLK  32
+ 
++// Sparse prefill (n_kv_max hint): one list of live KV cells per group of GGML_FA_SPARSE_GROUP_Q query tokens.
++// A unit stacks the group's tokens and up to GGML_FA_SPARSE_ROWS/GGML_FA_SPARSE_GROUP_Q query heads of one KV head.
++#define GGML_FA_SPARSE_GROUP_Q 8
++#define GGML_FA_SPARSE_ROWS    96
++
++// Per thread scratch of the sparse prefill path, in floats:
++// Q[ROWS*DK], KQ[ROWS*TILE_KV], mask[GROUP_Q*TILE_KV], VKQ32[ROWS*DV], V32[TILE_KV*DV], K_f32[TILE_KV*DK], padding.
++static inline size_t ggml_fa_sparse_wdata_per_thread(int64_t DK, int64_t DV) {
++    return (size_t) (GGML_FA_SPARSE_ROWS*(DK + GGML_FA_TILE_KV + DV) + GGML_FA_SPARSE_GROUP_Q*GGML_FA_TILE_KV + GGML_FA_TILE_KV*(DV + DK)) + CACHE_LINE_SIZE_F32;
++}
++
++// The hint bounds each mask row by n_kv_max live cells, so the union of a group never exceeds GROUP_Q*n_kv_max.
++static inline int64_t ggml_fa_sparse_list_cap(int64_t n_kv, int64_t n_kv_max) {
++    return MIN(n_kv, (int64_t) GGML_FA_SPARSE_GROUP_Q*n_kv_max);
++}
++
++// One list per token group and per mask sequence (mask ne[3]).
++static inline int64_t ggml_fa_sparse_n_lists(int64_t n_q, int64_t n_mask_seq) {
++    return (n_q + GGML_FA_SPARSE_GROUP_Q - 1)/GGML_FA_SPARSE_GROUP_Q*n_mask_seq;
++}
++
++// The plan and the kernel both size the work buffer with this: per thread scratch, then the counts, then the lists.
++static inline size_t ggml_fa_sparse_wsize(int64_t DK, int64_t DV, int64_t n_q, int64_t n_kv, int64_t n_kv_max, int64_t n_mask_seq, int n_threads) {
++    const int64_t n_lists = ggml_fa_sparse_n_lists(n_q, n_mask_seq);
++    return sizeof(float)*ggml_fa_sparse_wdata_per_thread(DK, DV)*n_threads +
++           sizeof(int32_t)*(size_t) (n_lists*(1 + ggml_fa_sparse_list_cap(n_kv, n_kv_max)));
++}
++
+ #ifdef __cplusplus
+ 
+ #include <utility>
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 448fd9da4..753b3c08a 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3365,7 +3365,16 @@ struct ggml_cplan ggml_graph_plan(
+                         size_t n_chunks = n_tasks;
+                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV + GGML_FA_KQ_BLK));
+ 
+-                        cur += MAX(prefill, decode);
++                        size_t fa = MAX(prefill, decode);
++
++                        // Sparse prefill (n_kv_max hint): the kernel takes this path only if the work buffer holds it.
++                        const int32_t n_kv_max = ggml_get_op_params_i32(node, 4);
++                        if (n_kv_max > 0 && node->src[3] != NULL) {
++                            const size_t sparse = ggml_fa_sparse_wsize(DK, DV, node->src[0]->ne[1], node->src[1]->ne[1], n_kv_max, node->src[3]->ne[3], n_tasks);
++                            fa = MAX(fa, sparse);
++                        }
++
++                        cur += fa;
+                     } break;
+                 case GGML_OP_FLASH_ATTN_BACK:
+                     {
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 32c2d050d..98cd83edf 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9542,6 +9542,386 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+     }
+ }
+ 
++// Sparse prefill (n_kv_max hint): the CUDA sparse gate, plus a prefill batch, an F16 mask shared by all heads
++// and a work buffer that holds the cell lists. Every thread computes the same answer.
++static bool ggml_fa_sparse_prefill_supported(const ggml_compute_params * params, const ggml_tensor * dst) {
++    const ggml_tensor * q    = dst->src[0];
++    const ggml_tensor * k    = dst->src[1];
++    const ggml_tensor * v    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++
++    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
++    if (n_kv_max <= 0 || mask == nullptr) {
++        return false;
++    }
++
++    float max_bias      = 0.0f;
++    float logit_softcap = 0.0f;
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++
++    // Head sizes up to 256 (Qwen QSA) for now. DeepSeek (512) and the MLA shape (576/512) keep the tiled path.
++    // The 4096 floor is the CUDA one: a shallow context stays on the tiled path, bit for bit.
++    return mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 && mask->ne[0] >= k->ne[1] &&
++           max_bias == 0.0f && logit_softcap == 0.0f &&
++           k->ne[0] <= 256 && v->ne[0] <= 256 &&
++           k->ne[2] == v->ne[2] && k->ne[3] == v->ne[3] &&
++           k->ne[1] >= 4096 &&
++           params->wsize >= ggml_fa_sparse_wsize(k->ne[0], v->ne[0], q->ne[1], k->ne[1], n_kv_max, mask->ne[3], params->nth);
++}
++
++// Query heads of one KV head split into the fewest blocks of at most ROWS/GROUP_Q heads.
++static int64_t ggml_fa_sparse_n_head_blocks(int64_t rk2) {
++    const int64_t hb_max = GGML_FA_SPARSE_ROWS/GGML_FA_SPARSE_GROUP_Q;
++    return (rk2 + hb_max - 1)/hb_max;
++}
++
++// The ascending list of KV cells that any of the n_rows mask rows can see.
++// Nothing (-1) when the union does not fit in cap, which means a row broke the n_kv_max contract.
++static int64_t ggml_fa_sparse_compact_rows(
++        const ggml_fp16_t * const * rows, int n_rows, int64_t n_kv,
++        int32_t * list, int64_t cap) {
++    // An F16 is finite unless all its exponent bits are set. The masked value, -INFINITY, is 0xFC00.
++    static constexpr uint16_t exp_bits = 0x7C00;
++
++    int64_t n = 0;
++    int64_t i = 0;
++#if defined(__AVX2__)
++    const __m256i exp_bits_v = _mm256_set1_epi16((short) exp_bits);
++    for (; i + 16 <= n_kv; i += 16) {
++        __m256i dead = _mm256_set1_epi16(-1);
++        for (int t = 0; t < n_rows; ++t) {
++            const __m256i h = _mm256_loadu_si256((const __m256i *) (rows[t] + i));
++            dead = _mm256_and_si256(dead, _mm256_cmpeq_epi16(_mm256_and_si256(h, exp_bits_v), exp_bits_v));
++        }
++        // movemask gives two bits per 16 bit lane: keep the low one.
++        const uint32_t live = ~(uint32_t) _mm256_movemask_epi8(dead) & 0x55555555u;
++        if (live == 0) {
++            continue;
++        }
++        for (int b = 0; b < 16; ++b) {
++            if (live & (1u << (2*b))) {
++                if (n == cap) {
++                    return -1;
++                }
++                list[n++] = (int32_t) (i + b);
++            }
++        }
++    }
++#endif
++    for (; i < n_kv; ++i) {
++        bool live = false;
++        for (int t = 0; t < n_rows; ++t) {
++            live |= (rows[t][i] & exp_bits) != exp_bits;
++        }
++        if (live) {
++            if (n == cap) {
++                return -1;
++            }
++            list[n++] = (int32_t) i;
++        }
++    }
++    return n;
++}
++
++// Sparse prefill, phase 1: one cell list per group of GGML_FA_SPARSE_GROUP_Q query tokens and per mask sequence.
++// All KV heads share a list, so the mask is scanned once per group, not once per head.
++static void ggml_compute_forward_flash_attn_ext_sparse_compact(
++        const ggml_compute_params * params,
++        const ggml_tensor * dst,
++        int32_t * counts, int32_t * lists, int64_t cap) {
++    const ggml_tensor * q    = dst->src[0];
++    const ggml_tensor * k    = dst->src[1];
++    const ggml_tensor * mask = dst->src[3];
++
++    const int64_t n_q      = q->ne[1];
++    const int64_t n_kv     = k->ne[1];
++    const int64_t n_groups = (n_q + GGML_FA_SPARSE_GROUP_Q - 1)/GGML_FA_SPARSE_GROUP_Q;
++    const int64_t n_lists  = ggml_fa_sparse_n_lists(n_q, mask->ne[3]);
++
++    for (int64_t il = params->ith; il < n_lists; il += params->nth) {
++        const int64_t im3    = il / n_groups;
++        const int64_t iq1    = (il % n_groups)*GGML_FA_SPARSE_GROUP_Q;
++        const int     n_rows = (int) MIN((int64_t) GGML_FA_SPARSE_GROUP_Q, n_q - iq1);
++
++        const ggml_fp16_t * rows[GGML_FA_SPARSE_GROUP_Q];
++        for (int t = 0; t < n_rows; ++t) {
++            rows[t] = (const ggml_fp16_t *) ((const char *) mask->data + (iq1 + t)*mask->nb[1] + im3*mask->nb[3]);
++        }
++
++#ifndef NDEBUG
++        // The hint contract: no row sees more than n_kv_max cells, or the union can overflow the list.
++        const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
++        for (int t = 0; t < n_rows; ++t) {
++            int64_t n_live = 0;
++            for (int64_t i = 0; i < n_kv; ++i) {
++                n_live += (rows[t][i] & 0x7C00) != 0x7C00;
++            }
++            GGML_ASSERT(n_live <= n_kv_max);
++        }
++#endif
++
++        counts[il] = (int32_t) ggml_fa_sparse_compact_rows(rows, n_rows, n_kv, lists + il*cap, cap);
++    }
++}
++
++// True when every list of phase 1 fits. A list that overflowed sends the whole op to the tiled path.
++static bool ggml_fa_sparse_lists_fit(const int32_t * counts, int64_t n_lists) {
++    for (int64_t il = 0; il < n_lists; ++il) {
++        if (counts[il] < 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Prefetch the rows of the next gathered tile: a cell list jumps around a K/V cache far larger than the L2.
++static void ggml_fa_sparse_prefetch_rows(const char * base, const int32_t * idx, int n, size_t nb_row, size_t row_size) {
++#if defined(__GNUC__)
++    for (int c = 0; c < n; ++c) {
++        const char * row = base + (int64_t) idx[c]*nb_row;
++        for (size_t off = 0; off < row_size; off += CACHE_LINE_SIZE) {
++            __builtin_prefetch(row + off);
++        }
++    }
++#else
++    GGML_UNUSED(base);
++    GGML_UNUSED(idx);
++    GGML_UNUSED(n);
++    GGML_UNUSED(nb_row);
++    GGML_UNUSED(row_size);
++#endif
++}
++
++// Sparse prefill, phase 2: one unit is (iq3, token group, KV head, head block).
++// The unit stacks its rows as r = token*HB + head, so the heads of a token share its mask row,
++// and each gathered K/V tile serves all GROUP_Q*HB rows. The softmax and output code is the tiled one.
++static void ggml_compute_forward_flash_attn_ext_sparse(
++        const ggml_compute_params * params,
++        ggml_tensor * dst,
++        int64_t unit,
++        const int32_t * counts, const int32_t * lists, int64_t cap) {
++    const ggml_tensor * q     = dst->src[0];
++    const ggml_tensor * k     = dst->src[1];
++    const ggml_tensor * v     = dst->src[2];
++    const ggml_tensor * mask  = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++
++    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
++    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
++    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
++    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
++    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
++
++    static constexpr int G  = GGML_FA_SPARSE_GROUP_Q;
++    static constexpr int KV = GGML_FA_TILE_KV;
++
++    const int64_t DK = nek0;
++    const int64_t DV = nev0;
++
++    const ggml_type kv_type = k->type;
++
++    const int64_t rk2 = neq2/nek2;
++    const int64_t rk3 = neq3/nek3;
++
++    const int64_t n_groups = (neq1 + G - 1)/G;
++    const int64_t n_hb     = ggml_fa_sparse_n_head_blocks(rk2);
++    const int64_t HB       = (rk2 + n_hb - 1)/n_hb;
++    const int64_t R        = G*HB;
++
++    float scale = 1.0f;
++    memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
++
++    int64_t rest = unit;
++    const int64_t hb  = rest % n_hb;     rest /= n_hb;
++    const int64_t ik2 = rest % nek2;     rest /= nek2;
++    const int64_t ig  = rest % n_groups; rest /= n_groups;
++    const int64_t iq3 = rest;
++
++    const int64_t ik3    = iq3 / rk3;
++    const int64_t iq1_0  = ig*G;
++    const int64_t h0     = ik2*rk2 + hb*HB;
++    const int     n_tok  = (int) MIN((int64_t) G, neq1 - iq1_0);
++    const int     n_head = (int) MIN(HB, rk2 - hb*HB);
++
++    const int64_t   il      = (iq3 % mask->ne[3])*n_groups + ig;
++    const int32_t * list    = lists + il*cap;
++    const int64_t   n_cells = counts[il];
++
++    float * Q_f32  = (float *) params->wdata + params->ith*ggml_fa_sparse_wdata_per_thread(DK, DV);
++    float * KQ     = Q_f32  + GGML_FA_SPARSE_ROWS*DK;
++    float * mask32 = KQ     + GGML_FA_SPARSE_ROWS*KV;
++    float * VKQ32  = mask32 + G*KV;
++    float * V32    = VKQ32  + GGML_FA_SPARSE_ROWS*DV;
++    float * K_f32  = V32    + KV*DV;
++
++    const ggml_fp16_t * mask_rows[G];
++    for (int t = 0; t < n_tok; ++t) {
++        mask_rows[t] = (const ggml_fp16_t *) ((const char *) mask->data + (iq1_0 + t)*mask->nb[1] + (iq3 % mask->ne[3])*mask->nb[3]);
++    }
++
++    for (int t = 0; t < G; ++t) {
++        for (int hh = 0; hh < HB; ++hh) {
++            float * q_row = Q_f32 + (t*HB + hh)*DK;
++            if (t < n_tok && hh < n_head) {
++                memcpy(q_row, (const char *) q->data + (iq1_0 + t)*nbq1 + (h0 + hh)*nbq2 + iq3*nbq3, DK*sizeof(float));
++            } else {
++                memset(q_row, 0, DK*sizeof(float));
++            }
++        }
++    }
++
++    float S[GGML_FA_SPARSE_ROWS];
++    float M[GGML_FA_SPARSE_ROWS];
++    for (int64_t r = 0; r < R; ++r) {
++        S[r] = 0.0f;
++        M[r] = -INFINITY;
++    }
++    memset(VKQ32, 0, R*DV*sizeof(float));
++
++    const char * k_base = (const char *) k->data + ik2*nbk2 + ik3*nbk3;
++    const char * v_base = (const char *) v->data + ik2*nbv2 + ik3*nbv3;
++
++    for (int64_t j0 = 0; j0 < n_cells; j0 += KV) {
++        const int       nc  = (int) MIN((int64_t) KV, n_cells - j0);
++        const int32_t * idx = list + j0;
++
++        const int nc_next = (int) MIN((int64_t) KV, n_cells - j0 - KV);
++        if (nc_next > 0) {
++            ggml_fa_sparse_prefetch_rows(k_base, idx + KV, nc_next, nbk1, DK*nbk0);
++            ggml_fa_sparse_prefetch_rows(v_base, idx + KV, nc_next, nbv1, DV*nbv0);
++        }
++
++        // One mask row per token. A padded column is -inf, so the softmax gives it zero weight.
++        for (int t = 0; t < n_tok; ++t) {
++            float * mask_row = mask32 + t*KV;
++            for (int c = 0; c < nc; ++c) {
++                mask_row[c] = GGML_CPU_FP16_TO_FP32(mask_rows[t][idx[c]]);
++            }
++            for (int c = nc; c < KV; ++c) {
++                mask_row[c] = -INFINITY;
++            }
++        }
++
++        // Gather K transposed, K_f32[dk][c], zero padded so the GEMM always runs KV columns.
++        for (int c = 0; c < nc; ++c) {
++            const char * k_data = k_base + (int64_t) idx[c]*nbk1;
++            if (kv_type == GGML_TYPE_F16) {
++                const ggml_fp16_t * k_f16 = (const ggml_fp16_t *) k_data;
++                for (int64_t dk = 0; dk < DK; dk++) {
++                    K_f32[dk*KV + c] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
++                }
++            } else {
++                const float * k_f32_src = (const float *) k_data;
++                for (int64_t dk = 0; dk < DK; dk++) {
++                    K_f32[dk*KV + c] = k_f32_src[dk];
++                }
++            }
++        }
++        if (nc < KV) {
++            for (int64_t dk = 0; dk < DK; dk++) {
++                memset(K_f32 + dk*KV + nc, 0, (KV - nc)*sizeof(float));
++            }
++        }
++
++        memset(KQ, 0, R*KV*sizeof(float));
++        simd_gemm(KQ, Q_f32, K_f32, (int) R, (int) DK, KV);
++        ggml_vec_scale_f32((int) (R*KV), KQ, scale);
++
++        bool skip[GGML_FA_SPARSE_ROWS];
++
++        for (int64_t r = 0; r < R; ++r) {
++            const int64_t t  = r / HB;
++            const int64_t hh = r % HB;
++            float * kq_row = KQ + r*KV;
++
++            if (t >= n_tok || hh >= n_head) {
++                skip[r] = true;
++                continue;
++            }
++
++            ggml_vec_add_f32(KV, kq_row, kq_row, mask32 + t*KV);
++
++            float tile_max;
++            ggml_vec_max_f32(KV, &tile_max, kq_row);
++
++            if (tile_max == -INFINITY) {
++                skip[r] = true;
++                continue;
++            }
++            skip[r] = false;
++
++            const float Mold = M[r];
++            const float Mnew = fmaxf(Mold, tile_max);
++
++            if (Mnew > Mold) {
++                const float ms = expf(Mold - Mnew);
++                ggml_vec_scale_f32(DV, VKQ32 + r*DV, ms);
++                S[r] *= ms;
++            }
++            M[r] = Mnew;
++
++            S[r] += ggml_vec_soft_max_f32(KV, kq_row, kq_row, Mnew);
++        }
++
++        // Gather V to contiguous F32, zero padded.
++        for (int c = 0; c < nc; ++c) {
++            const char * v_data = v_base + (int64_t) idx[c]*nbv1;
++            if (kv_type == GGML_TYPE_F16) {
++                ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) v_data, V32 + c*DV, DV);
++            } else {
++                memcpy(V32 + c*DV, v_data, DV*sizeof(float));
++            }
++        }
++        if (nc < KV) {
++            memset(V32 + nc*DV, 0, (KV - nc)*DV*sizeof(float));
++        }
++
++        for (int64_t r = 0; r < R; ++r) {
++            if (skip[r]) {
++                memset(KQ + r*KV, 0, KV*sizeof(float));
++            }
++        }
++        simd_gemm(VKQ32, KQ, V32, (int) R, KV, (int) DV);
++    }
++
++    for (int64_t r = 0; r < R; ++r) {
++        const int64_t t  = r / HB;
++        const int64_t hh = r % HB;
++        if (t >= n_tok || hh >= n_head) {
++            continue;
++        }
++
++        const int64_t h = h0 + hh;
++
++        if (sinks) {
++            const float s = ((const float *) sinks->data)[h];
++
++            float ms = 1.0f;
++            float vs = 1.0f;
++
++            if (s > M[r]) {
++                ms = expf(M[r] - s);
++                ggml_vec_scale_f32(DV, VKQ32 + r*DV, ms);
++            } else {
++                vs = expf(s - M[r]);
++            }
++
++            S[r] = S[r]*ms + vs;
++        }
++
++        const float S_inv = S[r] == 0.0f ? 0.0f : 1.0f/S[r];
++        ggml_vec_scale_f32(DV, VKQ32 + r*DV, S_inv);
++
++        // permute(0, 2, 1, 3)
++        const int64_t i1 = iq1_0 + t;
++        memcpy((char *) dst->data + (iq3*ne2*ne1 + h + i1*ne1)*nb1, VKQ32 + r*DV, nb1);
++    }
++}
++
+ // Reduction function: combines partial results across KV chunks
+ // Partials layout in wdata: [n_q_heads][n_chunks][2 + DV]
+ static void ggml_flash_attn_ext_reduce_partials(
+@@ -9713,14 +10093,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+             nchunk = nth;
+         }
+ 
+-        if (ith == 0) {
+-            ggml_threadpool_chunk_set(params->threadpool, nth);
+-        }
+-
+-        ggml_barrier(params->threadpool);
+-
+-        const int64_t dr = (nr + nchunk - 1) / nchunk;
+-
+         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+         bool use_tiled = !use_ref &&
+                                (q->type == GGML_TYPE_F32 &&
+@@ -9735,6 +10107,44 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+ #endif
+         use_tiled &= (DV % f32_epr == 0);
+ #endif
++
++        // The sparse prefill path works on the tiled path's shapes and keeps its lists after the per thread scratch.
++        const bool use_sparse = use_tiled && ggml_fa_sparse_prefill_supported(params, dst);
++
++        int32_t * sparse_counts  = nullptr;
++        int32_t * sparse_lists   = nullptr;
++        int64_t   sparse_cap     = 0;
++        int64_t   sparse_n_lists = 0;
++
++        if (use_sparse) {
++            const ggml_tensor * mask = dst->src[3];
++
++            sparse_cap     = ggml_fa_sparse_list_cap(nek1, ggml_get_op_params_i32(dst, 4));
++            sparse_n_lists = ggml_fa_sparse_n_lists(neq1, mask->ne[3]);
++            sparse_counts  = (int32_t *) ((float *) params->wdata + nth*ggml_fa_sparse_wdata_per_thread(DK, DV));
++            sparse_lists   = sparse_counts + sparse_n_lists;
++
++            ggml_compute_forward_flash_attn_ext_sparse_compact(params, dst, sparse_counts, sparse_lists, sparse_cap);
++        }
++
++        if (ith == 0) {
++            ggml_threadpool_chunk_set(params->threadpool, nth);
++        }
++
++        ggml_barrier(params->threadpool);
++
++        if (use_sparse && ggml_fa_sparse_lists_fit(sparse_counts, sparse_n_lists)) {
++            const int64_t n_groups = (neq1 + GGML_FA_SPARSE_GROUP_Q - 1)/GGML_FA_SPARSE_GROUP_Q;
++            const int64_t n_units  = neq3*n_groups*nek2*ggml_fa_sparse_n_head_blocks(neq2/nek2);
++
++            for (int64_t unit = ith; unit < n_units; unit = ggml_threadpool_chunk_add(params->threadpool, 1)) {
++                ggml_compute_forward_flash_attn_ext_sparse(params, dst, unit, sparse_counts, sparse_lists, sparse_cap);
++            }
++            return;
++        }
++
++        const int64_t dr = (nr + nchunk - 1) / nchunk;
++
+         int current_chunk = ith;
+ 
+         while (current_chunk < nchunk) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c0f321e55..bfde78890 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -220,6 +220,70 @@ static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
+     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+ }
+ 
++// A sparse mask shaped like Qwen QSA: each row sees whole pools of 4 cells below a causal edge, plus the
++// incomplete tail pool. A row keeps about 3/4 of the pools of the row before it, so adjacent rows overlap.
++// Every row sees at most n_kv_max cells.
++static void init_tensor_kq_mask_sparse_pools(ggml_tensor * tensor, int64_t n_kv_max) {
++    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
++
++    static constexpr int64_t pool = 4;
++
++    const int64_t ne0      = tensor->ne[0];
++    const int64_t ne1      = tensor->ne[1];
++    const int64_t n_slices = tensor->ne[2]*tensor->ne[3];
++    const int64_t n_pools  = (n_kv_max - (pool - 1))/pool;
++    GGML_ASSERT(n_pools > 0 && (ne0 - ne1 + 1)/pool >= 2*n_pools);
++
++    std::vector<float>       data_f32(ggml_nelements(tensor), -INFINITY);
++    std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
++
++    std::mt19937 gen(0x9001);
++    for (int64_t slice = 0; slice < n_slices; ++slice) {
++        std::vector<int64_t> chosen;
++        std::vector<bool>    used((ne0 + pool - 1)/pool, false);
++        for (int64_t i1 = 0; i1 < ne1; ++i1) {
++            const int64_t n_vis       = ne0 - ne1 + i1 + 1;
++            const int64_t n_pools_vis = n_vis/pool;
++            std::uniform_int_distribution<int64_t> pick(0, n_pools_vis - 1);
++
++            auto pick_unused = [&]() {
++                int64_t p;
++                do {
++                    p = pick(gen);
++                } while (used[p]);
++                used[p] = true;
++                return p;
++            };
++
++            if (chosen.empty()) {
++                for (int64_t i = 0; i < n_pools; ++i) {
++                    chosen.push_back(pick_unused());
++                }
++            } else {
++                for (int64_t & p : chosen) {
++                    if (gen() % 4 == 0) {
++                        used[p] = false;
++                        p = pick_unused();
++                    }
++                }
++            }
++
++            float * row = data_f32.data() + (slice*ne1 + i1)*ne0;
++            for (int64_t p : chosen) {
++                for (int64_t c = p*pool; c < (p + 1)*pool; ++c) {
++                    row[c] = -0.03125f * (1 + (c + i1) % 7);
++                }
++            }
++            for (int64_t c = n_pools_vis*pool; c < n_vis; ++c) {
++                row[c] = 0.0f;
++            }
++        }
++    }
++
++    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
++    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
++}
++
+ // generate a lower triangular matrix
+ static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+     GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+@@ -8231,6 +8295,20 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
+     }
+ };
+ 
++// sparse mask hint with a pool structured mask (see init_tensor_kq_mask_sparse_pools)
++struct test_flash_attn_ext_sparse_pools : public test_flash_attn_ext {
++    using test_flash_attn_ext::test_flash_attn_ext;
++
++    std::string vars() override {
++        return test_flash_attn_ext::vars() + ",mask_pools=4";
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        test_flash_attn_ext::initialize_tensors(ctx);
++        init_tensor_kq_mask_sparse_pools(ggml_get_tensor(ctx, "m"), n_kv_max);
++    }
++};
++
+ // GGML_OP_CROSS_ENTROPY_LOSS
+ struct test_cross_entropy_loss : public test_case {
+     const ggml_type type;
+@@ -11412,6 +11490,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+ 
++    // sparse prefill path (at least 64 rows, kv >= 4096, head size <= 256): a partial token group, sinks,
++    // two mask sequences, F32 K/V, head blocks of 1, 8 and 7+6 query heads, large logits and a pool shaped mask.
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 100, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 100, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 4096,  72, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {12, 1}, 4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_F32, {0, 1, 2, 3}, true, false, 512));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, { 1, 1}, 4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  256));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 1, {13, 1}, 4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 2, {12, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 512));
++    test_cases.emplace_back(new test_flash_attn_ext_sparse_pools(256, 256, 2, {12, 1}, 8192, 100, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
++    // the sparse prefill gate: ALiBi and softcap keep the tiled path
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  64, true, false, 8.0f, 0,     GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  64, true, false, 0,    10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
++
+     // sparse mask + quantized cache
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
+@@ -11941,6 +12034,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // Qwen QSA prefill across KV depths: the sparse prefill path, with the dense tiled path (n_kv_max 0) to compare.
++    // A random mask gives the worst case union per token group, a pool shaped mask a QSA like one.
++    for (int64_t kv : {4096, 32768, 131072}) {
++        for (int nb : {64, 100, 512}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
++        }
++        if (kv >= 32768) {
++            test_cases.emplace_back(new test_flash_attn_ext_sparse_pools(256, 256, 2, {12, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0));
++        }
++    }
++
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));

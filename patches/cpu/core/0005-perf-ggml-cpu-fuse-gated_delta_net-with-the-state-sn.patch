@@ -1,0 +1,351 @@
+From 600b615f8e97a9d42bf5242055d74ed97206711a Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 13:43:57 +0200
+Subject: [PATCH] perf(ggml-cpu): fuse gated_delta_net with the state snapshot
+ cpy
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The CPU backend was the only one that wrote every recurrent state
+snapshot into the gated_delta_net result tail and then copied it into
+the recurrent cache with a separate cpy. With MTP (K = 4) that cpy moves
+n_written x 3 MiB per linear layer of a qwen4exp model on one or two
+threads, because dup_bytes splits the strided copy by n_seqs.
+
+Match gated_delta_net followed, after views only, by the cpy of its
+snapshot tail into the [D, n_seqs, n_written] cache view, and let the
+kernel write each snapshot straight into its cache slot. The cpy is
+skipped. The matcher is a C port of ggml_cuda_try_gdn_cache_fusion
+(ggml-cuda.cu), with two more checks: the cpy must carry
+GGML_TENSOR_FLAG_COMPUTE, because the CPU graph loop skips a node
+without it, and the input state must not overlap the cache view.
+
+The kernel takes the snapshot destination and slot stride as arguments,
+so the unfused path keeps its output layout. Fusion stays off under
+use_ref and GGML_CPU_DISABLE_FUSION. The output is bit-exact.
+
+test_gated_delta_net_cache_fusion gets a mem_size argument for a slot
+stride wider than the cpy, as with --parallel 2, and cases for K = 1,
+n_tokens < K, n_seqs = 2 and the qwen4exp shape.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 88 ++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cpu/ops.cpp    | 44 ++++++++++++------
+ ggml/src/ggml-cpu/ops.h      |  2 +
+ tests/test-backend-ops.cpp   | 34 ++++++++++----
+ 4 files changed, 147 insertions(+), 21 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index ef6c42640..aa414d773 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3399,6 +3399,83 @@ struct ggml_cplan ggml_graph_plan(
+     return cplan;
+ }
+ 
++static bool ggml_cpu_ranges_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
++    const char * a0 = (const char *) a->data;
++    const char * b0 = (const char *) b->data;
++    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
++}
++
++// match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
++// (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
++// A port of ggml_cuda_try_gdn_cache_fusion. Returns the node distance to the cpy, or 0.
++static int ggml_cpu_try_gdn_cache_fusion(
++        const struct ggml_cgraph * cgraph,
++        const int node_n,
++        float ** cache,
++        int64_t * slot_stride) {
++    const struct ggml_tensor * gdn = cgraph->nodes[node_n];
++    // the kernel skips the snapshot tail, so the gdn output must not be a graph output
++    if (gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return 0;
++    }
++
++    const struct ggml_tensor * src_v = gdn->src[2];
++    const int64_t S_v       = src_v->ne[0];
++    const int64_t H         = src_v->ne[1];
++    const int64_t n_tokens  = src_v->ne[2];
++    const int64_t n_seqs    = src_v->ne[3];
++    const int64_t D         = S_v * S_v * H;
++    const int64_t K         = ggml_get_op_params_i32(gdn, 0); // snapshot slot count
++    const int64_t n_written = MIN(n_tokens, K);               // newest n_written slots are written
++
++    // snapshot tail starts right after the attention scores
++    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
++
++    // snapshot cpy is the first real node after the gdn (skip views/no-ops). The graph loop skips a
++    // node without GGML_TENSOR_FLAG_COMPUTE, so a cpy without it must not be fused into the cache.
++    const struct ggml_tensor * cpy = NULL;
++    int skip = 0;
++    for (int j = node_n + 1; j < cgraph->n_nodes && cpy == NULL; ++j) {
++        const struct ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_op_is_empty(n->op)) {
++            continue;
++        }
++        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT) || !(n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
++            return 0;
++        }
++        cpy  = n;
++        skip = j - node_n;
++    }
++    if (cpy == NULL) {
++        return 0;
++    }
++
++    const struct ggml_tensor * src = cpy->src[0]; // view of the gdn snapshot tail
++    const struct ggml_tensor * dst = cpy->src[1]; // cache view the kernel writes to
++
++    // src must be this gdn's snapshot tail (contiguous, at the tail offset)
++    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
++        !ggml_is_contiguous(src)) {
++        return 0;
++    }
++
++    // dst is the [D, n_seqs, n_written] cache view; require nb[1] == D (the per-seq stride the kernel
++    // assumes). ggml_cpy pins src to the same element count.
++    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == NULL ||
++        dst->ne[0] != D || dst->ne[1] != n_seqs || dst->ne[2] != n_written || dst->ne[3] != 1 ||
++        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != ggml_row_size(GGML_TYPE_F32, D)) {
++        return 0;
++    }
++
++    // the kernel writes the cache while other threads still read their input state, so they must not share memory
++    if (ggml_cpu_ranges_overlap(gdn->src[5], dst)) {
++        return 0;
++    }
++
++    *cache       = (float *) dst->data; // rollback group 0 (newest)
++    *slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
++    return skip;
++}
+ 
+ // Try to fuse the current node with subsequent nodes for better performance.
+ // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
+@@ -3435,6 +3512,17 @@ static int ggml_cpu_try_fuse_ops(
+         }
+     }
+ 
++    if (node->op == GGML_OP_GATED_DELTA_NET) {
++        // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
++        float * cache = NULL;
++        int64_t slot_stride = 0;
++        const int skip = ggml_cpu_try_gdn_cache_fusion(cgraph, node_n, &cache, &slot_stride);
++        if (skip > 0) {
++            ggml_compute_forward_gated_delta_net_fused_cache(params, node, cache, slot_stride);
++            return skip;
++        }
++    }
++
+     return 0;
+ }
+ 
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 96aca2e89..3000314c6 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11169,9 +11169,14 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
+ }
+ 
+ // ggml_compute_forward_gated_delta_net
++
++// state_out holds snapshot slot 0 with layout [S_v, S_v, H, n_seqs]; slot s starts at
++// state_out + s*slot_stride. It is the dst tail, or a recurrent cache view when the cpy is fused.
+ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     const ggml_compute_params * params,
+     ggml_tensor * dst,
++    float * state_out,
++    int64_t slot_stride,
+     int64_t ir0,
+     int64_t ir1) {
+ 
+@@ -11185,7 +11190,6 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     const int64_t S_v      = src_v->ne[0];
+     const int64_t H        = src_v->ne[1];
+     const int64_t n_tokens = src_v->ne[2];
+-    const int64_t n_seqs   = src_v->ne[3];
+ 
+     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
+     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
+@@ -11221,13 +11225,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
+     float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+ 
+-    // output layout: [attn_scores | new_states]
+-    // attn_scores: S_v * H * n_tokens * n_seqs    floats
+-    // new_states:  S_v * S_v * H * n_seqs * K     floats  (K snapshot slots; last min(n_tokens, K))
+-    const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
+-    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
+-    float * attn_out_base  = (float *)dst->data;
+-    float * state_out_base = (float *)dst->data + attn_score_elems;
++    float * attn_out_base = (float *)dst->data;
+ 
+     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+@@ -11255,7 +11253,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+         // For K>1, work in scratch and copy out per-token when the slot is in range.
+         float * s_out = (K > 1)
+             ? state_work
+-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
++            : state_out + (iv3 * H + iv1) * S_v * S_v;
+ 
+         // copy input state into the working buffer and operate in-place
+         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
+@@ -11313,7 +11311,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+             if (K > 1) {
+                 const int64_t target_slot = n_tokens - 1 - t;
+                 if (target_slot >= 0 && target_slot < K) {
+-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
++                    float * curr_state_o = state_out + target_slot * slot_stride +
+                                      (iv3 * H + iv1) * S_v * S_v;
+                     memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
+                 }
+@@ -11325,7 +11323,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+ 
+ static void ggml_compute_forward_gated_delta_net_f32(
+         const ggml_compute_params * params,
+-        ggml_tensor * dst) {
++        ggml_tensor * dst,
++        float * state_out,
++        int64_t slot_stride) {
+ 
+     ggml_tensor * V = dst->src[2];
+     int64_t nr = V->ne[1] * V->ne[3];
+@@ -11359,7 +11359,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+         const int64_t ir0 = dr * current_chunk;
+         const int64_t ir1 = MIN(ir0 + dr, nr);
+ 
+-        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
++        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, state_out, slot_stride, ir0, ir1);
+         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+     }
+ }
+@@ -11372,7 +11372,15 @@ void ggml_compute_forward_gated_delta_net(
+     switch (src0->type) {
+         case GGML_TYPE_F32:
+             {
+-                ggml_compute_forward_gated_delta_net_f32(params, dst);
++                // output layout: [attn_scores | new_states]
++                // attn_scores: S_v * H * n_tokens * n_seqs    floats
++                // new_states:  S_v * S_v * H * n_seqs * K     floats  (K snapshot slots; last min(n_tokens, K))
++                const ggml_tensor * src_v = dst->src[2];
++                const int64_t attn_score_elems    = ggml_nelements(src_v);
++                const int64_t state_size_per_snap = src_v->ne[0] * src_v->ne[0] * src_v->ne[1] * src_v->ne[3];
++                float * state_out = (float *)dst->data + attn_score_elems;
++
++                ggml_compute_forward_gated_delta_net_f32(params, dst, state_out, state_size_per_snap);
+             } break;
+         default:
+             {
+@@ -11381,6 +11389,16 @@ void ggml_compute_forward_gated_delta_net(
+     }
+ }
+ 
++void ggml_compute_forward_gated_delta_net_fused_cache(
++        const ggml_compute_params * params,
++        ggml_tensor * dst,
++        float * cache,
++        int64_t slot_stride) {
++    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
++
++    ggml_compute_forward_gated_delta_net_f32(params, dst, cache, slot_stride);
++}
++
+ 
+ // ggml_compute_forward_dsv4_hc_comb
+ 
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 2728b08b6..18110507f 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -104,6 +104,8 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
+ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++// writes the state snapshots to cache (slot 0, [S_v, S_v, H, n_seqs]) and slot s to cache + s*slot_stride, not to the dst tail
++void ggml_compute_forward_gated_delta_net_fused_cache(const struct ggml_compute_params * params, struct ggml_tensor * dst, float * cache, int64_t slot_stride);
+ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 29be1146b..fc0abfccc 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4782,18 +4782,20 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+     const int64_t head_size;
+     const int64_t n_seq_tokens;
+     const int64_t n_seqs;
+-    const int64_t K; // snapshot slot count (>1)
++    const int64_t K;        // snapshot slot count
++    const int64_t mem_size; // cache rows per snapshot slot (>= n_seqs); more than n_seqs makes the slot stride wider than the cpy
+ 
+     ggml_tensor * cpy_node = nullptr;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
++        return VARS_TO_STR7(type, head_count, head_size, n_seq_tokens, n_seqs, K, mem_size);
+     }
+ 
+     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
+             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
+-            int64_t K = 2)
+-        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
++            int64_t K = 2, int64_t mem_size = 0)
++        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
++          mem_size(mem_size > 0 ? mem_size : n_seqs) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t S_v = head_size;
+@@ -4837,13 +4839,14 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+                 ggml_row_size(gdn_out->type, D * n_seqs),
+                 ggml_row_size(gdn_out->type, attn_score_elems));
+ 
+-        // recurrent cache view [D, n_seqs, n_written]
+-        ggml_tensor * cache = ggml_new_tensor_3d(ctx, type, D, n_seqs, n_written);
++        // recurrent cache view [D, n_seqs, n_written], at the last n_seqs of the mem_size rows of each slot
++        ggml_tensor * cache = ggml_new_tensor_3d(ctx, type, D, mem_size, n_written);
+         ggml_set_name(cache, "cache");
+         ggml_tensor * dst = ggml_view_3d(ctx, cache,
+                 D, n_seqs, n_written,
+                 ggml_row_size(cache->type, D),
+-                ggml_row_size(cache->type, D * n_seqs), 0);
++                ggml_row_size(cache->type, D * mem_size),
++                ggml_row_size(cache->type, D * (mem_size - n_seqs)));
+ 
+         ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+         ggml_set_name(cpy, "gdn_cache_cpy");
+@@ -11575,12 +11578,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+ 
+-    // gdn + cache cpy fusion (K > 1)
++    // gdn + cache cpy fusion
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
+     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
++    // K = 1, the cpy of the final state only
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   1, 1, 1));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   7, 2, 1));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   7, 2, 1, 3));
++    // n_tokens < K: only the newest n_tokens slots are written
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   1, 1, 4));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   1, 2, 4));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   3, 2, 4));
++    // n_seqs = 2 with a slot stride wider than the cpy, as with --parallel 2
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 2, 4, 3));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   7, 2, 4, 3));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 4, 2));
++    // qwen4exp shape: 48 heads of 128, MTP verify of 4 tokens with K = 4
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128, 4, 1, 4));
++    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128, 4, 2, 4, 2));
+ 
+ #if 0
+     // these tests are disabled to save execution time, sbut they can be handy for debugging

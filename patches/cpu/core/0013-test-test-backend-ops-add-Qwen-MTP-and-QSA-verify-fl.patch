@@ -1,0 +1,65 @@
+From df8b6d78b7b42655bb9446ab881a16c8d66a0c2e Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 15:47:52 +0200
+Subject: [PATCH] test(test-backend-ops): add Qwen MTP and QSA verify flash
+ attention cases
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The FA eval loop only uses gqa 12 for head size 128, so the 256/256
+gqa 12 F16 shape of the Qwen MTP layer had no dense case. Add dense eval
+cases at kv 1024 for one row (split-KV path) and four rows (row-chunk
+path), with and without sinks. Add a four-row QSA verify case with the
+n_kv_max 2048 budget.
+
+Add perf cases for the same dense shape at kv 8192, 32768 and 131072,
+for one and four rows, to measure the batch-1 decode kernel at depth.
+
+These cases cover the decode kernel change from upstream llama.cpp
+PR #27478. With -b CPU, the reference path runs the same one_chunk
+function, so these cases cannot catch a bug in the blocked loop. The
+checks for that are a dump comparison against the base build and a KLD
+run.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ tests/test-backend-ops.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ab62b2c6a..c0f321e55 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11418,6 +11418,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ 
+     // Qwen QSA: 256/256, gqa 12, budget 2048.
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
++    // Qwen QSA verify: a few query rows take the row-chunk decode path, not the tiled one.
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
++    // Qwen MTP layer: dense 256/256 gqa 12 decode (split KV) and verify (row chunks).
++    for (bool sinks : { false, true }) {
++        for (int nb : { 1, 4 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 1024, nb, true, sinks, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++    }
+     // quantized cache, deep enough to take the sparse path
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+@@ -11926,6 +11934,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
+     }
+ 
++    // Dense 256/256 gqa12 F16 decode and verify across KV depths (Qwen MTP layer).
++    for (int64_t kv : {8192, 32768, 131072}) {
++        for (int nb : {1, 4}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++    }
++
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));

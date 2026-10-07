@@ -1,0 +1,142 @@
+From 52642393462ef32524fc6478350f97e2c6abb2c5 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 16:36:33 +0200
+Subject: [PATCH] perf(ggml-cpu): walk dsv4_hc_post one stream row at a time
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The CPU kernel of DSV4_HC_POST splits a flat dst index into (i0, idst,
+it) for every element. The build at -O3 runs 3 to 4 64-bit idiv per
+element in the hot loop and no vector code. The Zen 2 divider is not
+pipelined, so the op takes about 5.5 ms per call in a 512-token qwen4exp
+ubatch (96 calls, 4.7% of pp512), where its 47 MB of traffic needs about
+0.5 ms. qwen4exp builds this fused op since #28901, and the fusion
+carries the tg gain, so only the kernel changes.
+
+Each thread keeps its flat element range [ir0, ir1), so every thread
+still works at n_tokens = 1. The new path walks that range one stream
+row segment at a time, with one divide per segment, and the inner loops
+run with unit stride over n_embd. It runs when x, residual and dst have
+contiguous rows and use_ref is off. The scalar loop stays as the
+fallback and as the reference for test-backend-ops.
+
+The result is bit-exact with the scalar loop under GCC -O3
+-march=native (znver2) and its default -ffp-contract=fast:
+
+- Identity (comb == NULL, qwen4exp): one pass writes x*post and
+  ggml_vec_acc_f32 adds the residual. A single loop would contract into
+  an FMA. The base object shows vmulss then vaddss for the scalar loop.
+- Comb (DeepSeek V4): the same per-element chain over the streams in
+  the same order. The base object shows the scalar chain as vmulss and
+  vaddss, because GCC avoids FMA chains on znver2. The new chain has
+  the same shape and gets the same choice.
+
+The row-segment pattern follows the dsv4_hc_pre change. Add test cases
+whose thread ranges start mid-row (n_embd 1000, n_tokens 3), an uneven
+token count (33), and the decode and prefill shapes of qwen4exp.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/ops.cpp  | 59 ++++++++++++++++++++++++++++++++++++++
+ tests/test-backend-ops.cpp |  7 +++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 333fd3509..e970b4f6a 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11590,6 +11590,58 @@ void ggml_compute_forward_dsv4_hc_pre(
+ 
+ // ggml_compute_forward_dsv4_hc_post
+ 
++// Element range [ir0, ir1) of dst, flattened over (n_embd, hc, n_tokens), one stream row segment at a time.
++// Each element keeps the operation order of the scalar path, so the result is the same bit for bit.
++static void ggml_compute_forward_dsv4_hc_post_rows(
++        const ggml_tensor * x,
++        const ggml_tensor * residual,
++        const ggml_tensor * post,
++        const ggml_tensor * comb,
++        ggml_tensor * dst,
++        const int64_t ir0,
++        const int64_t ir1) {
++    const int64_t n_embd = x->ne[0];
++    const int64_t hc     = residual->ne[1];
++
++    for (int64_t ir = ir0; ir < ir1; ) {
++        const int64_t row  = ir / n_embd;
++        const int64_t i0   = ir - row*n_embd;
++        const int64_t idst = row % hc;
++        const int64_t it   = row / hc;
++        const int     n    = (int) MIN(n_embd - i0, ir1 - ir);
++
++        const float * xr = (const float *) ((const char *) x->data + it*x->nb[1]) + i0;
++        float       * d  = (float *) ((char *) dst->data + idst*dst->nb[1] + it*dst->nb[2]) + i0;
++        const float   pv = *(const float *) ((const char *) post->data + idst*post->nb[0] + it*post->nb[1]);
++
++        if (comb) {
++            // One sum over the streams per element, in the scalar order. The same chain shape gets the
++            // same FMA choice from the compiler: GCC tuned for znver2 keeps the chain as mul and add.
++            const char * residual_tok = (const char *) residual->data + it*residual->nb[2];
++            const char * comb_row     = (const char *) comb->data + idst*comb->nb[0] + it*comb->nb[2];
++            for (int i = 0; i < n; ++i) {
++                float sum = xr[i] * pv;
++                for (int64_t isrc = 0; isrc < hc; ++isrc) {
++                    const float rv = ((const float *) (residual_tok + isrc*residual->nb[1]))[i0 + i];
++                    const float cv = *(const float *) (comb_row + isrc*comb->nb[1]);
++                    sum += rv * cv;
++                }
++                d[i] = sum;
++            }
++        } else {
++            // Two passes, not d[i] = xr[i]*pv + rr[i]: GCC would contract that into an FMA,
++            // and the scalar path rounds the product before the add.
++            const float * rr = (const float *) ((const char *) residual->data + idst*residual->nb[1] + it*residual->nb[2]) + i0;
++            for (int i = 0; i < n; ++i) {
++                d[i] = xr[i] * pv;
++            }
++            ggml_vec_acc_f32(n, d, rr);
++        }
++
++        ir += n;
++    }
++}
++
+ static void ggml_compute_forward_dsv4_hc_post_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -11642,6 +11694,13 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
+     const int64_t ir0 = dr * ith;
+     const int64_t ir1 = MIN(ir0 + dr, nr);
+ 
++    // use_ref keeps the scalar loop, so a CPU-only test compares the row walk against it
++    const bool rows_contiguous = nbx0 == sizeof(float) && nbr0 == sizeof(float) && nbd0 == sizeof(float);
++    if (rows_contiguous && !params->use_ref) {
++        ggml_compute_forward_dsv4_hc_post_rows(x, residual, post, comb, dst, ir0, ir1);
++        return;
++    }
++
+     for (int64_t ir = ir0; ir < ir1; ++ir) {
+         const int64_t i0     = ir % n_embd;
+         const int64_t idst   = (ir / n_embd) % hc;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f4ba81868..dc1a67f80 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9423,6 +9423,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
+     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
+     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
++    // thread ranges that start and end mid-row, and the decode shape
++    test_cases.emplace_back(new test_dsv4_hc_post(1000, 3));
++    test_cases.emplace_back(new test_dsv4_hc_post(1000, 3, true));
++    test_cases.emplace_back(new test_dsv4_hc_post(2560, 33));
++    test_cases.emplace_back(new test_dsv4_hc_post(2560, 33, true));
++    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
++    test_cases.emplace_back(new test_dsv4_hc_post(2560, 64, true, true));
+ 
+     // glu ops
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

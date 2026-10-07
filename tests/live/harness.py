@@ -28,7 +28,9 @@ import urllib.request
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent.parent
-SERVER = PROJECT / "llama.cpp-mtp" / "build" / "bin" / "llama-server"
+# SERVER_MTP names the build under test, the same variable the launch scripts read.
+SERVER = Path(os.environ.get("SERVER_MTP")
+              or PROJECT / "llama.cpp-mtp" / "build" / "bin" / "llama-server")
 
 # Where the small models live. Nothing else on the machine uses this directory.
 MODEL_DIR = Path(os.environ.get("LIVE_MODEL_DIR")

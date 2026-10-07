@@ -27,10 +27,10 @@ The state file roughly doubles: a checkpoint is 112 to 200 MiB and a long
 conversation has several.
 
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index fe068d3e9..453834707 100644
+index 809be94cd..4daa8d49f 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -830,6 +830,100 @@
+@@ -869,6 +869,100 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
  // server_context_impl (private implementation)
  //
  
@@ -131,7 +131,7 @@ index fe068d3e9..453834707 100644
  struct server_context_impl {
      friend struct server_context;
  
-@@ -2579,6 +2673,11 @@
+@@ -2718,6 +2812,11 @@ private:
                          break;
                      }
  
@@ -143,7 +143,7 @@ index fe068d3e9..453834707 100644
                      const int64_t t_end = ggml_time_us();
                      const double t_save_ms = (t_end - t_start) / 1000.0;
  
-@@ -2588,7 +2687,9 @@
+@@ -2727,7 +2826,9 @@ private:
                      res->filename = filename;
                      res->is_save  = true;
                      res->n_tokens = slot->prompt.tokens.size();
@@ -154,7 +154,7 @@ index fe068d3e9..453834707 100644
                      res->t_ms     = t_save_ms;
                      queue_results.send(std::move(res));
                  } break;
-@@ -2613,6 +2714,7 @@
+@@ -2752,6 +2853,7 @@ private:
                      std::string filepath = task.slot_action.filepath;
  
                      size_t nread = 0;
@@ -162,7 +162,7 @@ index fe068d3e9..453834707 100644
                      try {
                          size_t n_packed = 0;
                          llama_tokens packed;
-@@ -2638,6 +2740,7 @@
+@@ -2777,6 +2879,7 @@ private:
  
                          slot->prompt.clear();
                          slot->prompt.tokens = std::move(restored);
@@ -170,7 +170,7 @@ index fe068d3e9..453834707 100644
                      } catch (const std::exception & err) {
                          slot->prompt_clear();
                          send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
-@@ -2653,7 +2756,10 @@
+@@ -2792,7 +2895,10 @@ private:
                      res->filename = filename;
                      res->is_save  = false;
                      res->n_tokens = slot->prompt.tokens.size();

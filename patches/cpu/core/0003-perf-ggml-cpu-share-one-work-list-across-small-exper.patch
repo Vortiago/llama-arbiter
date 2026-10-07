@@ -1,0 +1,251 @@
+From f1d365ea3e1765a0d951cfef9d69f113d1f8f3d7 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 13:43:50 +0200
+Subject: [PATCH] perf(ggml-cpu): share one work list across small experts in
+ mul_mat_id
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+At decode and MTP verify an expert gets 1 to 4 routed rows. The per
+expert plan then has fewer than 4 chunks per thread, so it slices the
+rows of every expert once per thread: with 10 experts and 16 threads,
+each thread reads 10 short slices (40 of 640 rows), one in each expert.
+
+These small experts now share one work list of (expert, row chunk)
+pairs, taken from the threadpool chunk counter in expert order. Each
+small expert splits into the fewest chunks that make the total a
+multiple of nth, so the threads get equal shares: for 10 experts and
+16 threads that is 8 chunks of 80 rows, and a thread reads 5 experts
+in runs twice as long. The counter also lets a thread that runs late
+hand its share to the others. When the number of small experts and
+nth have no common factor, the split is the old one per thread, and
+only the work stealing is new.
+
+Experts with enough rows keep their own chunk counter, tiled keeps its
+per expert dispatch, and NUMA keeps the per thread slices. Tiled can
+take an expert that the count includes: the list is then shorter and
+may not divide evenly, which costs balance, not correctness. The per
+expert plan moves into ggml_mmid_plan_expert, so the flat path and the
+per expert path agree on which experts are small.
+
+Each output is still one vec_dot over a full row, so the result is
+bit-exact. The speed gain is not benchmarked yet.
+
+The test cases add the up/gate (640 rows) and down (2560 rows) shapes
+of Qwen3.8-Flash-Next at batch 1, 2, 4 and 8. In a CPU-only build the
+test mode skips them, because the CPU backend is the reference. The
+bit-exact check against the unpatched CPU backend used an out-of-tree
+dump harness, at 1, 2, 3, 7, 12, 16, 32 and 64 threads.
+
+On top of the llamafile_sgemm path for Q8_0 experts, the experts that
+path computes stay out of the flat list and out of its count, so the
+list divides over the threads as it would without them. The sgemm path
+uses its own item counter in the work buffer, not the threadpool chunk
+counter, and its one barrier is reached by every thread or by none.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 131 ++++++++++++++++++++++++++++++-----
+ tests/test-backend-ops.cpp   |   7 ++
+ 2 files changed, 119 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 80014dc61..c4d6c5837 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1772,6 +1772,53 @@ static bool ggml_compute_forward_mul_mat_id_sgemm(
+ 
+ #endif
+ 
++// The chunks of one expert in mul_mat_id: nchunk0 over its src0 rows, nchunk1 over its src1 rows
++struct ggml_mmid_expert_plan {
++    int64_t nchunk0;
++    int64_t nchunk1;
++    bool    sliced; // one slice per thread along the longer side
++};
++
++static struct ggml_mmid_expert_plan ggml_mmid_slice_expert(int64_t nr0, int64_t nr1, int nth) {
++    return nr0 > nr1 ? (struct ggml_mmid_expert_plan) { nth, 1, true }
++                     : (struct ggml_mmid_expert_plan) { 1, nth, true };
++}
++
++// Chunks of 16 rows a side (64 when one side is a single row), or one slice per thread when
++// that gives fewer than 4 chunks per thread.
++static struct ggml_mmid_expert_plan ggml_mmid_plan_expert(int64_t nr0, int64_t nr1, int nth) {
++    const int chunk_size = (nr0 == 1 || nr1 == 1) ? 64 : 16;
++
++    const int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
++    const int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
++
++    if (nchunk0 * nchunk1 < nth * 4) {
++        return ggml_mmid_slice_expert(nr0, nr1, nth);
++    }
++    return (struct ggml_mmid_expert_plan) { nchunk0, nchunk1, false };
++}
++
++// An expert the plan would slice along its src0 rows, once per thread. These experts share
++// one flat work list instead.
++static bool ggml_mmid_expert_is_small(int64_t nr0, int64_t nr1, int nth) {
++    return ggml_mmid_plan_expert(nr0, nr1, nth).sliced && nr0 > nr1;
++}
++
++// Chunks per small expert in the flat work list: the fewest that make the total a multiple
++// of nth, so each thread gets an equal share of whole chunks. For 10 experts and 16 threads
++// this is 8 chunks per expert, so a thread reads 5 experts in long runs instead of 10 in short.
++// An expert with fewer rows than chunks gets some empty chunks, which keeps the count.
++static int64_t ggml_mmid_flat_chunks_per_expert(int64_t n_small, int nth) {
++    int64_t a = n_small;
++    int64_t b = nth;
++    while (b != 0) {
++        const int64_t r = a % b;
++        a = b;
++        b = r;
++    }
++    return nth / a;
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1891,13 +1938,52 @@ static void ggml_compute_forward_mul_mat_id(
+         *current_chunk_ctr = nth;
+     }
+ 
++    // NUMA keeps the per thread slices, as mul_mat does (see ggml_compute_forward_mul_mat)
++    const bool disable_chunking = ggml_is_numa();
++    const bool use_flat = !disable_chunking;
++
++    // the flat work list counter; every thread starts at its own chunk ith
++    if (use_flat && ith == 0) {
++        ggml_threadpool_chunk_set(params->threadpool, nth);
++    }
++
+     ggml_barrier(params->threadpool);
+ 
++    // An expert with at least this many routed rows went through the sgemm path, so the
++    // vec_dot work below skips it. INT64_MAX when the sgemm path did not run. Every thread
++    // reads the same counts, so all agree on it.
++    int64_t sgemm_min_rows = INT64_MAX;
+ #if GGML_MMID_SGEMM
+-    const bool sgemm_handled = !params->use_ref && ggml_mmid_sgemm_supported(src0, src1) &&
+-        ggml_compute_forward_mul_mat_id_sgemm(params, dst, matrix_row_counts, matrix_rows, sgemm_wdata);
++    if (!params->use_ref && ggml_mmid_sgemm_supported(src0, src1) &&
++        ggml_compute_forward_mul_mat_id_sgemm(params, dst, matrix_row_counts, matrix_rows, sgemm_wdata)) {
++        sgemm_min_rows = MMID_SGEMM_MIN_ROWS;
++    }
+ #endif
+ 
++    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++
++    const int64_t nr0 = ne01;
++
++    // The small experts (decode and MTP verify) share one work list of (expert, row chunk)
++    // pairs, taken in expert order. The count leaves out the experts the sgemm path took.
++    // Tiled may still take a counted expert: the list is then shorter and may not divide
++    // evenly over the threads, which costs balance, not correctness.
++    int64_t n_small = 0;
++    if (use_flat) {
++        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
++            const int64_t cne1 = matrix_row_counts[cur_a];
++            n_small += cne1 > 0 && cne1 < sgemm_min_rows && ggml_mmid_expert_is_small(nr0, cne1, nth);
++        }
++    }
++
++    const int64_t flat_nchunk = n_small > 0 ? ggml_mmid_flat_chunks_per_expert(n_small, nth) : 1;
++
++    // this thread's next chunk of the flat list, and the first chunk of expert cur_a in it;
++    // the chunks a thread takes only grow, so one walk over the experts reaches all of them
++    int64_t flat_chunk = ith;
++    int64_t flat_base  = 0;
++
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 
+@@ -1905,11 +1991,9 @@ static void ggml_compute_forward_mul_mat_id(
+             continue;
+         }
+ 
+-#if GGML_MMID_SGEMM
+-        if (sgemm_handled && cne1 >= MMID_SGEMM_MIN_ROWS) {
++        if (cne1 >= sgemm_min_rows) {
+             continue;
+         }
+-#endif
+ 
+         // tiled takes over if profitable for this expert (see tiled.h)
+         if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+@@ -1917,28 +2001,37 @@ static void ggml_compute_forward_mul_mat_id(
+         }
+ 
+         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+-        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+-        const int64_t nr0 = ne01;
+         const int64_t nr1 = cne1;
+ 
+-        int chunk_size = 16;
+-        if (nr0 == 1 || nr1 == 1) {
+-            chunk_size = 64;
+-        }
++        if (use_flat && ggml_mmid_expert_is_small(nr0, nr1, nth)) {
++            const int64_t flat_end = flat_base + flat_nchunk;
+ 
+-        // disable for NUMA
+-        const bool disable_chunking = ggml_is_numa();
++            while (flat_chunk < flat_end) {
++                const int64_t ichunk    = flat_chunk - flat_base;
++                const int64_t ir0_start = nr0 *  ichunk      / flat_nchunk;
++                const int64_t ir0_end   = nr0 * (ichunk + 1) / flat_nchunk;
+ 
+-        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+-        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
++                ggml_compute_forward_mul_mat_id_one_chunk(
++                    dst, src0, src1, ids, cur_a,
++                    ir0_start, ir0_end, 0, nr1,
++                    src0_cur, matrix_rows, row_size, src1_cont, wdata
++                );
+ 
+-        if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
+-            nchunk0 = nr0 > nr1 ? nth : 1;
+-            nchunk1 = nr0 > nr1 ? 1 : nth;
++                flat_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
++            }
++
++            flat_base = flat_end;
++            continue;
+         }
+ 
++        const struct ggml_mmid_expert_plan plan = disable_chunking
++            ? ggml_mmid_slice_expert(nr0, nr1, nth)
++            : ggml_mmid_plan_expert(nr0, nr1, nth);
++
++        const int64_t nchunk0 = plan.nchunk0;
++        const int64_t nchunk1 = plan.nchunk1;
++
+         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c27b907d3..22f02a2ad 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10662,6 +10662,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 16, 8, false, 198, 300, 512));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 64, 4, true,  101,  64, 256, 1.0f, 128));
+ 
++    // decode and MTP verify batches, where the experts share the flat work list:
++    // the up/gate rows (640) and down rows (2560) of Qwen3.8-Flash-Next
++    for (int n : {1, 2, 4, 8}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 10, false,  640, n, 256));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 10, false, 2560, n, 128));
++    }
++
+     // multiple blocks per row: exercises the block-stride loop and the
+     // per-expert base offset, which k == 256 alone leaves untested
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));

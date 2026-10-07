@@ -1,0 +1,248 @@
+From 4deddb43227087105f26473fd3e577c43e87d83a Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 5 Oct 2026 13:40:57 +0200
+Subject: [PATCH] perf(ggml-cpu): split wide rows across threads in get_rows
+ and dup_bytes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A recurrent model loads the state of each layer with a get_rows of one
+row per sequence. For Qwen3-Next style models that row is 3 MiB. In a
+model graph every node gets all threads, but get_rows_f32 split the
+work by rows, so only min(nr, nth) threads, one or two, copied the
+state. The state snapshot cpy into a strided cache view took the
+copy-by-rows branch of dup_bytes, which split the work by ne01 =
+n_seqs, so again one or two threads copied every snapshot.
+
+- get_rows_f32: with fewer F32 or I32 rows than threads and rows of at
+  least 4096 elements, each thread copies one cache-line-sized range
+  of every row. This also covers the narrower conv state rows.
+- dup_bytes: the copy-by-rows branch moves to its own function and
+  splits all ne01*ne02*ne03 rows. With fewer rows than threads, each
+  thread copies one cache-line-sized range of every row.
+- ggml_get_n_tasks: a graph in which every node has n_tasks = 1 runs
+  on one thread, so the column split had no threads to use there. Such
+  graphs are a single-op test-backend-ops graph, or a CPU split that
+  holds only the state get_rows under GPU offloading. A get_rows of
+  fewer F32 or I32 rows than threads, with rows of at least 65536
+  elements, now asks for all threads. That width is above any token
+  embedding row, so the get_rows of embeddings with GPU offloading
+  keeps n_tasks = 1 (see the FIXME). In a model graph with mul_mats
+  this changes nothing.
+
+Both are plain copies, so the output is bit-exact. Both splits are off
+under use_ref, which keeps a row split (over all rows for dup_bytes),
+so test-backend-ops compares the new splits with a row split. New
+GET_ROWS and CPY cases cover a 3 MiB row, a row width that is not a
+multiple of a cache line, and a strided Q8_0 copy. The GET_ROWS cases
+with one row reach the column split from 2 test threads, and the CPY
+cases with two rows from 3.
+
+Design I4 part A (arbiter perf plan), from a reading of ops.cpp.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01PSPFwkoM7cKXVVQWfzQpjs
+---
+ ggml/src/ggml-cpu/ggml-cpu.c |   7 +++
+ ggml/src/ggml-cpu/ops.cpp    | 103 ++++++++++++++++++++++++++---------
+ tests/test-backend-ops.cpp   |   8 +++
+ 3 files changed, 91 insertions(+), 27 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index c4d6c5837..ef6c42640 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2699,6 +2699,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+                 // decreases performance with GPU offloading
+                 //n_tasks = n_threads;
+                 n_tasks = 1;
++                // a graph of single-task nodes runs on one thread, so a few F32 or I32 rows wider than any
++                // token embedding, such as a recurrent state, ask for all threads to split the rows by columns
++                if (node->op == GGML_OP_GET_ROWS &&
++                    (node->src[0]->type == GGML_TYPE_F32 || node->src[0]->type == GGML_TYPE_I32) &&
++                    node->ne[0] >= 65536 && ggml_nrows(node) < n_threads) {
++                    n_tasks = n_threads;
++                }
+             } break;
+         case GGML_OP_SCALE:
+         case GGML_OP_SET:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 16a916d20..96aca2e89 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -322,6 +322,51 @@ static void ggml_compute_forward_dup_to_q(
+     }
+ }
+ 
++// Copies rows of the same shape and type whose elements are contiguous, with any row strides.
++static void ggml_compute_forward_dup_bytes_rows(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++
++    GGML_TENSOR_UNARY_OP_LOCALS;
++
++    const int ith = params->ith; // thread index
++    const int nth = params->nth; // number of threads
++
++    const size_t  rs = ggml_row_size(src0->type, ne00);
++    const int64_t nr = ne01*ne02*ne03;
++
++    int64_t ir0 = 0;
++    int64_t ir1 = nr;
++    size_t  ib0 = 0;
++    size_t  ib1 = rs;
++
++    if (!params->use_ref && nr < nth) {
++        // few rows: each thread copies one cache-line-sized range of every row
++        const size_t db = CACHE_LINE_SIZE*((rs + CACHE_LINE_SIZE*nth - 1)/(CACHE_LINE_SIZE*nth));
++
++        ib0 = MIN(db*ith, rs);
++        ib1 = MIN(ib0 + db, rs);
++    } else {
++        // rows per thread
++        const int64_t dr = (nr + nth - 1)/nth;
++
++        ir0 = dr*ith;
++        ir1 = MIN(ir0 + dr, nr);
++    }
++
++    for (int64_t ir = ir0; ir < ir1 && ib0 < ib1; ++ir) {
++        const int64_t i03 = ir/(ne01*ne02);
++        const int64_t i02 = (ir - i03*ne01*ne02)/ne01;
++        const int64_t i01 = ir - i03*ne01*ne02 - i02*ne01;
++
++        memcpy(
++            ((char *)  dst->data + i01*nb1  + i02*nb2  + i03*nb3  + ib0),
++            ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03 + ib0),
++            ib1 - ib0);
++    }
++}
++
+ // A simplified version of ggml_compute_forward_dup that doesn't do float upcasting, and just plain old memcpy.
+ static void ggml_compute_forward_dup_bytes(
+         const ggml_compute_params * params,
+@@ -340,6 +385,11 @@ static void ggml_compute_forward_dup_bytes(
+ 
+     const size_t type_size = ggml_type_size(src0->type);
+ 
++    if (ggml_are_same_shape(src0, dst) && nb00 == type_size && nb0 == type_size) {
++        ggml_compute_forward_dup_bytes_rows(params, dst);
++        return;
++    }
++
+     const int ith = params->ith; // thread index
+     const int nth = params->nth; // number of threads
+ 
+@@ -351,24 +401,6 @@ static void ggml_compute_forward_dup_bytes(
+     const int ir0 = dr * ith;
+     const int ir1 = MIN(ir0 + dr, nr);
+ 
+-    if (src0->type == dst->type &&
+-        ggml_are_same_shape(src0, dst) &&
+-        nb00 == type_size && nb0 == type_size) {
+-        // copy by rows
+-        const size_t rs = ggml_row_size(src0->type, ne00);
+-        for (int64_t i03 = 0; i03 < ne03; i03++) {
+-            for (int64_t i02 = 0; i02 < ne02; i02++) {
+-                for (int64_t i01 = ir0; i01 < ir1; i01++) {
+-                    memcpy(
+-                        ((char *)  dst->data + i01*nb1  + i02*nb2  + i03*nb3),
+-                        ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03),
+-                        rs);
+-                }
+-            }
+-        }
+-        return;
+-    }
+-
+     if (ggml_is_contiguous(dst)) {
+         size_t id = 0;
+         char * dst_ptr = (char *) dst->data;
+@@ -5327,6 +5359,10 @@ static void ggml_compute_forward_get_rows_bf16(
+     }
+ }
+ 
++// At this row width, in elements, get_rows_f32 splits fewer rows than threads by columns.
++// In a model graph every node already has all threads, so the split is free.
++static const int64_t GGML_GET_ROWS_SPLIT_MIN_COLS = 4096;
++
+ static void ggml_compute_forward_get_rows_f32(
+         const ggml_compute_params * params,
+               ggml_tensor * dst) {
+@@ -5347,14 +5383,27 @@ static void ggml_compute_forward_get_rows_f32(
+     const int ith = params->ith;
+     const int nth = params->nth;
+ 
+-    // rows per thread
+-    const int dr = (nr + nth - 1)/nth;
++    int64_t ir0 = 0;
++    int64_t ir1 = nr;
++    int64_t ic0 = 0;
++    int64_t ic1 = nc;
+ 
+-    // row range for this thread
+-    const int ir0 = dr*ith;
+-    const int ir1 = MIN(ir0 + dr, nr);
++    if (!params->use_ref && nr < nth && nc >= GGML_GET_ROWS_SPLIT_MIN_COLS) {
++        // few wide rows: each thread copies one cache-line-sized range of every row
++        const int64_t cl = CACHE_LINE_SIZE_F32;
++        const int64_t dc = cl*((nc + cl*nth - 1)/(cl*nth));
+ 
+-    for (int64_t i = ir0; i < ir1; ++i) {
++        ic0 = MIN(dc*ith, nc);
++        ic1 = MIN(ic0 + dc, nc);
++    } else {
++        // rows per thread
++        const int64_t dr = (nr + nth - 1)/nth;
++
++        ir0 = dr*ith;
++        ir1 = MIN(ir0 + dr, nr);
++    }
++
++    for (int64_t i = ir0; i < ir1 && ic0 < ic1; ++i) {
+         const int64_t i12 = i/(ne11*ne10);
+         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+@@ -5362,9 +5411,9 @@ static void ggml_compute_forward_get_rows_f32(
+ 
+         GGML_ASSERT(i01 >= 0 && i01 < ne01);
+ 
+-        ggml_vec_cpy_f32(nc,
+-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
+-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
++        ggml_vec_cpy_f32(ic1 - ic0,
++                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + ic0,
++                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + ic0);
+     }
+ }
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 22f02a2ad..29be1146b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9473,6 +9473,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
++    // few wide rows, such as a recurrent state, split by columns on the CPU
++    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 786432, 3, 1, 1, 1, false));
++    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32,  65541, 3, 2, 1, 1, false));
++    test_cases.emplace_back(new test_get_rows(GGML_TYPE_I32,  65541, 3, 1, 1, 1, false));
+ 
+     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
+     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
+@@ -9965,6 +9969,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {128, 2, 3, 1}, {128, 2, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {128, 4, 3, 1})); // strided dst
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
+     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
++    // few wide rows, such as recurrent state snapshots, split by bytes on the CPU
++    test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {786432, 1, 2, 1}, {786432, 1, 2, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, {786432, 2, 2, 1})); // strided dst
++    test_cases.emplace_back(new test_cpy(GGML_TYPE_F16,  GGML_TYPE_F16,  { 65541, 1, 2, 1}, { 65541, 1, 2, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, { 65541, 2, 2, 1})); // strided dst
++    test_cases.emplace_back(new test_cpy(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, { 65536, 1, 3, 1}, { 65536, 1, 3, 1}, {0, 0, 0, 0}, {0, 0, 0, 0}, false, { 65536, 2, 3, 1})); // strided dst
+ 
+     // CPY - different src/dst shapes (reshaping via CPY)
+     // Use permutations of {3, 5, 7, 32}. Total elements: 3*5*7*32 = 3360.

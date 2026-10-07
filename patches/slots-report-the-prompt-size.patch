@@ -1,6 +1,8 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 809be94cd..ab7010b45 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -698,6 +698,12 @@
+@@ -718,6 +718,12 @@ struct server_slot {
          if (ptask) {
              res["id_task"] = ptask->id;
              res["n_prompt_tokens"]           = (int32_t) prompt.tokens.size();
@@ -13,9 +15,11 @@
              res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
              res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
              res["params"] = ptask->params.to_json(only_metrics);
+diff --git a/tools/server/tests/unit/test_slot_save.py b/tools/server/tests/unit/test_slot_save.py
+index 5eca46cb2..25c2de498 100644
 --- a/tools/server/tests/unit/test_slot_save.py
 +++ b/tools/server/tests/unit/test_slot_save.py
-@@ -546,3 +546,36 @@
+@@ -546,3 +546,36 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
      assert res.status_code == 200
      assert res.body["timings"]["cache_n"] == 0
      assert res.body["content"] == content
