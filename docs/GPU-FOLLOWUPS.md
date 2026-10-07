@@ -40,6 +40,7 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
 | optional I1 + Q1 | CPU run, node 0 quiet, 3 rounds | prompt 19.51 / 19.56 / 19.62 ms/token; verify 317.0 / 317.2 / 318.5 ms | prompt 18.10 / 18.35 / 18.52; verify 302.8 / 301.8 / 301.9 | prefill +7%, generate +5%. PPL 9.7310 -> 9.8584 (3 chunks of 512; I1 is not exact). Split I1 and Q1 before deciding |
 | N1 expert cache, #29887, 1500 MiB | GPU run, ctx 150000, 3 prompts x 2 rounds | 14.5-14.8 / 18.9-20.2 / 16.9-18.7 tok/s | 1.8-1.9 / 2.1 / 2.0 tok/s | rejected: 0.00% hits on this card |
 | `--spec-draft-p-min 0.5` (H3) | gpu backend, temperature 1.0, 2 rounds | see `--backend-sampling` baseline | 12.9-13.4 / 17.3-17.6 / 15.3-16.3 tok/s | rejected: -2 to -5% |
+| threads 14 / 16 / 17 / 18 (`-t` = `-tb`) | CPU run and GPU run, node 0 quiet, two passes in reversed order | 18: GPU prompt 8.41, 8.37 ms/token; CPU prompt 20.27, 19.61 | GPU prompt 17: 8.69, 8.72; 16: 9.16, 9.02. CPU prompt 17: 20.25, 20.40; 14: 24.09, 23.51 | keep 18. Verify: no count beats the spread (up to 21 ms CPU, 4 ms GPU). A 4-token verify runs on the `-tb` pool, so `-t` alone changes nothing there |
 | 36 threads (hyperthreads) for the experts | test-backend-ops, model shapes, box busy | 4-token matmul 0.83-0.86 ms | 10.9-12.1 ms | rejected |
 
 ### Where the time goes (op-profile, GPU run, ctx 150000, idle)
@@ -58,6 +59,9 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
   with `GGML_ASSERT(buffer) failed`.
 - #29887 now needs upstream 6753a033f first: it was rebased after this page
   checked it.
+- Load on node 1 moves node-0 numbers: the same CPU-run setting read prompts
+  at 19.6 to 20.3 ms/token with node 1 busy and 18.7 to 18.8 with it idle.
+  Compare only inside one session's alternating rounds.
 - CUDA graphs are captured per GPU split, that is per layer between two CPU
   expert phases.
 
