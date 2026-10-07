@@ -1,14 +1,18 @@
-// Where a prompt's time goes, by op, on the CPU.
+// How fast a prompt reads and a verify step runs, and where the time goes.
 //
 //   tools/op-profile.sh -m MODEL [llama flags...] -f PROMPT_FILE [-n TOKENS]
 //
-// Reads the prompt once to warm up, once for the plain rate, then again under
-// the scheduler's eval callback. Then it times generate: steps of 4 tokens, the width of an MTP
-// verify at --spec-draft-n-max 3, after the prompt. The callback asks for every node whose output is in host memory,
-// so each CPU node runs alone and its time is exact. Nodes on the card run
-// asynchronously; their time, and the copies between card and RAM, are the
-// rest of the wall time. Running nodes one at a time turns off fusion, so the
-// shares are close to a normal run's, not equal.
+// Reads the prompt once to warm up, then once for its rate. Then it times 32
+// steps of 4 tokens, the width of an MTP verify at --spec-draft-n-max 3, and
+// reports them with and without the first two, which build the CUDA graphs.
+// These runs set no eval callback: with one, the scheduler syncs after every
+// split.
+//
+// OP_PROFILE_OPS=1 adds a pass of each under the callback, which asks for every
+// node whose output is in host memory. Each CPU node then runs alone and its
+// time is exact; the card, the copies and the waits are the rest of the wall
+// time. Nodes run one at a time, so fusion is off and the shares are close to
+// a normal run's, not equal.
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -86,9 +90,14 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    // The callback makes the scheduler sync after every split, so the plain timings run
+    // without it. OP_PROFILE_OPS=1 adds the per-op tables, from a second pass with it.
+    const bool ops = getenv("OP_PROFILE_OPS") != nullptr;
     profile p;
-    params.cb_eval = on_node;
-    params.cb_eval_user_data = &p;
+    if (ops) {
+        params.cb_eval = on_node;
+        params.cb_eval_user_data = &p;
+    }
     params.warmup = false;
 
     auto init = common_init_from_params(params);
@@ -121,16 +130,18 @@ int main(int argc, char ** argv) {
     };
 
     read(0);                                   // warm: the first touch of each page
-    const double plain = read(0);              // the rate with fusion on
-    p.on = true;
-    const double wall = read(0);
+    const double plain = read(0);
+    printf("\n== prompt: %d of them, %.0f ms (%.2f ms each)\n", n, plain, plain / n);
+    if (ops) {
+        p.on = true;
+        const double wall = read(0);
+        report(p, n, plain, wall, "prompt, with the callback");
+        p.on = false;
+    }
 
-    report(p, n, plain, wall, "prompt");
-    p.on = false;
-
-    // generate: verify-wide steps on top of the prompt just read
-    const int steps = 32, width = 4;
-    p = profile{};
+    // generate: verify-wide steps on top of the prompt just read. The first two after a
+    // change of batch shape build the CUDA graphs, so "steady" leaves them out.
+    const int steps = 32, width = 4, warm = 2;
     auto step = [&](int k) {
         std::vector<llama_token> part(all.begin() + n + k * width, all.begin() + n + (k + 1) * width);
         llama_batch b = llama_batch_init(width, 0, 1);
@@ -149,19 +160,29 @@ int main(int argc, char ** argv) {
     if ((int) all.size() < n + 2 * steps * width) {
         printf("the prompt file is too short for the generate steps\n");
     } else {
-        p.on = false;
-        auto t0 = clk::now();
-        for (int k = 0; k < steps; k++) step(k);
-        llama_synchronize(ctx);
-        const double gplain = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
-        // a recurrent state cannot step back, so read the prompt again
-        read(0);
-        p.on = true;
-        t0 = clk::now();
-        for (int k = 0; k < steps; k++) step(k);
-        llama_synchronize(ctx);
-        const double gwall = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
-        report(p, steps, gplain, gwall, "verify steps of 4 tokens");
+        double total = 0, steady = 0;
+        for (int k = 0; k < steps; k++) {
+            const auto t0 = clk::now();
+            step(k);
+            llama_synchronize(ctx);
+            const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            total += ms;
+            if (k >= warm) {
+                steady += ms;
+            }
+        }
+        printf("== verify steps of 4 tokens: %d of them, steady %.2f ms each (all %.2f ms each)\n",
+               steps, steady / (steps - warm), total / steps);
+        if (ops) {
+            read(0);                           // a recurrent state cannot step back
+            p = profile{};
+            p.on = true;
+            const auto t0 = clk::now();
+            for (int k = 0; k < steps; k++) step(k);
+            llama_synchronize(ctx);
+            const double gwall = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            report(p, steps, total, gwall, "verify steps of 4 tokens, with the callback");
+        }
     }
     llama_backend_free();
     return 0;
