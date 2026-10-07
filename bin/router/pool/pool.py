@@ -11,7 +11,7 @@ from ..sizing import VISION
 from ..store.backendlog import CacheWatch, read_config, read_vision
 from ..store.events import EventLog
 from ..store.files import adopt_files, opening_key, shelf_of, trim_openings
-from ..transport import Gone
+from ..transport import Gone, Rejected
 from ..backend.link import Link
 from ..backend.poll import counters, slot_state, stats
 from .turn import Turn
@@ -897,9 +897,10 @@ class Pool:
             print(f"[router] parked {short} from {be['name']} slot {slot}", flush=True)
         return kept
 
-    def recall(self, conv, be, slot):
+    def recall(self, conv, be, slot, remove=None):
         """Put a parked cache back on the backend about to serve it. Returns
         True when the cache is now on that backend."""
+        remove = remove or self.store.drop
         with self.cv:
             record = self.pins.get(conv)
             if not record or not record.get("parked"):
@@ -920,6 +921,8 @@ class Pool:
             self.events.write("recall", conv=short_key(conv), backend=be["name"],
                          slot=target_slot, ok=False, error=str(err)[:120],
                          secs=round(time.time() - began, 2))
+            if isinstance(err, Rejected):
+                self._forget_park(conv, name, remove)
             return False
 
         with self.cv:
@@ -935,6 +938,20 @@ class Pool:
         print(f"[router] recalled {short_key(conv)} onto {be['name']} slot {target_slot}",
               flush=True)
         return True
+
+    def _forget_park(self, conv, name, remove):
+        """The backend refused the copy, so no backend will load it. Without
+        it the turn can load a shared opening."""
+        with self.cv:
+            record = self.pins.get(conv)
+            if not record or record.get("parked") != name:
+                return            # parked again since
+            record["parked"] = None
+            record["bytes"] = 0
+        remove(name)
+        self.save_pins()
+        print(f"[router] {short_key(conv)} forgot its copy: the backend "
+              f"refused the file", flush=True)
 
     def warm_prefix(self, conv, cuts, messages, system, tools, be, slot,
                     path, alive=None, template=None):
@@ -1534,6 +1551,8 @@ class Pool:
                   f"{be['name']}: {err}", flush=True)
             self.events.write("load", key=short_key(key), backend=be["name"],
                          slot=slot, ok=False, error=str(err)[:120])
+            if isinstance(err, Rejected):
+                self._drop_opening(key, name)
             return False
         # Sized: the dashboard draws each file event over its byte count.
         read = self.store.size(name)
@@ -1553,6 +1572,21 @@ class Pool:
         print(f"[router] loaded opening {key[:8]} onto {be['name']} "
               f"slot {slot}", flush=True)
         return True
+
+    def _drop_opening(self, key, name):
+        """The backend refused the file, so no backend will load it: one
+        saved by another llama.cpp state version, for one. The next request
+        reads the opening again and keeps a new copy."""
+        with self.cv:
+            if self.openings.get(key) != name:
+                return            # another request has dropped or replaced it
+            del self.openings[key]
+            self.opening_bytes.pop(key, None)
+            self.starts.pop(key, None)
+        self.store.drop(name)
+        self.save_openings()
+        print(f"[router] dropped opening {key[:8]}: the backend refused "
+              f"its file", flush=True)
 
     def _read_prefix(self, cut, messages, system, tools, be, slot, path,
                      alive, template=None):

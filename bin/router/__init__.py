@@ -61,7 +61,7 @@ from .store.backendlog import CacheWatch, cache_event, read_config, read_vision
 from .store.events import EventLog
 from .store.files import (Store, adopt_files, opening_key, shelf_of,
                           trim_openings)
-from .transport import Gone, http_post, http_post_watched, said, said_in
+from .transport import Gone, Rejected, http_post, http_post_watched, said, said_in
 from .web.config import CONFIG_FILES, client_config, default_provider, host_only
 from .web.handler import (DROP_HEADERS, INFERENCE, MIME, PASSED, WEB, Handler,
                           on_the_page, passed_paths)
@@ -71,7 +71,7 @@ __all__ = ["ANTHROPIC_PING", "AnthropicSplice", "Ask", "CONFIG_FILES",
     "CacheWatch", "DEFAULT_BACKENDS", "DROP_HEADERS", "EventLog", "Flow",
     "GPU_CMD", "Gone", "HEADER_B64", "Handler", "History", "IGNORED_KEYS",
     "INFERENCE", "MIME", "Machine", "OaiUsageSplice", "PASSED", "PING",
-    "Pool", "RATE_FLOOR", "Refused", "SHELF_MARKS", "SYSTEMONE",
+    "Pool", "RATE_FLOOR", "Refused", "Rejected", "SHELF_MARKS", "SYSTEMONE",
     "SYSTEMONE_LETTERS", "SYSTEMONE_RUBRIC", "SYSTEMONE_UP", "SYSTEM_ROLES",
     "Server", "Stamped", "Store", "Tuning", "Turn", "VISION", "WEB",
     "adopt_files", "answers", "anthropic", "by_place", "cache_event",

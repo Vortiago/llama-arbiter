@@ -4,6 +4,7 @@ network.
 """
 import atexit
 import base64
+import http.server
 import io
 import json
 import os
@@ -1859,6 +1860,34 @@ class Recall(unittest.TestCase):
                   FakeLink(fail_on="restore")).recall("conv1", self.cpu, 1)
         self.assertEqual(self.pool.pins["conv1"]["backend"], "gpu")
 
+    def test_a_copy_the_backend_refuses_is_forgotten(self):
+        """Kept, it stays the conversation's own cache, so the turn loads no
+        opening either and reads its whole prompt."""
+        removed = []
+        post = FakeLink()
+
+        def restore(be, slot, name, timeout=None):
+            raise router.Rejected("400 on /slots/1?action=restore: "
+                                  "invalid slot save file")
+
+        post.restore = restore
+        self.pool.link = post
+        self.assertFalse(self.pool.recall("conv1", self.cpu, 1,
+                                          remove=removed.append))
+        self.assertIsNone(self.pool.pins["conv1"]["parked"])
+        self.assertEqual(removed, ["conv1.park"])
+
+    def test_a_copy_on_a_backend_that_is_down_is_kept(self):
+        post = FakeLink()
+
+        def restore(be, slot, name, timeout=None):
+            raise ConnectionRefusedError("connection refused")
+
+        post.restore = restore
+        self.pool.link = post
+        self.assertFalse(self.pool.recall("conv1", self.cpu, 1))
+        self.assertEqual(self.pool.pins["conv1"]["parked"], "conv1.park")
+
 
 LONG = "You are a careful assistant. " * 400      # a client-sized system prompt
 
@@ -2129,6 +2158,40 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
         self.assertEqual(self.paths(post), ["restore"])
         self.assertEqual(post.files()[0], "deep-k2.park")
 
+    def refusing(self, error):
+        talk = self.talker()
+
+        def restore(be, slot, name, timeout=None):
+            talk._note("restore", be, slot, name)
+            raise error
+
+        talk.restore = restore
+        return talk
+
+    def test_an_opening_the_backend_refuses_is_dropped(self):
+        """A llama.cpp of another state version refuses every file the old
+        one saved. Kept, the opening failed to load on every request, and
+        nobody read a new one, because the router still had it."""
+        self.pool.openings["k1"] = "base-k1.park"
+        (SANDBOX.store.slots / "base-k1.park").write_bytes(b"old")
+        post = self.refusing(router.Rejected(
+            "400 on /slots/1?action=restore: invalid slot save file"))
+        self.assertFalse(self.warm(post))
+        self.assertNotIn("k1", self.pool.openings)
+        self.assertFalse((SANDBOX.store.slots / "base-k1.park").exists())
+
+        post = linked(self.pool, self.talker())
+        self.assertTrue(self.warm(post, system="rules"))
+        self.assertEqual(self.paths(post),
+                         ["render", "render", "prefill", "save"])
+
+    def test_an_opening_on_a_backend_that_is_down_is_kept(self):
+        """No answer is not a refusal: the backend may be restarting."""
+        self.pool.openings["k1"] = "base-k1.park"
+        post = self.refusing(ConnectionRefusedError("connection refused"))
+        self.assertFalse(self.warm(post))
+        self.assertIn("k1", self.pool.openings)
+
     def test_reads_nothing_when_the_opening_is_already_on_the_shelf(self):
         self.pool.openings["k1"] = "base-k1.park"
         post = linked(self.pool, self.talker())
@@ -2250,6 +2313,44 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
         self.pool.openings["k1"] = "base-k1.park"
         self.warm(self.talker(), cuts=[(0, "k0")])
         self.assertEqual(list(self.pool.openings), ["k1", "k0"])
+
+
+class ABackendThatAnswersNoIsNotDown(unittest.TestCase):
+    """A slot file call raises either way, and the caller needs to know
+    which: a refused file is dead, an unreachable backend may come back."""
+
+    def serve(self, code, body):
+        class Answer(http.server.BaseHTTPRequestHandler):
+            def do_POST(inner):
+                inner.rfile.read(int(inner.headers["Content-Length"]))
+                inner.send_response(code)
+                inner.send_header("Content-Type", "application/json")
+                inner.end_headers()
+                inner.wfile.write(json.dumps(body).encode())
+
+            def log_message(inner, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Answer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def test_an_error_reply_is_a_rejection_with_the_reason(self):
+        url = self.serve(400, {"error": {"message": "invalid slot save file"}})
+        with self.assertRaises(router.Rejected) as said:
+            router.http_post(url, "/slots/0?action=restore", {}, timeout=5)
+        self.assertIsInstance(said.exception, OSError)
+        self.assertIn("invalid slot save file", str(said.exception))
+
+    def test_no_answer_is_no_rejection(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        with self.assertRaises(OSError) as said:
+            router.http_post(f"http://127.0.0.1:{port}", "/slots/0", {},
+                             timeout=5)
+        self.assertNotIsInstance(said.exception, router.Rejected)
 
 
 class SlotHistory(unittest.TestCase):
