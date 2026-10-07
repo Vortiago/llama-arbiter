@@ -14,6 +14,36 @@ The GPU box runs the arbiter at about 130k context on one 16 GiB card, with
 recurrent state and the KV cache are on the card. All 48 expert layers are in
 RAM. The CPU box runs about 250k context.
 
+## Results on koishi
+
+koishi is the GPU box: two Xeon Gold 6150 sockets of 18 cores, an RTX A4000
+16 GiB, ctx 150000. Measured on 7 October 2026 with the pin, core CPU
+patches only. Generate is three chat prompts of 256 tokens at temperature
+0, through one test server on node 0, in alternating rounds.
+
+- **The link is PCIe gen3 x8**, about 8 GB/s, not the 25 GB/s this page
+  plans with. Every upload costs three times more than estimated below.
+- **The ggml-org draft must be the 30 September upload.** The 9 September
+  file gives the MTP layer a compress ratio of 0, so it runs dense, reads
+  none of the k-pool inputs, and the server aborts at load with
+  `GGML_ASSERT(buffer) failed`. The new file gives it 4.
+- **The draft does not fit on the card with its experts at ctx 150000.**
+  Its output head adds 644 MiB. `bin/qwen-mtp.sh` now passes
+  `--cpu-moe-draft`, which frees 2.5 GiB. That costs 4 to 5% of generate,
+  measured at ctx 130000 where both fit (14.4/19.0/17.0 against
+  15.1/19.8/17.8 tok/s, the same acceptance).
+- **N1, #29887, loses by ten times.** The free VRAM gave a 1500 MiB cache,
+  about 6 experts a layer against 10 used a token. The hit rate was 0.00%,
+  it uploaded 1.5 TB in the test, and generate fell from 15 to 20 tok/s to
+  about 2. A cache that hits needs about 64 experts a layer, about 15 GB at
+  Q8_0. The build with the cache off matched the pin within drift. Not
+  worth keeping on this card. #29887 needs upstream 6753a033f first now: it
+  was rebased after this page checked it.
+- **CPU prefill, old fork against the pin** (the readers' own logs, median
+  tok/s): 5 to 64 token batches 14.1 to 19.3, 64 to 256 tokens 20.9 to
+  22.4 on node 1. A /v1/systemone call of 16 questions went from about 37 s
+  a case to about 26 s, with the router fixes of the same day in it.
+
 ## Sizes that decide most of this
 
 These come from the model header: 48 layers, 512 experts, 10 used, an expert
