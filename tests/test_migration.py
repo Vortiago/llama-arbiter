@@ -4388,6 +4388,26 @@ class HandOff(unittest.TestCase):
         self.assertIs(self.go(self.mover()), self.gpu)
         hand.join()
 
+    def test_the_move_says_how_long_it_waited_for_the_generator(self):
+        """A turn read elsewhere waits for the generator to be free. That
+        wait is what a read on the generator costs the others."""
+        said = self.pool.events = Said()
+        self.gpu["busy"] = 1
+
+        def free_it():
+            time.sleep(0.3)
+            with self.pool.cv:
+                self.gpu["busy"] = 0
+                self.pool.cv.notify_all()
+
+        hand = threading.Thread(target=free_it, daemon=True)
+        hand.start()
+        self.go(self.mover())
+        hand.join()
+        (moved,) = said.of("migrate")
+        self.assertGreaterEqual(moved["waited"], 0.3)
+        self.assertLess(moved["waited"], 5)
+
     def test_gives_up_the_wait_when_the_client_leaves(self):
         """Nobody is owed an answer, and the reader is already back.
 

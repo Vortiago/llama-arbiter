@@ -1429,12 +1429,14 @@ class Pool:
             source["busy"] -= 1            # the reader takes the next prompt
             self.flow.note(conv, "generate-queue")
             self.cv.notify_all()
+        queued = time.time()
 
         try:
             while True:
                 # None once the last generator went away.
                 free = None if target is None else self._wait_to_generate(target, alive)
                 if free is not None:
+                    waited = time.time() - queued
                     break
                 if alive is not None and not alive():
                     return None                # parked, and nobody to answer
@@ -1478,9 +1480,11 @@ class Pool:
                 self.flow.note(conv, "generate", target["name"], free)
                 self.cv.notify_all()
             self.events.write("migrate", conv=short_key(conv), src=source["name"],
-                         dst=target["name"], bytes=written)
+                         dst=target["name"], bytes=written,
+                         waited=round(waited, 1))
             print(f"[router] {short_key(conv)} read on {source['name']}, "
-                  f"generates on {target['name']} slot {free}", flush=True)
+                  f"generates on {target['name']} slot {free} after waiting "
+                  f"{waited:.0f}s for it", flush=True)
             return target
         finally:
             self.store.settle(name)        # read by the target, or by nobody
