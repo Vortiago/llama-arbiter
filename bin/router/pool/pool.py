@@ -814,8 +814,11 @@ class Pool:
 
             self._save_park(conv, be, slot, remove)
 
-    def _save_park(self, conv, be, slot, remove=None, timeout=None):
-        """Write one cache to disk. Mark the pin only if it holds one."""
+    def _save_park(self, conv, be, slot, remove=None, timeout=None,
+                   settle=True):
+        """Write one cache to disk. Mark the pin only if it holds one.
+        `settle` false leaves the copy in the page cache for a restore that
+        follows at once; that caller settles it."""
         remove = remove or self.store.drop
         with self.cv:
             # Counted, not a set: two pins can name one slot, so two saves of
@@ -824,7 +827,7 @@ class Pool:
             # still being read out of it.
             be["saving"][slot] += 1
         try:
-            return self._park(conv, be, slot, remove, timeout)
+            return self._park(conv, be, slot, remove, timeout, settle)
         finally:
             with self.cv:
                 if be["saving"][slot] <= 1:
@@ -841,7 +844,7 @@ class Pool:
                     record["parking"] = False
                 self.cv.notify_all()
 
-    def _park(self, conv, be, slot, remove, timeout):
+    def _park(self, conv, be, slot, remove, timeout, settle):
         """The save itself. _save_park owns the claim on the slot."""
         name = conv + ".park"
         short = short_key(conv)
@@ -907,6 +910,8 @@ class Pool:
         # this run made. A park is rare: 952 in three days.
         if kept or spent:
             self.save_pins()
+        if kept and settle:
+            self.store.settle(name)
         self.events.write("park", conv=short, backend=be["name"], slot=slot,
                      ok=bool(kept), bytes=written if kept else 0,
                      secs=round(time.time() - began, 2))
@@ -949,6 +954,7 @@ class Pool:
                 record["slot"] = target_slot
             note_bytes = record.get("bytes", 0) if record else 0
             self.note_file("recalled", conv, be, target_slot, note_bytes)
+        self.store.settle(name)
         self.events.write("recall", conv=short_key(conv), backend=be["name"],
                      slot=target_slot, ok=True, bytes=note_bytes,
                      secs=round(time.time() - began, 2))
@@ -1159,6 +1165,7 @@ class Pool:
                                     budget=self.tuning.block_budget)
             for gone in dropped:
                 self.starts.pop(opening_key(gone), None)
+        self.store.settle(name)
         for extra in dropped:
             self.store.drop(extra)
         self.save_openings()
@@ -1310,7 +1317,7 @@ class Pool:
         if slot is None:
             return self._stay(source, "its prompt is in no slot to carry")
 
-        if not self._save_park(conv, source, slot, remove):
+        if not self._save_park(conv, source, slot, remove, settle=False):
             return self._stay(source, "the slot had already changed hands")
         with self.cv:
             name = self.pins[conv]["parked"]
@@ -1319,55 +1326,58 @@ class Pool:
             self.flow.note(conv, "generate-queue")
             self.cv.notify_all()
 
-        while True:
-            # None once the last generator went away.
-            free = None if target is None else self._wait_to_generate(target, alive)
-            if free is not None:
-                break
-            if alive is not None and not alive():
-                return None                # parked, and nobody to answer
-            if generates(source):
-                # The generator went away. A slow answer beats none.
-                with self.cv:
-                    source["busy"] += 1
-                return source
-            # `generate: false` is an operator's setting. The turn is parked
-            # on disk, the cheapest place to wait. Wait for a generator.
-            target = self.generator(tokens, path)
-            if target is None:
-                with self.cv:
-                    self.cv.wait(1.0)
-
         try:
-            self.link.restore(target, free, name)
-        except Exception as err:
-            print(f"[router] {short_key(conv)} could not be carried to "
-                  f"{target['name']}: {err}", flush=True)
-            with self.cv:
-                target["busy"] -= 1
-                source["busy"] += 1        # it generates where it read instead
-                self.cv.notify_all()
-            return self._stay(source, f"{target['name']} refused the restore")
+            while True:
+                # None once the last generator went away.
+                free = None if target is None else self._wait_to_generate(target, alive)
+                if free is not None:
+                    break
+                if alive is not None and not alive():
+                    return None                # parked, and nobody to answer
+                if generates(source):
+                    # The generator went away. A slow answer beats none.
+                    with self.cv:
+                        source["busy"] += 1
+                    return source
+                # `generate: false` is an operator's setting. The turn is parked
+                # on disk, the cheapest place to wait. Wait for a generator.
+                target = self.generator(tokens, path)
+                if target is None:
+                    with self.cv:
+                        self.cv.wait(1.0)
 
-        with self.cv:
-            record = self.pins.get(conv)
-            if record:
-                self._end_claims(target, free, conv)
-                record["backend"] = target["name"]
-                record["slot"] = free
-                # Both: `slot` is where the cache is, `using` is what this
-                # turn was handed. _turn_slots answers from `using`, so
-                # without it a carried turn is invisible to the next chooser.
-                record["using"] = free
-                record["inflight"] = True
-            self.note_file("moved", conv, target, free, written)
-            self.flow.note(conv, "generate", target["name"], free)
-            self.cv.notify_all()
-        self.events.write("migrate", conv=short_key(conv), src=source["name"],
-                     dst=target["name"], bytes=written)
-        print(f"[router] {short_key(conv)} read on {source['name']}, "
-              f"generates on {target['name']} slot {free}", flush=True)
-        return target
+            try:
+                self.link.restore(target, free, name)
+            except Exception as err:
+                print(f"[router] {short_key(conv)} could not be carried to "
+                      f"{target['name']}: {err}", flush=True)
+                with self.cv:
+                    target["busy"] -= 1
+                    source["busy"] += 1        # it generates where it read instead
+                    self.cv.notify_all()
+                return self._stay(source, f"{target['name']} refused the restore")
+
+            with self.cv:
+                record = self.pins.get(conv)
+                if record:
+                    self._end_claims(target, free, conv)
+                    record["backend"] = target["name"]
+                    record["slot"] = free
+                    # Both: `slot` is where the cache is, `using` is what this
+                    # turn was handed. _turn_slots answers from `using`, so
+                    # without it a carried turn is invisible to the next chooser.
+                    record["using"] = free
+                    record["inflight"] = True
+                self.note_file("moved", conv, target, free, written)
+                self.flow.note(conv, "generate", target["name"], free)
+                self.cv.notify_all()
+            self.events.write("migrate", conv=short_key(conv), src=source["name"],
+                         dst=target["name"], bytes=written)
+            print(f"[router] {short_key(conv)} read on {source['name']}, "
+                  f"generates on {target['name']} slot {free}", flush=True)
+            return target
+        finally:
+            self.store.settle(name)        # read by the target, or by nobody
 
     def _stay(self, source, why):
         """Generate where the prompt was read, because carrying it failed. Said
@@ -1572,6 +1582,7 @@ class Pool:
             if isinstance(err, Rejected):
                 self._drop_opening(key, name)
             return False
+        self.store.settle(name)
         # Sized: the dashboard draws each file event over its byte count.
         read = self.store.size(name)
         with self.cv:
@@ -1648,6 +1659,7 @@ class Pool:
             dropped = trim_openings(self.openings, self.opening_bytes,
                                     keep=set(self.building),
                                     budget=self.tuning.block_budget)
+        self.store.settle(name)
         for extra in dropped:
             self.store.drop(extra)
         self.save_openings()

@@ -1,6 +1,6 @@
 """Everything one run keeps on disk."""
 
-import json, os, shutil
+import json, os, queue, shutil, threading
 from pathlib import Path
 from collections import OrderedDict
 from ..identity import SHELF_MARKS
@@ -23,6 +23,9 @@ class Store:
         # block_budget. Parked copies stay under the run directory, under
         # park_budget.
         self.blocks = Path(block_dir) if block_dir else self.run / "blocks"
+        self._settles = queue.SimpleQueue()
+        self._settler = None
+        self._settler_lock = threading.Lock()
 
     def __repr__(self):
         return f"Store({str(self.run)!r}, {str(self.blocks)!r})"
@@ -53,6 +56,32 @@ class Store:
             path.unlink(missing_ok=True)
         except OSError as err:
             print(f"[router] could not delete {name}: {err}", flush=True)
+
+    def settle(self, name):
+        """Drop a slot file's pages from the page cache, on a worker. The
+        backend holds the cache in its own memory, and these pages push the
+        model's out. Returns at once: forcing a gigabyte down takes seconds."""
+        with self._settler_lock:
+            if self._settler is None:
+                self._settler = threading.Thread(target=self._run_settles,
+                                                 name="settle", daemon=True)
+                self._settler.start()
+        self._settles.put(name)
+
+    def _run_settles(self):
+        while True:
+            name = self._settles.get()
+            try:
+                fd = os.open(self.slots / name, os.O_RDONLY)
+            except OSError:
+                continue                  # deleted since: nothing to drop
+            try:
+                os.fdatasync(fd)          # DONTNEED skips a dirty page
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            except Exception as err:
+                print(f"[router] could not settle {name}: {err}", flush=True)
+            finally:
+                os.close(fd)
 
     def link_block(self, name):
         """Point the slot directory at a block on the faster disk. A backend
