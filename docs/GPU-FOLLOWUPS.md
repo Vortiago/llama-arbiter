@@ -88,14 +88,20 @@ the large weights, near the A4000's 448 GB/s; the small-K hyper-connection
 GET_ROWS 2.0%, the indexer 0.3%. The kernels Strata tuned are a small share
 here at short context.
 
-### The release in service (llama.cpp-rel2, 8 October 05:58)
+### The release in service (llama.cpp-rel3, 8 October 07:05)
 
 Patches through core/0033. Against llama.cpp-live, profiler, 2 rounds: GPU
 verify step 112.2 to 103.0 ms (-8%), CPU verify step 300.6 to 254.9 ms (-15%),
 prompts the same; PPL identical at ub 4 and 512. Generating directly on the
 gpu backend, warm: 27.7-30.7 tok/s against 24.9-27.1. A chat turn handed off
-from a node-1 reader to the gpu backend generates at about 9 tok/s (about 360
-ms a step) on both releases: under investigation. A gpu backend with
+to the gpu backend generated at about 9 tok/s (about 360 ms a step) only as
+the first work of a freshly restarted gpu backend whose model pages were out
+of the page cache (1.39 million major faults); warm, a hand-off from either
+node runs at 122-144 ms a step. Since 07:05 llama.cpp-rel3 is in service:
+rel2 plus a slot file that carries the MTP draft's KV (a restored slot drafts
+as the server that saved it: 75/154 drafts accepted against 70/170 on a long
+prompt). After its restart the gpu backend took 0 major faults and handed-off
+turns ran at 122-128 ms a step. A gpu backend with
 "prefill": true lost chat generation to the cpu readers; it reads
 /v1/systemone only.
 
