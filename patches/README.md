@@ -117,7 +117,7 @@ by 40 to 56 ms with the patch. A run of grammar requests never paid it,
 because a grammar turns backend sampling off. Outputs, grammar
 probabilities and perplexity identical.
 
-### slot-file-carries-the-draft-kv.patch
+### slot-state-carries-the-draft-kv.patch
 
 Not required, but every hand-off from a reader to a generator needs it to
 draft well. A slot file held only the target context's state; the MTP draft
@@ -266,6 +266,7 @@ and 12.2% on tg128, so a smaller single-run change is not a result.
 | `core/0025` | | The CUDA vector lightning indexer reads its keys once for all the batches of a block (Strata #187). | kv 32768 (about 128K context): 190 to 115 us; the same at short context | exact |
 | `core/0026` to `0030` | N4 | CUDA, for a 4-token verify step: up to 4 MMVQ products of one input run as one launch on one q8_1 quantization (0026); MMF uses 16-row tiles for matrices of few row tiles, so the router runs 32 blocks, not 16 (0027); a warp per row pair for MMVQ at K of 1024 or less (0028); 0029 drops perf cases that timed the wrong node; qwen4exp builds the hyper-connection inject product where it is made, so all 96 down+inject pairs fuse (0030). | koishi: card kernel time a verify step 23.26 to 20.92 ms; verify step 111.3 to 108.7 ms mean (clean A/B) | exact: the logits of a 4-token run are bit-identical; MUL_MAT 2127 OK |
 | `core/0031` to `0033` | N5 | `ggml_barrier` spins on an atomic with OpenMP too (0031): under `OMP_WAIT_POLICY=PASSIVE` every `omp barrier` slept in the kernel, and 34% of a CPU verify step's thread time was barrier wait. Idle workers still sleep between graphs. Below 64 routed rows, gate, up, SWIGLU, the Q8_0 quantize and down run as one op with 3 barriers instead of 7, threads taking row blocks from a counter (0032), 128/256-row blocks (0033). | koishi: CPU verify step 313 to 261 ms (-15%), CPU prompt about -7%, GPU verify step 118 to 110 ms (-6%). Two busy instances on one node: both faster (about 367 to 330 ms) | exact: PPL identical at ub 512 and 4, CPU and GPU runs |
+| `core/0034`, `0035` | G1 | The dist sampler picks by the Gumbel-max trick, its noise a hash of (seed, accepted count, token id), and the MTP drafter picks with a copy of the target's sampler chain, so a draft and the target agree more often when sampling (Strata #1281). dist runs on the CPU, after the backend's top-k. 0035 updates `test-backend-sampler`. | koishi, temperature 1.0: generate 20.61 to 22.10 tok/s (+7.2%, rounds 2-4 of 4, order alternated), acceptance 0.555 to 0.611; temperature 0 unchanged | the output distribution is the same; a fixed seed gives other text than before. Greedy output byte-identical |
 | `optional/I1/0001, 0002` | I1 | A SIMD sigmoid, which the gated `dsv4_hc_pre` now uses row by row. | *paired* on stack2: pp512 +2.4%, 8k prefill +1.7% | at most 1.2e-7 per op. KLD 0.020, same top token 96.0%, PPL ratio 0.9972 ± 0.0037 at 512 |
 | `optional/Q1/0001, 0002` | Q1 | `ggml_argsort_top_k` passes k as a hint, and the CPU kernel sorts only the top k of a row. The MoE router sorted 512 ids to read 10. | *paired* on stack2: generate +0.9 to +3.2%, tg128 +1.3% | bit-exact (1047 cases). KLD 0.002, same top token 99.5%, PPL ratio 0.9984 ± 0.0015 at 512 |
 
