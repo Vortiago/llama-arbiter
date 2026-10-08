@@ -117,6 +117,19 @@ by 40 to 56 ms with the patch. A run of grammar requests never paid it,
 because a grammar turns backend sampling off. Outputs, grammar
 probabilities and perplexity identical.
 
+### slot-file-carries-the-draft-kv.patch
+
+Not required, but every hand-off from a reader to a generator needs it to
+draft well. A slot file held only the target context's state; the MTP draft
+keeps its own KV over the prompt, so after a restore it drafted over an empty
+or a foreign KV. The save appends the draft's state after the checkpoints
+(magic "QDFT", about 5 MB per 2K tokens), and the restore loads it; a file
+without the block restores with the draft KV cleared. A context checkpoint
+also keeps the MTP head's pending hidden state. Measured on a CPU test server,
+an 1856-token prompt, 128 tokens at temperature 0, the same text: a fresh
+server after a restore accepted 70 of 170 drafts before and 75 of 154 after,
+the same as the server that read the prompt.
+
 ### anthropic-apply-template.patch
 
 `/apply-template` reads openai-shaped messages only. A `/v1/messages` client
