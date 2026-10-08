@@ -1889,6 +1889,165 @@ class Recall(unittest.TestCase):
         self.assertEqual(self.pool.pins["conv1"]["parked"], "conv1.park")
 
 
+class SettleWatch(router.Store):
+    """A store that records each file it is asked to settle, and the link
+    calls made by then."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.link = FakeLink(written=1 << 30)
+        self.settled = []
+
+    def settle(self, name):
+        self.settled.append((name, self.link.ops()))
+
+
+class ASlotFileLeavesThePageCache(unittest.TestCase):
+    """A backend holds a saved or restored cache in its own memory, so the
+    file's pages in the page cache are a second copy nobody reads. On
+    8 October the parked copies held 40 GiB of the page cache (3.7 TB passed
+    through it the day before), and model pages went out in their place: a
+    gpu backend restarted that morning took 1.39 million major faults and its
+    first turns ran 3x slower. So each file is settled once the router is
+    done with it."""
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="settle-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.store = SettleWatch(self.root)
+        self.post = self.store.link
+        self.pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1}],
+            store=self.store, link=self.post, watch=False)
+        self.gpu, self.cpu = self.pool.backends
+        for be in self.pool.backends:
+            be.update(up=True, slots=2, n_ctx=150000,
+                      slots_detail=[{"id": 0, "busy": False},
+                                    {"id": 1, "busy": False}])
+
+    def test_a_park_settles_its_copy_after_the_save(self):
+        self.pool.pins["c"] = pin("cpu", slot=0)
+        self.assertTrue(self.pool._save_park("c", self.cpu, 0))
+        self.assertEqual(self.store.settled, [("c.park", ["save"])])
+
+    def test_a_recall_settles_the_copy_it_read(self):
+        self.pool.pins["c"] = pin("gpu", slot=0, parked="c.park")
+        self.assertTrue(self.pool.recall("c", self.cpu, 1))
+        self.assertEqual(self.store.settled, [("c.park", ["restore"])])
+
+    def test_an_opening_load_settles_its_file(self):
+        self.assertTrue(self.pool._load_prefix("k" * 16, "base-k.park",
+                                               self.cpu, 0))
+        self.assertEqual(self.store.settled, [("base-k.park", ["restore"])])
+
+    def test_an_opening_build_settles_its_file(self):
+        self.assertTrue(self.pool._read_prefix(
+            (0, "k" * 16), [{"role": "user", "content": "hi"}], "rules", [],
+            self.cpu, 0, "/v1/messages", lambda: True))
+        self.assertEqual([name for name, _ in self.store.settled],
+                         ["base-" + "k" * 16 + ".park"])
+        self.assertEqual(self.store.settled[0][1][-1], "save")
+
+    def test_a_deep_opening_build_settles_its_file(self):
+        start = ("d" * 16, "the shared start", "k" * 16, 0, None)
+        self.assertTrue(self.pool._read_start(
+            start, [{"role": "user", "content": "the shared start, then"}],
+            "rules", [], self.cpu, 0, "/v1/messages", lambda: True, None))
+        self.assertEqual([name for name, _ in self.store.settled],
+                         ["deep-" + "d" * 16 + ".park"])
+        self.assertEqual(self.store.settled[0][1][-1], "save")
+
+    def test_a_hand_off_settles_its_copy_once_the_target_has_read_it(self):
+        """Settled after the save, the restore right behind it would read the
+        whole copy back from the disk."""
+        self.pool.tuning = replace(self.pool.tuning, handoff=True)
+        self.cpu.update(prefill=True, generate=False)
+        self.gpu.update(prefill=False, generate=True)
+        self.pool.pins["c"] = pin("cpu", slot=0, inflight=True)
+        self.cpu["busy"] = 1
+        self.assertIs(self.pool.hand_off("c", self.cpu, 1000), self.gpu)
+        self.assertEqual(self.store.settled, [("c.park", ["save", "restore"])])
+
+    def test_a_failed_save_settles_nothing(self):
+        self.post.fail_on = "save"
+        self.pool.pins["c"] = pin("cpu", slot=0)
+        self.assertFalse(self.pool._save_park("c", self.cpu, 0))
+        self.assertEqual(self.store.settled, [])
+
+
+class SettlingAFile(unittest.TestCase):
+    """What settle does on the disk. A backend wrote the file, so the router
+    can only drop its pages after the write: forced down first, because
+    POSIX_FADV_DONTNEED skips a dirty page."""
+
+    def setUp(self):
+        from unittest import mock
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="settle-disk-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.store = router.Store(self.root, self.root / "blocks")
+        self.store.slots.mkdir(parents=True)
+        self.calls = []
+        self.done = threading.Event()
+        self.hold = threading.Event()
+        self.hold.set()
+        real_fdatasync, real_fadvise = os.fdatasync, os.posix_fadvise
+
+        def fdatasync(fd):
+            self.hold.wait(10.0)
+            self.calls.append(("fdatasync", os.readlink(f"/proc/self/fd/{fd}")))
+            real_fdatasync(fd)
+
+        def fadvise(fd, offset, length, advice):
+            self.calls.append(("fadvise", os.readlink(f"/proc/self/fd/{fd}"),
+                               offset, length, advice))
+            real_fadvise(fd, offset, length, advice)
+            self.done.set()
+
+        for name, fake in (("fdatasync", fdatasync),
+                           ("posix_fadvise", fadvise)):
+            patcher = mock.patch.object(os, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_it_writes_the_file_down_then_drops_all_of_it(self):
+        path = self.store.slots / "c.park"
+        path.write_bytes(b"x" * 65536)
+        self.store.settle("c.park")
+        self.assertTrue(self.done.wait(10.0))
+        self.assertEqual(self.calls, [
+            ("fdatasync", str(path)),
+            ("fadvise", str(path), 0, 0, os.POSIX_FADV_DONTNEED)])
+
+    def test_it_settles_the_block_a_link_points_at(self):
+        self.store.link_block("base-k.park")
+        (self.store.blocks / "base-k.park").write_bytes(b"x" * 4096)
+        self.store.settle("base-k.park")
+        self.assertTrue(self.done.wait(10.0))
+        self.assertEqual(self.calls[-1][1],
+                         str((self.store.blocks / "base-k.park").resolve()))
+
+    def test_the_caller_does_not_wait_for_the_disk(self):
+        """A hand-off and an opening build settle inside a turn. The write
+        down takes seconds for a gigabyte."""
+        (self.store.slots / "c.park").write_bytes(b"x" * 4096)
+        self.hold.clear()
+        began = time.monotonic()
+        self.store.settle("c.park")
+        self.assertLess(time.monotonic() - began, 0.5)
+        self.assertFalse(self.done.is_set())
+        self.hold.set()
+        self.assertTrue(self.done.wait(10.0))
+
+    def test_a_file_already_deleted_is_skipped(self):
+        self.store.settle("gone.park")
+        (self.store.slots / "c.park").write_bytes(b"x" * 4096)
+        self.store.settle("c.park")
+        self.assertTrue(self.done.wait(10.0))
+        self.assertEqual([call[0] for call in self.calls],
+                         ["fdatasync", "fadvise"])
+
+
 LONG = "You are a careful assistant. " * 400      # a client-sized system prompt
 
 
