@@ -4428,6 +4428,21 @@ class HandOff(unittest.TestCase):
         self.go(self.mover())
         self.assertEqual(self.pool.recent[0]["did"], "moved")
 
+    def test_the_cache_the_generator_holds_is_parked_before_the_restore(self):
+        """The restore writes over the generator's slot. Whatever another
+        conversation left there is copied out first, as it is before a read
+        lands on a backend. A generator that also reads keeps no copy after
+        its turns, so without this the next turn of that conversation read
+        its whole prompt again."""
+        self.pool.pins["b"] = pin("gpu", slot=0)
+        post = linked(self.pool, self.mover())
+        self.assertIs(self.go(post), self.gpu)
+        on_gpu = [(op, name) for op, be, *rest in post.calls if be == "gpu"
+                  for name in rest[1:2]]
+        self.assertEqual(on_gpu, [("save", "b.park"), ("restore", "a.park")])
+        self.assertEqual(self.pool.pins["b"]["parked"], "b.park")
+        self.assertIsNone(self.pool.pins["b"]["slot"])
+
 
 class WhatMustStayResident(unittest.TestCase):
     """The backend says what it mapped and what it reads lazily. The

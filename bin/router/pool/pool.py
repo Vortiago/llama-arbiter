@@ -1346,6 +1346,8 @@ class Pool:
                     with self.cv:
                         self.cv.wait(1.0)
 
+            # The restore writes over the slot, as a read landing here would.
+            self.ensure_parked(target, conv, remove)
             try:
                 self.link.restore(target, free, name)
             except Exception as err:
