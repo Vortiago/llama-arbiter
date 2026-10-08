@@ -222,8 +222,7 @@ class Turn:
                 pool.note_slot(conv, slot)
                 serving = pool.hand_off(conv, be, tokens,
                                         alive=client.alive,
-                                        migrate=not ask.plan,
-                                        path=ask.path)
+                                        migrate=not ask.plan)
                 if serving is None:
                     raise Gone("after its prompt was parked")
             if serving is be:

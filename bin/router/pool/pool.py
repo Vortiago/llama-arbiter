@@ -1,6 +1,6 @@
 """The slots, the pins, and everything a turn moves."""
 
-import queue, threading, time
+import math, queue, threading, time
 from collections import Counter, OrderedDict, deque
 from ..backends import by_place, generates, prefills
 from ..identity import copy_is_current, last_used, short_key, worth_keeping
@@ -13,7 +13,7 @@ from ..store.events import EventLog
 from ..store.files import adopt_files, opening_key, shelf_of, trim_openings
 from ..transport import Gone, Rejected
 from ..backend.link import Link
-from ..backend.poll import counters, slot_state, stats
+from ..backend.poll import counters, read_rate, slot_state, stats
 from .turn import Turn
 from .machine import Flow, History, Machine
 
@@ -105,8 +105,8 @@ class Pool:
         self.heads = {}
         self.waiting = 0          # requests with no free slot yet
         self.waiters = {}         # ticket -> the waiting request
-        # Turns read and parked, waiting for a generator slot.
-        self.to_generate = 0
+        # Turns read and parked, waiting for a slot on the backend named.
+        self.generate_waits = Counter()
         self.wait_seq = 0
         self.flow = Flow(self.tuning.flow_log)
         # The last few slot files written or read.
@@ -548,8 +548,17 @@ class Pool:
                       if other.get("node") == node)
         # Within a node a quiet instance beats a second slot on a busy one:
         # llama.cpp lets the first reading slot take the whole batch. Then
-        # the opposite of pref, which keeps the generating instances free.
-        return (on_node, reads(be), -be["pref"], be["busy"])
+        # the faster reader, as measured. One not measured yet goes first,
+        # or it never is. Between equals the better generator, so the turn
+        # needs no move.
+        rate = self._read_rate(be)
+        return (on_node, reads(be), -(math.inf if rate is None else rate),
+                be["pref"], be["busy"])
+
+    @staticmethod
+    def _read_rate(be):
+        """Prompt tokens a second over the backend's life, or None."""
+        return read_rate(be.get("counters") or {})
 
     def _turn_slots(self, be, skip=None):
         """The slots on this backend a turn owns. Held under the lock. `skip`
@@ -637,6 +646,7 @@ class Pool:
         `alive` says the client left. A pin holds for pin_patience."""
         patience = time.time() + self.tuning.pin_patience
         spill = False              # set once the pin is given up on
+        kept = set()               # free backends held back for generating
 
         while True:
             with self.cv:
@@ -647,9 +657,12 @@ class Pool:
 
                 if target:
                     if prefills(target, path) and self._usable(target, tokens):
-                        got = self._take(target, conv, tokens)
-                        if got:
-                            return got
+                        if self._owed(target, conv, tokens):
+                            kept.add(target["name"])
+                        else:
+                            got = self._take(target, conv, tokens)
+                            if got:
+                                return self._said_kept(conv, kept, got)
                     # A fifth of turns re-read everything: prefillers only.
                     if (not target["up"] or tokens > target["n_ctx"]
                             or not prefills(target, path)):
@@ -661,10 +674,15 @@ class Pool:
                 if not target:
                     free = [b for b in self.backends
                             if prefills(b, path) and self._usable(b, tokens)]
+                    owed = {b["name"] for b in free
+                            if self._owed(b, conv, tokens)}
+                    kept |= owed
                     for be in sorted(free, key=self._reading_rank):
+                        if be["name"] in owed:
+                            continue
                         got = self._take(be, conv, tokens)
                         if got:
-                            return got
+                            return self._said_kept(conv, kept, got)
 
                 # Nothing that could serve this is up. Waiting cannot help.
                 served_by = target is not None or any(
@@ -679,6 +697,90 @@ class Pool:
                     spill = True
 
                 self.cv.wait(1.0)
+
+    def _owed(self, be, conv, tokens):
+        """True when reading this turn here would keep another turn from
+        generating here. Held under the lock.
+
+        A read cannot be stopped once it starts, and while it runs the
+        backend generates for nobody. So a backend that turns move to takes
+        a read only when the read should end before the first of them needs
+        it: no turn waits to generate here, no turn whose cache is in a slot
+        here waits to come back, and the read ends before every read in
+        flight whose turn moves here, at the rates each reader has shown. A
+        read onto the conversation's own cache in a slot here is never held:
+        read anywhere else, it costs a copy out and a carry back."""
+        if not generates(be):
+            return False
+        record = self.pins.get(conv) if conv else None
+        if self._holds_here(record, be):
+            return False
+        if self.generate_waits[be["name"]]:
+            return True
+        for w in self.waiters.values():
+            other = self.pins.get(w["conv"]) if w["conv"] != conv else None
+            if self._holds_here(other, be) and not other.get("inflight"):
+                return True
+        # Only what is measured holds a read back. A guess either way could
+        # hold it for as long as the other read runs, and one read measures.
+        rate = self._read_rate(be)
+        if not rate:
+            return False
+        soonest = None
+        names = {b["name"]: b for b in self.backends}
+        for name, other in self.pins.items():
+            reader = names.get(other.get("backend"))
+            if (name == conv or not other.get("inflight") or reader is None
+                    or reader is be or not self._read_rate(reader)
+                    or self.generator(0, reader) is not be):
+                continue
+            left = self._read_left(reader, other)
+            if left is None:
+                continue                  # it generates where it was read
+            ends = left / self._read_rate(reader)
+            soonest = ends if soonest is None else min(soonest, ends)
+        if soonest is None:
+            return False
+        return self._left_to_read(record, be, tokens) / rate > soonest
+
+    @staticmethod
+    def _holds_here(record, be):
+        """True when this conversation's cache is in a slot on `be`."""
+        return (bool(record) and record.get("backend") == be["name"]
+                and record.get("slot") is not None)
+
+    def _left_to_read(self, record, be, tokens):
+        """About how many tokens a turn of this size reads on `be`: what came
+        after its cache, when its cache is here or on disk, else all of it."""
+        if record and (record.get("parked") or self._holds_here(record, be)):
+            return max(0, tokens - (record.get("tokens") or 0))
+        return tokens
+
+    @staticmethod
+    def _read_left(reader, record):
+        """What a turn in flight on `reader` still has to read, or None when
+        it is generating there. The slot's own count once a poll shows it
+        reading, the turn's estimate before that."""
+        slot = next((s for s in reader.get("slots_detail") or []
+                     if s.get("id") == record.get("using")), None)
+        phase = slot.get("phase") if slot else None
+        if phase == "generating":
+            return None
+        if phase == "reading":
+            return slot.get("prompt") or 0
+        return record.get("to_read", record.get("tokens") or 0)
+
+    def _said_kept(self, conv, kept, got):
+        """Say which free backends this turn was kept off, once it has a
+        reader. Held under the lock."""
+        kept.discard(got[0]["name"])
+        for name in sorted(kept):
+            self.events.write("keep", conv=short_key(conv) if conv else None,
+                              backend=name, reader=got[0]["name"])
+            print(f"[router] {short_key(conv) if conv else 'a turn'} reads on "
+                  f"{got[0]['name']}: {name} is kept free to generate",
+                  flush=True)
+        return got
 
     def _take(self, be, conv, tokens=0):
         """Claim a backend and a slot on it. Answers (backend, slot), or
@@ -700,6 +802,8 @@ class Pool:
                 # Named here because several readers index them directly.
                 record = self.pins[conv] = {"parked": None, "bytes": 0,
                                             "parking": False}
+            # Before the record moves: what it holds says how much is new.
+            record["to_read"] = self._left_to_read(record, be, tokens)
             record.update(
                 backend=be["name"],
                 # A slot id only means something on its own backend.
@@ -1271,7 +1375,7 @@ class Pool:
         return len(kept)
 
     def hand_off(self, conv, source, tokens, remove=None, alive=None,
-                 migrate=True, path=None):
+                 migrate=True):
         """Move a conversation to the backend it generates on.
 
         The prefiller is released before the wait to generate. The other
@@ -1297,7 +1401,7 @@ class Pool:
             return self._stay(source, "the handoff is turned off")
         if not migrate and generates(source):
             return self._stay(source, "this turn is not worth carrying")
-        target = self.generator(tokens, path)
+        target = self.generator(tokens, source)
         while target is None and not generates(source):
             # Nothing to carry this to, and the instance holding it does
             # not generate. Wait, holding a prefill slot.
@@ -1308,7 +1412,7 @@ class Pool:
                 raise Gone("while it waited for a slot to generate in")
             with self.cv:
                 self.cv.wait(1.0)
-            target = self.generator(tokens, path)
+            target = self.generator(tokens, source)
         if target is None or target is source:
             return self._stay(source, "nothing that generates can take it")
         with self.cv:
@@ -1325,12 +1429,14 @@ class Pool:
             source["busy"] -= 1            # the reader takes the next prompt
             self.flow.note(conv, "generate-queue")
             self.cv.notify_all()
+        queued = time.time()
 
         try:
             while True:
                 # None once the last generator went away.
                 free = None if target is None else self._wait_to_generate(target, alive)
                 if free is not None:
+                    waited = time.time() - queued
                     break
                 if alive is not None and not alive():
                     return None                # parked, and nobody to answer
@@ -1341,11 +1447,13 @@ class Pool:
                     return source
                 # `generate: false` is an operator's setting. The turn is parked
                 # on disk, the cheapest place to wait. Wait for a generator.
-                target = self.generator(tokens, path)
+                target = self.generator(tokens, source)
                 if target is None:
                     with self.cv:
                         self.cv.wait(1.0)
 
+            # The restore writes over the slot, as a read landing here would.
+            self.ensure_parked(target, conv, remove)
             try:
                 self.link.restore(target, free, name)
             except Exception as err:
@@ -1372,9 +1480,11 @@ class Pool:
                 self.flow.note(conv, "generate", target["name"], free)
                 self.cv.notify_all()
             self.events.write("migrate", conv=short_key(conv), src=source["name"],
-                         dst=target["name"], bytes=written)
+                         dst=target["name"], bytes=written,
+                         waited=round(waited, 1))
             print(f"[router] {short_key(conv)} read on {source['name']}, "
-                  f"generates on {target['name']} slot {free}", flush=True)
+                  f"generates on {target['name']} slot {free} after waiting "
+                  f"{waited:.0f}s for it", flush=True)
             return target
         finally:
             self.store.settle(name)        # read by the target, or by nobody
@@ -1388,16 +1498,21 @@ class Pool:
                   f"not to: {why}", flush=True)
         return source
 
-    def generator(self, tokens, path=None):
-        """The backend turns migrate to after their prompt is read, or None:
-        one that generates and does not prefill. Where every instance does
-        both, a turn generates where it read. None also when the configured
-        one is down, draining or too small."""
+    def generator(self, tokens, source):
+        """The backend a turn read on `source` moves to, or None: it stays.
+
+        The first in pref order that generates and can take the turn (up,
+        not draining, big enough), if it comes before `source`. pref is the
+        operator's order of where to generate, so a turn only moves forward
+        in it, and a peer of the same pref is no better place. Whether the
+        target also reads does not matter. A source that may not generate
+        takes any generator."""
         with self.cv:
             for be in sorted(self.backends, key=lambda b: b["pref"]):
-                if prefills(be, path) or not generates(be):
-                    continue
-                if be["up"] and not be.get("draining") and tokens <= be["n_ctx"]:
+                if generates(source) and be["pref"] >= source["pref"]:
+                    return None
+                if (generates(be) and be["up"] and not be.get("draining")
+                        and tokens <= be["n_ctx"]):
                     return be
             return None
 
@@ -1405,7 +1520,7 @@ class Pool:
         """Wait until the generator has a slot. Returns the slot id, or None
         when the generator cannot serve this turn or the client left."""
         with self.cv:
-            self.to_generate += 1
+            self.generate_waits[target["name"]] += 1
         try:
             while True:
                 with self.cv:
@@ -1421,7 +1536,7 @@ class Pool:
                     self.cv.wait(1.0)
         finally:
             with self.cv:
-                self.to_generate -= 1
+                self.generate_waits[target["name"]] -= 1
 
     def park_later(self, be, conv, ticket, remove=None, path=None):
         """Copy a cache out of a backend that cannot read it, on a worker: the
@@ -1773,7 +1888,7 @@ class Pool:
                                       for c in reversed(self.choices)],
                     "machine": machine,
                     "waiting": len(self.waiters),
-                    "waiting_to_generate": self.to_generate,
+                    "waiting_to_generate": sum(self.generate_waits.values()),
                     "waiting_detail": self._waiting_detail(now),
                     "pinned_conversations": len(self.pins),
                     "saved_prompts": len(self.openings),

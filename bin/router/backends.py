@@ -5,9 +5,9 @@ from pathlib import Path
 from .settings import handoff_on
 
 # A prefill is compute bound for tens of minutes. A generation is memory
-# bound for seconds. A `generate`-only instance is a generator: turns
-# migrate to it, `pref` lowest first. One slot per instance: a slot
-# reading a long prompt blocks every other slot on it.
+# bound for seconds. A turn moves forward in `pref` to the first instance
+# that generates: Pool.generator. One slot per instance: a slot reading a
+# long prompt blocks every other slot on it.
 DEFAULT_BACKENDS = [
     {"name": "solo", "url": "http://127.0.0.1:8080", "pref": 0,
      "prefill": True, "generate": True, "node": 0},
@@ -58,9 +58,8 @@ def read_backend_table(env=None):
 def prefills(be, path=None):
     """May a prompt sent to this path be read on this backend.
 
-    `prefill` is true, false, or the paths the backend reads for. A gpu that
-    reads only typed questions stays the generator for every other turn.
-    No path asks whether it reads anything at all."""
+    `prefill` is true, false, or the paths the backend reads for. No path
+    asks whether it reads anything at all."""
     said = be.get("prefill", True)
     if isinstance(said, list):
         return bool(said) if path is None else path in said

@@ -82,18 +82,30 @@
 # '
 #
 # The JSON has the same names plus what each instance may do: "prefill" and
-# "generate". "pref" orders the instances a turn would rather generate on.
-# Both on: read and answer in place. Prefill off: the generator that turns
-# migrate to. Generate off: read for the pool and hand every turn on. The
-# router refuses a table with nothing to prefill on, nothing to generate on,
-# or an instance that does neither.
+# "generate". "pref" orders the instances a turn would rather generate on,
+# lowest first. A turn read on one instance moves to the first instance in
+# that order that generates and can take it, if that one comes before the
+# reader; otherwise it is answered where it was read. Peers get the same pref:
+# a move between two equal instances costs a copy and buys nothing.
+# Prefill off: an instance that only answers. Generate off: read for the pool
+# and hand every turn on. The router refuses a table with nothing to prefill
+# on, nothing to generate on, or an instance that does neither.
 #
-# "prefill" can also list the paths an instance reads for. It is then the
-# generator for every other path. At least one instance must read every path.
-# koishi runs gpu0_0 with "prefill": ["/v1/systemone"]. "prefill": true made it
-# one reader among four: the router reads on it last, and a cpu reader that
-# generates keeps the turn, so chat generated on a cpu at 5-7 tok/s instead of
-# the gpu. It first went back
+# "prefill" can also list the paths an instance reads for. At least one
+# instance must read every path.
+# A prompt is read on the free reader with the highest measured prompt rate,
+# after the rule that keeps two reads off one socket. A reader that turns
+# move to reads only what it should finish before the first turn that needs
+# it to generate: none waiting to generate there, and every read in flight
+# whose turn moves there ends later. So a gpu that reads every path reads
+# short prompts and quiet-time long ones, and stays free for the rest.
+#
+# koishi runs gpu0_0 with "prefill": ["/v1/systemone"]. Before the rules
+# above, "prefill": true made it one reader among four: the router read on it
+# last, and a cpu reader kept the turn it read, so chat generated on a cpu at
+# 5-7 tok/s instead of the gpu. With them, the table to try is gpu0_0
+# "prefill": true, pref 0, and the three cpu readers at one shared pref 1.
+# It first went back
 # to false: the gpu read 120-token questions at 9.4 tokens/s, because each
 # batch copied the experts over PCIe. With GGML_OP_OFFLOAD_MIN_BATCH high
 # (bin/qwen-mtp.sh) it reads them at about 68, against 37 on a cpu socket.

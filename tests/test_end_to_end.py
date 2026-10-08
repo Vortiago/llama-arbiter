@@ -330,12 +330,12 @@ class RecallFires(EndToEnd):
     """A parked cache goes back on whichever backend ends up serving it."""
 
     def test_a_parked_cache_is_restored_onto_the_backend_that_serves_it(self):
-        pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 2)])
+        pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 1)])
         url = self.serve(pool)
 
         self.turn(url, "early")
-        # Nothing here generates anywhere but where it read: no backend in this
-        # pool is a generating one, so the cache ends where the prompt was read.
+        # Nothing here generates anywhere but where it read: the two are
+        # peers, so the cache ends where the prompt was read.
         home = pool.pins["early"]["backend"]
         mine = self.cpu if home == "cpu" else self.cpu2
         other = self.cpu2 if home == "cpu" else self.cpu
@@ -437,11 +437,12 @@ class DrainUnderLoad(EndToEnd):
     """A drain waits for work already running, then copies the caches out."""
 
     def test_a_drain_waits_parks_and_sends_new_work_to_the_other_backend(self):
-        pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 2)])
+        # Peers, so neither carries a turn to the other. Neither has read
+        # yet, so a prompt with no cache anywhere is read on the first in the
+        # table, cpu2. That is the backend with work on it to drain.
+        pool = self.pool([self.stub("cpu2", 1), self.stub("cpu", 1)])
         url = self.serve(pool)
 
-        # Reading takes pref backwards, so a prompt with no cache anywhere is
-        # read on cpu2. That is the backend with work on it to drain.
         self.cpu2.hold()
         self.start_turn(url, "inflight")
         self.assertTrue(wait_for(lambda: self.backend(pool, "cpu2")["busy"] == 1),
@@ -469,14 +470,14 @@ class DrainUnderLoad(EndToEnd):
         self.assertTrue((SANDBOX.store.slots / "inflight.park").exists())
 
     def test_resume_puts_the_backend_back_in_service(self):
-        pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 2)])
+        pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 1)])
         url = self.serve(pool)
         pool.drain("cpu", deadline=PATIENCE)
         self.turn(url, "while-drained")
         self.assertEqual(len(self.cpu2.answers), 1)
 
-        # Back in service means work can land there again. Reading takes pref
-        # backwards, so cpu2 goes out of service to leave only one answer.
+        # Back in service means work can land there again. cpu2 goes out of
+        # service to leave only one answer.
         self.assertTrue(pool.resume("cpu"))
         pool.drain("cpu2", deadline=PATIENCE)
         self.turn(url, "after-resume")

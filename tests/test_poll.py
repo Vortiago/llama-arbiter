@@ -53,6 +53,21 @@ class TheCountersAreTheBareOnes(unittest.TestCase):
         self.assertEqual(router.counters("a lots\nb 2\n"), {"b": 2.0})
 
 
+class HowFastABackendReads(unittest.TestCase):
+    """The lifetime prompt rate, from the bare counters. The router ranks
+    readers by it, so a reset of the dashboard's averages must not move it."""
+
+    def test_tokens_read_over_the_seconds_spent_reading(self):
+        self.assertEqual(router.read_rate(router.counters(METRICS)), 100.0)
+
+    def test_nothing_before_a_second_of_reading(self):
+        self.assertIsNone(router.read_rate({"prompt_tokens_total": 12,
+                                            "prompt_seconds_total": 0.5}))
+
+    def test_nothing_from_a_backend_that_has_not_answered(self):
+        self.assertIsNone(router.read_rate({}))
+
+
 class TheStatsAreWhatTheDashboardShows(unittest.TestCase):
     """The counters are lifetime totals. These are the figures a reader
     compares two backends with."""

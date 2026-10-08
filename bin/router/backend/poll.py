@@ -29,6 +29,15 @@ def counters(text):
     return value
 
 
+def read_rate(value):
+    """Tokens a second this backend has read prompts at over its life, from
+    the raw counters, or None before it has read for RATE_FLOOR seconds."""
+    seconds = value.get("prompt_seconds_total", 0)
+    if seconds < RATE_FLOOR:
+        return None
+    return value.get("prompt_tokens_total", 0) / seconds
+
+
 def stats(value):
     """What the dashboard shows, from counters taken since the last reset."""
     def rate(tokens, seconds):
