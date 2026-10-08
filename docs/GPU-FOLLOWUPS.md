@@ -102,6 +102,11 @@ ub 4. The gpu backend runs on both sockets (NODE=0,1, --numa distribute, 36
 threads, LLAMA_NUMA_MIRROR) and reads every path under the reader-speed
 router; cpu0_0 and cpu1_0 are the CPU readers, cpu1_1 is gone. First chat
 after the restart: read and generated on the gpu backend at 29.0 tok/s.
+Two router faults kept the gpu backend off /v1/systemone at first (37a1b49:
+the guard reserved it for typed turns that never move; 120efeb: its read rate
+came from 46 tokens of smoke tests). After both: the peer's 28-case subset
+took 5m56s at concurrency 3 (8m06s before the fixes); seconds a call:
+gpu0_0 27.3 (12 calls), cpu1_0 41.9, cpu0_0 44.5. No outcome moved.
 
 ### The release before (llama.cpp-rel3, 8 October 07:05)
 
