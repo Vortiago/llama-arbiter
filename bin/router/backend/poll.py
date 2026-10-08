@@ -7,6 +7,10 @@ reading and holds what carries between polls.
 """
 
 RATE_FLOOR = 1.0     # seconds. Under this a count is not a rate.
+# A read rate needs this many tokens too: per-request overhead dominates a
+# few short prompts, and a reader ranked by such a figure is never chosen to
+# read enough to be measured again.
+READ_TOKENS_FLOOR = 2048
 
 
 def per_second(tokens, seconds):
@@ -31,11 +35,13 @@ def counters(text):
 
 def read_rate(value):
     """Tokens a second this backend has read prompts at over its life, from
-    the raw counters, or None before it has read for RATE_FLOOR seconds."""
+    the raw counters, or None before it has read for RATE_FLOOR seconds and
+    READ_TOKENS_FLOOR tokens."""
     seconds = value.get("prompt_seconds_total", 0)
-    if seconds < RATE_FLOOR:
+    tokens = value.get("prompt_tokens_total", 0)
+    if seconds < RATE_FLOOR or tokens < READ_TOKENS_FLOOR:
         return None
-    return value.get("prompt_tokens_total", 0) / seconds
+    return tokens / seconds
 
 
 def stats(value):

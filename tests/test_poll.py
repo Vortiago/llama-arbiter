@@ -67,6 +67,14 @@ class HowFastABackendReads(unittest.TestCase):
     def test_nothing_from_a_backend_that_has_not_answered(self):
         self.assertIsNone(router.read_rate({}))
 
+    def test_nothing_from_a_few_short_prompts(self):
+        """Per-request overhead dominates a short prompt. koishi's gpu read
+        46 tokens of smoke tests in 1.5 s, 30 tokens/s, and ranked below the
+        cpus (35) it reads three times as fast as; never chosen, it never
+        read enough to be measured again."""
+        self.assertIsNone(router.read_rate({"prompt_tokens_total": 46,
+                                            "prompt_seconds_total": 1.5}))
+
 
 class TheStatsAreWhatTheDashboardShows(unittest.TestCase):
     """The counters are lifetime totals. These are the figures a reader
