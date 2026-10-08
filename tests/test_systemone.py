@@ -243,6 +243,36 @@ class SeveralQuestionsOneState(TypedCall):
                                f"{step['question']} read the state again")
 
 
+class TheSameCaseAskedAgain(TypedCall):
+    """A typed call's conversation is its rubric and its state, so a repeat of
+    the same case is the same conversation, and its copy saves the read.
+
+    The client never continues it, but it asks the same state again. On
+    koishi, 7 October 09:30 to 8 October 08:00: 278 of 440 typed-question
+    copies were recalled, and a recalled call kept a cpu1 backend 47 s against
+    94 s for a cold one. A park cost 1 s. The copy is kept on that evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self.ask(CHOICE, state="case one")
+        self.ask(CHOICE, state="case two")      # takes case one's only slot
+        self.reply = self.ask(CHOICE, state="case one")
+
+    def test_the_first_case_was_parked_before_the_second_took_its_slot(self):
+        self.assertEqual(len(self.solo.saves), 2,
+                         "a case was not copied out before the next one")
+
+    def test_the_repeat_restores_its_copy(self):
+        self.assertEqual(len(self.solo.saves), 2)
+        self.assertEqual(self.solo.restores, [self.solo.saves[0]],
+                         "the repeat did not come back from its copy")
+
+    def test_the_repeat_reads_none_of_its_state_again(self):
+        first, repeat = self.solo.probes[0], self.solo.probes[-1]
+        self.assertEqual(repeat["cached"], first["read"] + first["cached"],
+                         "the repeat read part of its state again")
+
+
 class ItStaysWhereItRead(EndToEnd):
     """A gpu that only generates, and a cpu that only reads.
 
