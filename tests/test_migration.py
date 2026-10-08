@@ -4596,6 +4596,173 @@ class TheFastestReaderReadsFirst(unittest.TestCase):
         self.assertEqual(pool.acquire("a", 1000)[0]["name"], "cpu")
 
 
+class Said:
+    """An event log that keeps what it was told, for a case to read."""
+
+    def __init__(self):
+        self.rows = []
+
+    def write(self, event, **fields):
+        self.rows.append(dict(fields, event=event))
+
+    def of(self, event):
+        return [row for row in self.rows if row["event"] == event]
+
+
+class AReadOnTheGeneratorEndsBeforeItIsNeeded(unittest.TestCase):
+    """The best generator reads too, but not into the time it owes.
+
+    A read cannot be stopped once it starts, and while it runs the gpu
+    generates for nobody. A turn read on a cpu that finds the gpu reading
+    waits for it, or the router would have to settle for 5-7 tokens/s on
+    the cpu. So the gpu takes a read only when the read should end before
+    the first turn that wants it to generate: none waits to generate there,
+    none whose cache is in its slot waits to come back, and the read ends
+    before every read in flight on a cpu whose turn moves to the gpu.
+
+    The router knows each of those: the rates, the queue, and how much is
+    left to read, from the slot's own count or the turn's estimate."""
+
+    def setUp(self):
+        self.said = Said()
+        self.pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": True, "generate": True, "node": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1, "prefill": True, "generate": True, "node": 1},
+             {"name": "cpu2", "url": "http://cpu2", "pref": 1, "prefill": True, "generate": True, "node": 1}],
+            events=self.said, watch=False)
+        self.gpu, self.cpu, self.cpu2 = self.pool.backends
+        for be in self.pool.backends:
+            be.update(up=True, slots=1, n_ctx=150000)
+        reads_at(self.gpu, 100)
+        reads_at(self.cpu, 50)
+        reads_at(self.cpu2, 50)
+
+    def reading_on(self, be, conv, left, phase="reading"):
+        """A turn in flight on `be`, with `left` tokens still to read."""
+        self.pool.pins[conv] = dict(pin(be["name"], slot=0, inflight=True),
+                                    using=0)
+        be["busy"] = 1
+        be["slots_detail"] = [{"id": 0, "busy": True, "phase": phase,
+                               "prompt": left}]
+
+    def reader(self, conv, tokens):
+        return self.pool.acquire(conv, tokens)[0]["name"]
+
+    def test_with_nothing_in_flight_a_long_read_takes_the_gpu(self):
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_a_long_read_goes_elsewhere_when_a_turn_wants_the_gpu_first(self):
+        """500 tokens left on a cpu is 10 s. 100,000 on the gpu is 1000 s."""
+        self.reading_on(self.cpu, "x", 500)
+        self.assertEqual(self.reader("new", 100000), "cpu2")
+
+    def test_a_short_read_still_takes_the_gpu(self):
+        """2,000 tokens on the gpu is 20 s, done before the cpu's 100 s."""
+        self.reading_on(self.cpu, "x", 5000)
+        self.assertEqual(self.reader("new", 2000), "gpu")
+
+    def test_no_read_while_a_turn_waits_to_generate_there(self):
+        self.pool.generate_waits["gpu"] = 1
+        self.assertNotEqual(self.reader("new", 10), "gpu")
+
+    def test_a_turn_whose_cache_is_in_the_slot_goes_first(self):
+        self.pool.pins["warm"] = pin("gpu", slot=0)
+        self.pool.begin_wait("warm", 1000)
+        self.assertNotEqual(self.reader("new", 10), "gpu")
+
+    def test_its_own_cache_in_the_slot_is_read_there_whatever_waits(self):
+        """Read elsewhere, it would cost a copy out and a carry back."""
+        self.pool.pins["a"] = pin("gpu", slot=0)
+        self.reading_on(self.cpu, "x", 10)
+        self.pool.generate_waits["gpu"] = 1
+        self.assertEqual(self.reader("a", 100000), "gpu")
+
+    def test_a_pin_to_the_gpu_without_its_cache_there_is_held_too(self):
+        """A stale copy or a lost slot makes a pinned turn read from
+        nothing, as long a read as any."""
+        self.pool.pins["a"] = pin("gpu", slot=None)
+        self.reading_on(self.cpu, "x", 500)
+        self.pool.tuning = replace(self.pool.tuning, pin_patience=0.0)
+        self.assertEqual(self.reader("a", 100000), "cpu2")
+
+    def test_a_turn_generating_where_it_was_read_wants_nothing(self):
+        self.reading_on(self.cpu, "x", 0, phase="generating")
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_a_read_whose_turn_moves_nowhere_wants_nothing(self):
+        """A peer of the gpu's pref keeps its turns, so the gpu owes it
+        nothing."""
+        self.gpu["pref"] = 1
+        self.reading_on(self.cpu, "x", 500)
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_a_turn_not_yet_reading_counts_by_its_estimate(self):
+        """Between the claim and the first poll that shows it reading, the
+        estimate is all there is. 1,000 tokens on a cpu is 20 s."""
+        self.pool._take(self.cpu, "x", tokens=1000)
+        self.assertEqual(self.reader("new", 100000), "cpu2")
+        self.assertEqual(self.reader("short", 1000), "gpu")
+
+    def test_only_what_is_left_to_read_counts(self):
+        """A copy on disk is restored, so only what came after it is read:
+        1,000 tokens, 10 s on the gpu, done before the cpu's 20 s."""
+        self.reading_on(self.cpu, "x", 1000)
+        self.pool.pins["back"] = pin("(before the restart)", slot=None,
+                                     parked="back.park", tokens=99000)
+        self.assertEqual(self.reader("back", 100000), "gpu")
+
+    def test_without_a_copy_the_whole_prompt_counts(self):
+        self.reading_on(self.cpu, "x", 1000)
+        self.pool.pins["back"] = pin("(before the restart)", slot=None,
+                                     tokens=99000)
+        self.assertEqual(self.reader("back", 100000), "cpu2")
+
+    def test_nothing_is_held_on_a_rate_not_measured_yet(self):
+        """Without a rate there is no telling which read ends first, and a
+        guess either way could hold a read back for as long as the other
+        one runs. One read measures it."""
+        self.reading_on(self.cpu, "x", 500)
+        del self.gpu["counters"]
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_nor_on_a_reader_elsewhere_not_measured_yet(self):
+        self.reading_on(self.cpu, "x", 500)
+        del self.cpu["counters"]
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_with_no_other_reader_free_it_waits_for_one(self):
+        self.reading_on(self.cpu, "x", 500)
+        self.reading_on(self.cpu2, "y", 500)
+        got = {}
+
+        def ask():
+            got["be"] = self.pool.acquire("new", 100000)[0]["name"]
+
+        threading.Thread(target=ask, daemon=True).start()
+        time.sleep(0.3)
+        self.assertNotIn("be", got, "it read on the gpu")
+        with self.pool.cv:
+            self.cpu["busy"] = 0
+            self.cpu["slots_detail"] = [{"id": 0, "busy": False, "phase": "idle"}]
+            self.pool.pins["x"]["inflight"] = False
+            self.pool.cv.notify_all()
+        for _ in range(30):
+            if "be" in got:
+                break
+            time.sleep(0.1)
+        self.assertEqual(got.get("be"), "cpu")
+
+    def test_it_says_when_it_kept_the_gpu_free(self):
+        self.reading_on(self.cpu, "x", 500)
+        self.reader("new", 100000)
+        self.assertEqual([(row["backend"], row["reader"])
+                          for row in self.said.of("keep")], [("gpu", "cpu2")])
+
+    def test_it_says_nothing_when_it_kept_nothing(self):
+        self.reader("new", 100000)
+        self.assertEqual(self.said.of("keep"), [])
+
+
 class SpreadReadsAcrossNodes(unittest.TestCase):
     """Two reads on one socket share its cores. On two sockets they do not.
 

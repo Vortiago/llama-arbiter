@@ -282,9 +282,9 @@ class ItStaysWhereItRead(EndToEnd):
 class AReaderForSomePathsOnly(EndToEnd):
     """`prefill` may name the paths a backend reads for.
 
-    The gpu reads no faster than a cpu socket, so it is worth more as the
-    generator of a chat turn. A typed question writes one token, so there
-    nothing is lost when the gpu reads it, and it is one more lane."""
+    A gpu that reads only typed questions is still where a chat turn read
+    on a cpu generates. A typed question writes one token, so it answers
+    where it was read."""
 
     def setUp(self):
         super().setUp()
@@ -293,8 +293,8 @@ class AReaderForSomePathsOnly(EndToEnd):
         self.url = self.serve(self.duo)
 
     def test_a_typed_question_reads_and_answers_there(self):
-        """Once the cpu is busy. A free cpu still comes first, which keeps
-        the gpu free to generate."""
+        """Here the cpu is busy reading a chat turn. Neither has a measured
+        rate, so nothing holds the gpu back for that turn."""
         self.cpu.hold()
         self.start_turn(self.url, "talker")
         self.assertTrue(wait_for(lambda: self.backend(self.duo, "cpu")["busy"] == 1),
