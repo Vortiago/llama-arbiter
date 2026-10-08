@@ -20,8 +20,8 @@
 # koishi builds the pin in a second worktree, llama.cpp-pin, so the old fork
 # kept running while it built: DIR=$PWD/llama.cpp-pin LLAMA_REF= CUDA=1
 # CMAKE_ARGS=-DCMAKE_CUDA_ARCHITECTURES=86 tools/get-llama.sh. Its
-# SERVER_MTP points at the newest release worktree (llama.cpp-rel3), built
-# the same way from the current patches/; the one before it (llama.cpp-rel2)
+# SERVER_MTP points at the newest release worktree (llama.cpp-rel4), built
+# the same way from the current patches/; the one before it (llama.cpp-rel3)
 # stays for a rollback and as the baseline of open experiments. llama.cpp-pin stays
 # at the commit the experiments in docs/GPU-FOLLOWUPS.md measure against.
 

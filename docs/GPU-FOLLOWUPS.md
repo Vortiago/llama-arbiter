@@ -93,7 +93,17 @@ the large weights, near the A4000's 448 GB/s; the small-K hyper-connection
 GET_ROWS 2.0%, the indexer 0.3%. The kernels Strata tuned are a small share
 here at short context.
 
-### The release in service (llama.cpp-rel3, 8 October 07:05)
+### The release in service (llama.cpp-rel4, 8 October 15:15)
+
+Patches through core/0039: rel3 plus the Gumbel-coupled drafts (0034-0035),
+re-reserve only when the backend sampling graph changes (0036-0038) and each
+socket reading its own copy of the experts (0039). PPL identical to rel3 at
+ub 4. The gpu backend runs on both sockets (NODE=0,1, --numa distribute, 36
+threads, LLAMA_NUMA_MIRROR) and reads every path under the reader-speed
+router; cpu0_0 and cpu1_0 are the CPU readers, cpu1_1 is gone. First chat
+after the restart: read and generated on the gpu backend at 29.0 tok/s.
+
+### The release before (llama.cpp-rel3, 8 October 07:05)
 
 Patches through core/0033. Against llama.cpp-live, profiler, 2 rounds: GPU
 verify step 112.2 to 103.0 ms (-8%), CPU verify step 300.6 to 254.9 ms (-15%),
