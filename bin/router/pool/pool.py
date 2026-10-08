@@ -1271,7 +1271,7 @@ class Pool:
         return len(kept)
 
     def hand_off(self, conv, source, tokens, remove=None, alive=None,
-                 migrate=True, path=None):
+                 migrate=True):
         """Move a conversation to the backend it generates on.
 
         The prefiller is released before the wait to generate. The other
@@ -1297,7 +1297,7 @@ class Pool:
             return self._stay(source, "the handoff is turned off")
         if not migrate and generates(source):
             return self._stay(source, "this turn is not worth carrying")
-        target = self.generator(tokens, path)
+        target = self.generator(tokens, source)
         while target is None and not generates(source):
             # Nothing to carry this to, and the instance holding it does
             # not generate. Wait, holding a prefill slot.
@@ -1308,7 +1308,7 @@ class Pool:
                 raise Gone("while it waited for a slot to generate in")
             with self.cv:
                 self.cv.wait(1.0)
-            target = self.generator(tokens, path)
+            target = self.generator(tokens, source)
         if target is None or target is source:
             return self._stay(source, "nothing that generates can take it")
         with self.cv:
@@ -1341,7 +1341,7 @@ class Pool:
                     return source
                 # `generate: false` is an operator's setting. The turn is parked
                 # on disk, the cheapest place to wait. Wait for a generator.
-                target = self.generator(tokens, path)
+                target = self.generator(tokens, source)
                 if target is None:
                     with self.cv:
                         self.cv.wait(1.0)
@@ -1390,16 +1390,21 @@ class Pool:
                   f"not to: {why}", flush=True)
         return source
 
-    def generator(self, tokens, path=None):
-        """The backend turns migrate to after their prompt is read, or None:
-        one that generates and does not prefill. Where every instance does
-        both, a turn generates where it read. None also when the configured
-        one is down, draining or too small."""
+    def generator(self, tokens, source):
+        """The backend a turn read on `source` moves to, or None: it stays.
+
+        The first in pref order that generates and can take the turn (up,
+        not draining, big enough), if it comes before `source`. pref is the
+        operator's order of where to generate, so a turn only moves forward
+        in it, and a peer of the same pref is no better place. Whether the
+        target also reads does not matter. A source that may not generate
+        takes any generator."""
         with self.cv:
             for be in sorted(self.backends, key=lambda b: b["pref"]):
-                if prefills(be, path) or not generates(be):
-                    continue
-                if be["up"] and not be.get("draining") and tokens <= be["n_ctx"]:
+                if generates(source) and be["pref"] >= source["pref"]:
+                    return None
+                if (generates(be) and be["up"] and not be.get("draining")
+                        and tokens <= be["n_ctx"]):
                     return be
             return None
 

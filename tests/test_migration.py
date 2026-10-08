@@ -3878,17 +3878,20 @@ class WhatIsLeftToRead(unittest.TestCase):
 
 
 class WhereToGenerate(unittest.TestCase):
-    """Only the gpu generates, and a turn waits for it.
+    """A turn moves to the best place to generate that will take it.
 
-    It decodes about five times faster than a socket of cpu, and a generation
-    started on a cpu holds a slot that could be prefilling for the whole of
-    it: minutes of somebody else's read spent to save seconds on this turn.
-    So there is nothing to choose between. The turn goes to the gpu, and if
-    the gpu is busy it queues for it rather than settle for a cpu.
+    `pref` is the operator's order of where to generate. A turn read on one
+    backend moves to the first generator in that order, if it comes before
+    the reader: the gpu decodes about five times faster than a socket of cpu,
+    and a generation started on a cpu holds a slot that could be reading.
+    Busy is a queue to join, not a reason to settle for a cpu.
 
-    The one answer that is not the gpu is no answer at all: the gpu down,
-    draining, or too small for this prompt. Then the turn generates where its
-    prompt was read, because the alternative is not answering."""
+    Whether the generator also reads does not matter. A gpu that reads every
+    path is still where a turn read on a cpu should generate.
+
+    The answers that are not the gpu are no answer at all: the gpu down,
+    draining or too small for this prompt, or the turn already on it. Then
+    the turn generates where its prompt was read."""
 
     def setUp(self):
         self.pool = make_pool(
@@ -3905,47 +3908,74 @@ class WhereToGenerate(unittest.TestCase):
         be["busy"] = be["slots"]
 
     def test_the_gpu(self):
-        self.assertEqual(self.pool.generator(1000)["name"], "gpu")
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "gpu")
 
     def test_the_gpu_even_when_every_cpu_is_idle_and_it_is_not(self):
         """Busy is a queue to join, not a reason to go elsewhere."""
         self.fill(self.gpu)
-        self.assertEqual(self.pool.generator(1000)["name"], "gpu")
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "gpu")
 
     def test_never_a_cpu(self):
         for be in self.pool.backends:
             self.fill(be)
-        self.assertEqual(self.pool.generator(1000)["name"], "gpu")
+        self.assertEqual(self.pool.generator(1000, self.cpu2)["name"], "gpu")
 
     def test_nothing_when_the_gpu_is_down(self):
         self.gpu["up"] = False
-        self.assertIsNone(self.pool.generator(1000))
+        self.assertIsNone(self.pool.generator(1000, self.cpu))
 
     def test_nothing_when_the_gpu_is_draining(self):
         self.gpu["draining"] = True
-        self.assertIsNone(self.pool.generator(1000))
+        self.assertIsNone(self.pool.generator(1000, self.cpu))
 
     def test_nothing_when_the_prompt_outgrew_the_gpu(self):
         self.gpu["n_ctx"] = 4096
-        self.assertIsNone(self.pool.generator(100000))
+        self.assertIsNone(self.pool.generator(100000, self.cpu))
 
-    def test_a_migration_target_generates_and_does_not_prefill(self):
-        """Both halves, not one derived from the other: an instance that does
-        both is not worth carrying a turn to."""
-        self.assertFalse(self.gpu["prefill"])
-        self.assertTrue(self.gpu["generate"])
-        self.assertEqual(self.pool.generator(1000)["name"], "gpu")
-
-    def test_nothing_when_the_only_generator_also_prefills(self):
-        """A turn already sitting in a slot that can generate stays there."""
+    def test_a_generator_that_also_reads_is_still_the_place_to_generate(self):
+        """The rule that kept chat on a cpu at 5-7 tokens/s: an instance
+        that read as well was never a place to carry a turn to."""
         self.gpu["prefill"] = True
-        self.assertIsNone(self.pool.generator(1000))
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "gpu")
+
+    def test_a_generator_that_reads_some_paths_is_the_place_for_all(self):
+        self.gpu["prefill"] = ["/v1/systemone"]
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "gpu")
+
+    def test_nothing_when_the_turn_was_read_on_the_gpu(self):
+        """It is already in the best place: no carry to make."""
+        self.gpu["prefill"] = True
+        self.assertIsNone(self.pool.generator(1000, self.gpu))
+
+    def test_the_next_in_order_when_the_gpu_cannot_take_it(self):
+        """pref is the order. With the gpu down, the next one in it."""
+        self.gpu["up"] = False
+        self.assertEqual(self.pool.generator(1000, self.cpu2)["name"], "cpu")
+
+    def test_nothing_from_a_peer_of_the_same_pref(self):
+        """Equal pref says neither is a better place to generate, so a carry
+        between them buys nothing. Give peers the same pref."""
+        self.gpu["up"] = False
+        for be in (self.cpu, self.cpu0, self.cpu2):
+            be["pref"] = 1
+        self.assertIsNone(self.pool.generator(1000, self.cpu2))
+
+    def test_nothing_after_the_reader_in_the_order(self):
+        """A generator the operator ranked below the reader is no better
+        place to generate, even one that does nothing else."""
+        self.gpu["pref"] = 5
+        self.assertIsNone(self.pool.generator(1000, self.cpu))
+
+    def test_any_generator_for_a_reader_that_may_not_generate(self):
+        self.cpu["generate"] = False
+        self.gpu["pref"] = 5
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "cpu0")
 
     def test_nothing_when_the_candidate_does_not_generate(self):
         """prefill off and generate off is refused at startup, but a backend
         that only prefills is not a place to carry a turn to."""
         self.gpu["generate"] = False
-        self.assertIsNone(self.pool.generator(1000))
+        self.assertIsNone(self.pool.generator(1000, self.cpu))
 
 
 class AnInstanceThatDoesNotGenerate(unittest.TestCase):
@@ -4427,6 +4457,20 @@ class HandOff(unittest.TestCase):
     def test_it_shows_up_in_the_dashboard_feed(self):
         self.go(self.mover())
         self.assertEqual(self.pool.recent[0]["did"], "moved")
+
+    def test_a_generator_that_also_reads_takes_the_turn(self):
+        """Read on a cpu, generated on the gpu, though the gpu reads too."""
+        self.gpu["prefill"] = True
+        self.assertIs(self.go(self.mover()), self.gpu)
+        self.assertEqual(self.pool.pins["a"]["backend"], "gpu")
+
+    def test_a_turn_read_on_the_generator_stays_there(self):
+        self.gpu["prefill"] = True
+        self.pool.pins["a"] = pin("gpu", slot=0, inflight=True)
+        self.gpu["busy"], self.cpu["busy"] = 1, 0
+        post = linked(self.pool, self.mover())
+        self.assertIs(self.pool.hand_off("a", self.gpu, 1000), self.gpu)
+        self.assertEqual(post.calls, [])
 
     def test_the_cache_the_generator_holds_is_parked_before_the_restore(self):
         """The restore writes over the generator's slot. Whatever another

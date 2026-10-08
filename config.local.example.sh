@@ -82,14 +82,17 @@
 # '
 #
 # The JSON has the same names plus what each instance may do: "prefill" and
-# "generate". "pref" orders the instances a turn would rather generate on.
-# Both on: read and answer in place. Prefill off: the generator that turns
-# migrate to. Generate off: read for the pool and hand every turn on. The
-# router refuses a table with nothing to prefill on, nothing to generate on,
-# or an instance that does neither.
+# "generate". "pref" orders the instances a turn would rather generate on,
+# lowest first. A turn read on one instance moves to the first instance in
+# that order that generates and can take it, if that one comes before the
+# reader; otherwise it is answered where it was read. Peers get the same pref:
+# a move between two equal instances costs a copy and buys nothing.
+# Prefill off: an instance that only answers. Generate off: read for the pool
+# and hand every turn on. The router refuses a table with nothing to prefill
+# on, nothing to generate on, or an instance that does neither.
 #
-# "prefill" can also list the paths an instance reads for. It is then the
-# generator for every other path. At least one instance must read every path.
+# "prefill" can also list the paths an instance reads for. At least one
+# instance must read every path.
 # koishi runs gpu0_0 with "prefill": ["/v1/systemone"]. "prefill": true made it
 # one reader among four: the router reads on it last, and a cpu reader that
 # generates keeps the turn, so chat generated on a cpu at 5-7 tok/s instead of
