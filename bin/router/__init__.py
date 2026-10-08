@@ -31,8 +31,8 @@ from .backends import (DEFAULT_BACKENDS, by_place, generates, prefills,
 from .identity import (SHELF_MARKS, client_kind, conversation_id,
                        copy_is_current, file_safe, last_used, prompt_key,
                        session_key, short_key, worth_keeping)
-from .backend.poll import (RATE_FLOOR, counters, per_second, slot_state,
-                          stats)
+from .backend.poll import (RATE_FLOOR, counters, per_second, read_rate,
+                          slot_state, stats)
 from .pool.machine import (GPU_CMD, Flow, History, Machine,
                            cpu_times, gpu_query, node_busy, node_meminfo,
                            parse_cpulist, read_nodes, resident_bytes)

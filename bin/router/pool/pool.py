@@ -1,6 +1,6 @@
 """The slots, the pins, and everything a turn moves."""
 
-import queue, threading, time
+import math, queue, threading, time
 from collections import Counter, OrderedDict, deque
 from ..backends import by_place, generates, prefills
 from ..identity import copy_is_current, last_used, short_key, worth_keeping
@@ -13,7 +13,7 @@ from ..store.events import EventLog
 from ..store.files import adopt_files, opening_key, shelf_of, trim_openings
 from ..transport import Gone, Rejected
 from ..backend.link import Link
-from ..backend.poll import counters, slot_state, stats
+from ..backend.poll import counters, read_rate, slot_state, stats
 from .turn import Turn
 from .machine import Flow, History, Machine
 
@@ -548,8 +548,17 @@ class Pool:
                       if other.get("node") == node)
         # Within a node a quiet instance beats a second slot on a busy one:
         # llama.cpp lets the first reading slot take the whole batch. Then
-        # the opposite of pref, which keeps the generating instances free.
-        return (on_node, reads(be), -be["pref"], be["busy"])
+        # the faster reader, as measured. One not measured yet goes first,
+        # or it never is. Between equals the better generator, so the turn
+        # needs no move.
+        rate = self._read_rate(be)
+        return (on_node, reads(be), -(math.inf if rate is None else rate),
+                be["pref"], be["busy"])
+
+    @staticmethod
+    def _read_rate(be):
+        """Prompt tokens a second over the backend's life, or None."""
+        return read_rate(be.get("counters") or {})
 
     def _turn_slots(self, be, skip=None):
         """The slots on this backend a turn owns. Held under the lock. `skip`

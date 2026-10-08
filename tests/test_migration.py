@@ -3123,10 +3123,10 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
         self.assertNotEqual(self.pool.acquire("a", 1000)[0]["name"], "gpu")
 
     def test_it_fills_the_reading_backends_in_order(self):
-        """Backwards through pref, so the best place to generate is read on
-        last and stays free to generate."""
-        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu2")
-        self.assertEqual(self.pool.acquire("b", 1000)[0]["name"], "cpu")
+        """Neither is measured yet, so the better generator reads first and
+        the next prompt goes to the other."""
+        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu")
+        self.assertEqual(self.pool.acquire("b", 1000)[0]["name"], "cpu2")
 
     def test_a_conversation_living_on_the_gpu_still_reads_elsewhere(self):
         """A later turn is not a few tokens. It can carry a whole file, and
@@ -4527,6 +4527,75 @@ class WhatMustStayResident(unittest.TestCase):
         self.assertEqual(router.resident_bytes({}), 0)
 
 
+def reads_at(be, rate):
+    """Give a backend a lifetime prompt rate, as its /metrics would."""
+    be["counters"] = {"prompt_tokens_total": rate * 100.0,
+                      "prompt_seconds_total": 100.0}
+
+
+class TheFastestReaderReadsFirst(unittest.TestCase):
+    """A prompt goes to the free reader that reads fastest, as measured.
+
+    pref says where to generate, not where to read. Read backwards through
+    pref, the best generator was read on last, so a gpu that reads two to
+    three times faster than a cpu socket read nothing while a cpu was free.
+    The measure is the backend's own lifetime prompt rate. A reader not yet
+    measured goes first, or it is never measured. Between equal rates the
+    better generator reads: then the turn needs no move."""
+
+    def setUp(self):
+        self.pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": True, "generate": True, "node": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1, "prefill": True, "generate": True, "node": 1}],
+            watch=False)
+        self.gpu, self.cpu = self.pool.backends
+        for be in self.pool.backends:
+            be.update(up=True, slots=1, n_ctx=150000)
+
+    def first(self):
+        return self.pool.acquire("a", 1000)[0]["name"]
+
+    def test_the_faster_reader(self):
+        reads_at(self.gpu, 100)
+        reads_at(self.cpu, 45)
+        self.assertEqual(self.first(), "gpu")
+
+    def test_whatever_pref_says(self):
+        reads_at(self.gpu, 30)
+        reads_at(self.cpu, 45)
+        self.assertEqual(self.first(), "cpu")
+
+    def test_one_not_yet_measured_reads_first(self):
+        reads_at(self.cpu, 45)
+        self.assertEqual(self.first(), "gpu")
+
+    def test_one_not_yet_measured_reads_first_whatever_its_pref(self):
+        reads_at(self.gpu, 100)
+        self.assertEqual(self.first(), "cpu")
+
+    def test_between_equal_rates_the_better_generator(self):
+        reads_at(self.gpu, 45)
+        reads_at(self.cpu, 45)
+        self.assertEqual(self.first(), "gpu")
+
+    def test_a_busy_node_still_counts_before_speed(self):
+        """Two reads on one socket halve each other, and the gpu reads with
+        its socket's cores: its experts are in RAM."""
+        pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0, "node": 0},
+             {"name": "cpu0", "url": "http://cpu0", "pref": 1, "node": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1, "node": 1}],
+            watch=False)
+        gpu, cpu0, cpu = pool.backends
+        for be in pool.backends:
+            be.update(up=True, slots=1, n_ctx=150000)
+        cpu0.update(busy=1, slots_detail=[{"id": 0, "busy": True,
+                                           "phase": "reading"}])
+        reads_at(gpu, 100)
+        reads_at(cpu, 45)
+        self.assertEqual(pool.acquire("a", 1000)[0]["name"], "cpu")
+
+
 class SpreadReadsAcrossNodes(unittest.TestCase):
     """Two reads on one socket share its cores. On two sockets they do not.
 
@@ -4552,17 +4621,12 @@ class SpreadReadsAcrossNodes(unittest.TestCase):
                                "phase": "reading" if n < how_many else "idle"}
                               for n in range(be["slots"])]
 
-    def test_reading_takes_the_opposite_order_to_generating(self):
-        """pref says where to generate. A prompt goes to the last of those, so
-        the instances kept for generating stay free to generate."""
-        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu2")
-
     def test_the_second_read_crosses_to_the_other_node(self):
         """Not the other slot on node 1, which would share its cores."""
         self.reading(self.cpu2, 1)
         self.assertEqual(self.pool.acquire("b", 1000)[0]["name"], "cpu0")
 
-    def test_the_generating_instance_is_read_on_last(self):
+    def test_a_quiet_instance_beats_a_second_slot_on_a_node_as_busy(self):
         self.reading(self.cpu2, 1)
         self.reading(self.cpu0, 1)
         self.assertEqual(self.pool.acquire("c", 1000)[0]["name"], "cpu")
@@ -4584,7 +4648,7 @@ class SpreadReadsAcrossNodes(unittest.TestCase):
         turn while cpu generates, and loses it the moment cpu reads."""
         self.cpu["slots_detail"] = [{"id": 0, "busy": True, "phase": "generating"},
                                     {"id": 1, "busy": False, "phase": "idle"}]
-        self.assertEqual(self.pool.acquire("e", 1000)[0]["name"], "cpu2")
+        self.assertEqual(self.pool.acquire("e", 1000)[0]["node"], 1)
         self.reading(self.cpu, 1)
         self.assertEqual(self.pool.acquire("f", 1000)[0]["name"], "cpu0")
 
