@@ -4676,6 +4676,14 @@ class AReadOnTheGeneratorEndsBeforeItIsNeeded(unittest.TestCase):
         self.reading_on(self.cpu, "x", 500)
         self.assertEqual(self.reader("new", 100000), "cpu2")
 
+    def test_a_turn_that_answers_where_it_reads_holds_nothing_back(self):
+        """A typed /v1/systemone turn answers on the backend that read it, so
+        it never needs the gpu to generate. Counted as one that does, it kept
+        the gpu idle while typed calls queued for the cpus."""
+        self.reading_on(self.cpu, "x", 500)
+        self.pool.note_stage("x", "prefill", "cpu", 0, "typed", stays=True)
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
     def test_a_short_read_still_takes_the_gpu(self):
         """2,000 tokens on the gpu is 20 s, done before the cpu's 100 s."""
         self.reading_on(self.cpu, "x", 5000)

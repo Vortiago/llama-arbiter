@@ -195,7 +195,10 @@ class Turn:
         # has no deadline, so a claim left behind stops the conversation.
         try:
             warm = bool(conv) and pool.holds_slot(conv)
-            pool.note_stage(conv, "prefill", be["name"], slot, work)
+            # A typed turn answers where it is read: hand_off is not asked to
+            # move it, so nothing waits for a generator on its behalf.
+            pool.note_stage(conv, "prefill", be["name"], slot, work,
+                            stays=bool(ask.plan))
             pool.ensure_parked(be, conv)
             pool.take_slot(be, slot, conv)
             if pool.forget_stale_park(conv, cuts):

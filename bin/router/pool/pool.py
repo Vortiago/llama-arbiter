@@ -228,10 +228,15 @@ class Pool:
                                 "backend": be["name"], "slot": slot,
                                 "bytes": size})
 
-    def note_stage(self, conv, stage, backend=None, slot=None, kind=None):
-        """Move a turn along its stages, for the flow dashboard."""
+    def note_stage(self, conv, stage, backend=None, slot=None, kind=None,
+                   stays=None):
+        """Move a turn along its stages, for the flow dashboard. `stays` says
+        the turn answers where it is read and never moves to a generator."""
         with self.cv:
             self.flow.note(conv, stage, backend, slot, kind)
+            record = self.pins.get(conv) if conv else None
+            if record is not None and stays is not None:
+                record["stays"] = stays
 
     def begin_wait(self, conv, tokens, images=0, image_tokens_=0):
         """Count a request as waiting until end_wait. Returns its ticket."""
@@ -730,7 +735,8 @@ class Pool:
         names = {b["name"]: b for b in self.backends}
         for name, other in self.pins.items():
             reader = names.get(other.get("backend"))
-            if (name == conv or not other.get("inflight") or reader is None
+            if (name == conv or not other.get("inflight") or other.get("stays")
+                    or reader is None
                     or reader is be or not self._read_rate(reader)
                     or self.generator(0, reader) is not be):
                 continue
