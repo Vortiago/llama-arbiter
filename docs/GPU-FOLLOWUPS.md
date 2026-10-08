@@ -55,6 +55,7 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
 | small GPU kernels of a verify step (agent gpusmall, core/0026-0030) | GPU run, 3 rounds, node 1 idle; again with node 1 busy | verify 111.9 / 111.1 / 110.9 ms; card kernels 23.26 ms a step (3628 kernels) | verify 108.7 / 109.3 / 108.2 ms; 20.92 ms (3074 kernels) | generate about +2.4%, exact (bit-identical 4-token logits). With node 1 busy: faster in every pair by 0.9-1.7 ms. Ready to deploy |
 | spin barrier inside a graph, and a fused small-batch MoE op (agent moebarrier, `exp/moebarrier` c23cd8d77, 6635eacfc, 2efebd55a) | CPU and GPU runs, 3 rounds, one instance on node 0 | CPU: verify 312.9 / 309.6 / 310.2 ms, prompt 19.8-20.6; GPU: verify 116.0-116.7 | spin: CPU verify 270.7 / 271.9 / 269.1 (-13%), prompt 19.6-19.8; GPU 114.6-115.0. Spin + fused: CPU 268.5-271.5, GPU 113.5-114.1 | OMP_WAIT_POLICY=PASSIVE made every ggml_barrier sleep in the kernel: 34% of a CPU verify step's thread time was barrier wait. Exact (PPL identical at ub 512 and 4). With the fused op and 128/256-row blocks (2efebd55a): CPU verify 260.5-262.1 ms (-15%), GPU 109.9-110.7 (-6%). Two busy instances on node 0: 365-370 -> 327-334 ms each. Ready to deploy as core/0031-0033 |
 | adaptive MTP draft length 1-5 (H4, agent adaptdepth, `exp/adaptdepth` c620c122d) | test server in the gpu backend's layout, 8 prompts x temperature 0 and 1.0, 3 rounds, quiet box | pooled 22.38 / 22.36 / 22.54 tok/s | 22.51 / 22.56 / 22.57 | rejected: +0.1 to +0.9%, within the spread. It wins on json, sql, code and loses as much on lists and reasoning; each change of length costs a graph rebuild. Greedy text depends on the verify width, so no draft-length change keeps greedy output byte-identical |
+| CPU expert phase from the GPU stream (R5, agent doorbell, `exp/doorbell` b71b6e369 single-thread gate; 138794077 host function) | GPU run, 3 rounds; test server, 3 rounds (base always first) | verify 113.5 / 112.1 ms (r2, r3); server 17.61 / 16.84 tok/s | gate: 112.1 / 111.9 ms; server 18.75 / 18.78. Host function: 116-118 ms | the launch gap per layer falls from 115 to 7.5 us, exact, but the profiler gain is within the spread; the server gain (+6 to +11%) needs a rerun with the order swapped. The host function was slower (the CPU split runs slower on CUDA's callback thread). Unresolved |
 | N1 expert cache, #29887, 1500 MiB | GPU run, ctx 150000, 3 prompts x 2 rounds | 14.5-14.8 / 18.9-20.2 / 16.9-18.7 tok/s | 1.8-1.9 / 2.1 / 2.0 tok/s | rejected: 0.00% hits on this card |
 | `--spec-draft-p-min 0.5` (H3) | gpu backend, temperature 1.0, 2 rounds | see `--backend-sampling` baseline | 12.9-13.4 / 17.3-17.6 / 15.3-16.3 tok/s | rejected: -2 to -5% |
 | threads 14 / 16 / 17 / 18 (`-t` = `-tb`) | CPU run and GPU run, node 0 quiet, two passes in reversed order | 18: GPU prompt 8.41, 8.37 ms/token; CPU prompt 20.27, 19.61 | GPU prompt 17: 8.69, 8.72; 16: 9.16, 9.02. CPU prompt 17: 20.25, 20.40; 14: 24.09, 23.51 | keep 18. Verify: no count beats the spread (up to 21 ms CPU, 4 ms GPU). A 4-token verify runs on the `-tb` pool, so `-t` alone changes nothing there |
@@ -86,6 +87,17 @@ the large weights, near the A4000's 448 GB/s; the small-K hyper-connection
 (665 calls), the F32 router matmul 3.7% (16 blocks), GATED_DELTA_NET 3.1%,
 GET_ROWS 2.0%, the indexer 0.3%. The kernels Strata tuned are a small share
 here at short context.
+
+### The release in service (llama.cpp-rel2, 8 October 05:58)
+
+Patches through core/0033. Against llama.cpp-live, profiler, 2 rounds: GPU
+verify step 112.2 to 103.0 ms (-8%), CPU verify step 300.6 to 254.9 ms (-15%),
+prompts the same; PPL identical at ub 4 and 512. Generating directly on the
+gpu backend, warm: 27.7-30.7 tok/s against 24.9-27.1. A chat turn handed off
+from a node-1 reader to the gpu backend generates at about 9 tok/s (about 360
+ms a step) on both releases: under investigation. A gpu backend with
+"prefill": true lost chat generation to the cpu readers; it reads
+/v1/systemone only.
 
 ### Facts about this box
 
