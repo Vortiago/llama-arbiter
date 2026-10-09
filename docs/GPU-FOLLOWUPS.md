@@ -110,20 +110,26 @@ gpu0_0 27.3 (12 calls), cpu1_0 41.9, cpu0_0 44.5. No outcome moved.
 
 ### The release after (llama.cpp-rel5, in the tree, 8 October 21:48)
 
-Patches through core/0046: rel4 plus the three candidates measured below and
-their tests. core/0040-0042 key a CUDA graph by the first and the last node's
-shape and keep the previous graph results when the scheduler re-reserves
-(agent graphwarm, about 30 ms a request); core/0043-0044 queue a CPU split
-behind the GPU split's host gate (agent doorbell2, +1.0% generate on rel3);
-core/0045-0046 split a prefill ubatch's experts between the card and the CPU
-(agent prefillsplit, +37% read on the gpu backend). Built as `llama.cpp-rel5`
-(971a0d3d1) and pointed at by `SERVER_MTP`; `test-moe-split` and
-`test-backend-sched-host` pass. `start-all.sh` warms the gpu backend once (a
-~130-token prefill, then the slot is erased), so the one-time expert pin is
-paid at startup instead of by the first turn; `WARM_MOE_SPLIT=0` skips it. Not
-measured together yet: the prefill split is inert without `LLAMA_MOE_SPLIT=32`
-and `GGML_CUDA_REGISTER_HOST=1`, and the doorbell host gate still wants a soak
-test. The release is not declared until the joint A/B runs.
+Patches through core/0047: rel4 plus the three candidates measured below, their
+tests, and a radix-select for the QSA indexer's wide top-k. core/0040-0042 key a
+CUDA graph by the first and the last node's shape and keep the previous graph
+results when the scheduler re-reserves (agent graphwarm, about 30 ms a request);
+core/0043-0044 queue a CPU split behind the GPU split's host gate (agent
+doorbell2, +1.0% generate on rel3); core/0045-0046 split a prefill ubatch's
+experts between the card and the CPU (agent prefillsplit, +37% read on the gpu
+backend); core/0047 radix-selects a wide top_k when CUB DeviceTopK is
+unavailable (CCCL before 3.4.3, which is koishi's 3.3.4) - the QSA indexer's
+top_k over pooled keys, wide at long context. test-backend-ops perf -o TOP_K,
+us/run against the argsort fallback: median 1.91x over 66 shapes with
+ncols >= 8192 (ncols 131072 up to 10x), below the threshold unchanged;
+correctness 525/525. Built as `llama.cpp-rel5` (ad2bd118b) and pointed at by
+`SERVER_MTP`; `test-moe-split` and `test-backend-sched-host` pass. `start-all.sh`
+warms the gpu backend once (a ~130-token prefill, then the slot is erased), so
+the one-time expert pin is paid at startup instead of by the first turn;
+`WARM_MOE_SPLIT=0` skips it. Not measured together yet: the prefill split is
+inert without `LLAMA_MOE_SPLIT=32` and `GGML_CUDA_REGISTER_HOST=1`, and the
+doorbell host gate still wants a soak test. The release is not declared until
+the joint A/B runs.
 
 ### The release before (llama.cpp-rel3, 8 October 07:05)
 

@@ -1,0 +1,52 @@
+From ad2bd118b89f31aad63eff0aeef2a6d06da69fc9 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Fri, 9 Oct 2026 12:17:55 +0200
+Subject: [PATCH] ggml-cuda: radix-select a wide top-k when CUB DeviceTopK is
+ unavailable
+
+CCCL before 3.4.3 has a race in DeviceTopK, so the CUDA top-k falls back to
+argsort + copy and sorts every column. The QSA indexer calls top_k over one
+pooled key per block (ncols = n_kv / 4), so at long context the rows are wide
+and a select beats a sort. Compile the radix-select (already used on HIP) when
+DeviceTopK is unavailable, and use it for ncols >= 8192.
+
+Measured on koishi (RTX A4000, CUDA 13.3, CCCL 3.3.4), test-backend-ops perf
+-o TOP_K, us/run against the argsort fallback: ncols 8192 ~1.5x, 32768 ~1.6-3.8x,
+131072 ~1.5-10x, 200000 ~1.2-6.4x; median 1.91x over 66 wide shapes; below the
+threshold unchanged. Correctness: test-backend-ops test -o TOP_K 525/525.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-cuda/top-k.cu | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 3ffbba839..1bcffa4d7 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -52,7 +52,9 @@ static int next_power_of_2(int x) {
+ 
+ #endif                            // CUB_TOP_K_AVAILABLE
+ 
+-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
++// A radix-select for a wide row. Compiled whenever the fast CUB DeviceTopK is
++// not available (CCCL before 3.4.3), which includes a CUDA build that has CUB.
++#if !defined(CUB_TOP_K_AVAILABLE)
+ 
+ static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
+     const uint32_t bits = __float_as_uint(value);
+@@ -237,6 +239,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+     }
+ #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
++    // A wide row is the QSA indexer scoring one pooled key per block: a select
++    // of the top k, not a sort of every column. Radix-select it. Below the
++    // threshold the row is short and the argsort is fine.
++    if (ncols >= 8192) {
++        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
++        return;
++    }
+     // Fall back to argsort + copy
+     const int    ncols_pad      = next_power_of_2(ncols);
+     const size_t shared_mem     = ncols_pad * sizeof(int);
