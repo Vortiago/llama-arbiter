@@ -138,11 +138,16 @@ def slot_state(raw, previous, rate_window, now):
         busy = bool(slot.get("is_processing"))
         whole = slot.get("n_prompt_tokens_total")
         if whole is None:
-            # Without the patch, the old arithmetic is the fallback.
+            # Without the patch, the old arithmetic is the fallback. It is not
+            # the prompt's size: it is only what the slot holds, and it grows
+            # while the prompt is read. Left unnamed so the bar does not pin
+            # its track to a number that moves.
             whole = max(0, slot.get("n_prompt_tokens", 0) - decoded)
             to_read = max(0, whole - cached)
+            known = None
         else:
             to_read = max(0, whole - cached - processed)
+            known = whole
         detail.append({
             "id": sid,
             "busy": busy,
@@ -151,6 +156,10 @@ def slot_state(raw, previous, rate_window, now):
             "done": processed,
             "cached": cached,
             "decoded": decoded,
+            # The prompt the task arrived with, when the backend reports it
+            # (patches/slots-report-the-prompt-size.patch). The bar pins its
+            # track to this; absent, it falls back to cached + done + left.
+            "whole": known,
             # null, not 0.0, until a window has resolved.
             "pp_rate": round(pp_rate, 1) if measured else None,
             "tg_rate": round(tg_rate, 1) if measured else None,

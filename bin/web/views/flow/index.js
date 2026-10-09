@@ -187,7 +187,7 @@ export default {
       } else {
         reused.style.width = b ? `${(100 * b.reused) / b.total}%` : "0%";
         read.style.width = b ? `${(100 * b.read) / b.total}%` : "0%";
-        slot(node, { done: b ? `${num(b.reused)} reused of ${num(b.total)}` : "" });
+        slot(node, { done: b ? `${num(b.reused)} reused · ${num(b.read)} / ${num(b.total)} read` : "" });
       }
       slot(node, { rate: n.phase === "idle" || n.phase === "down" ? "" : `${n.rate.toFixed(1)} tok/s` });
       // Colour stays in CSS; JS only says how far up each band reaches.

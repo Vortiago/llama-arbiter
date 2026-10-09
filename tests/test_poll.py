@@ -138,6 +138,7 @@ class WhatIsLeftToReadIsWhatTheDashboardCountsDown(unittest.TestCase):
             [slot(n_prompt_tokens_total=1000, n_prompt_tokens_cache=600,
                   n_prompt_tokens_processed=100)], {}, 10.0, 100.0)
         self.assertEqual(detail[0]["prompt"], 300)
+        self.assertEqual(detail[0]["whole"], 1000)
 
     def test_an_unpatched_backend_falls_back_to_what_it_does_report(self):
         """n_prompt_tokens grows with every token generated, so the generated
@@ -147,6 +148,7 @@ class WhatIsLeftToReadIsWhatTheDashboardCountsDown(unittest.TestCase):
         row["n_prompt_tokens"] = 1000
         _, detail = router.slot_state([row], {}, 10.0, 100.0)
         self.assertEqual(detail[0]["prompt"], 350)     # 1000 - 50 - 600
+        self.assertIsNone(detail[0]["whole"], "the fallback is not the prompt's size")
 
     def test_a_slot_says_which_of_the_three_things_it_is_doing(self):
         idle = router.slot_state([slot(is_processing=False)], {}, 10.0, 1.0)[1]

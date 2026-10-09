@@ -4698,6 +4698,22 @@ class AReadOnTheGeneratorEndsBeforeItIsNeeded(unittest.TestCase):
         self.pool.begin_wait("warm", 1000)
         self.assertNotEqual(self.reader("new", 10), "gpu")
 
+    def test_a_parked_copy_still_holds_its_warm_slot(self):
+        """A park is a copy: the slot keeps the cache until a turn takes it,
+        so a waiter with both still holds the generator. Guarding on `parked`
+        would read a warm reuse as a disk recall."""
+        self.pool.pins["warm"] = pin("gpu", slot=0, parked="warm.park")
+        self.pool.begin_wait("warm", 1000)
+        self.assertNotEqual(self.reader("new", 10), "gpu")
+
+    def test_a_waiter_too_big_for_the_generator_holds_nothing(self):
+        """A waiter that cannot fit on the generator must spill to a cpu, so
+        it must not keep the generator idle while a read waits for it."""
+        self.pool.pins["warm"] = pin("gpu", slot=0)
+        self.gpu["n_ctx"] = 500
+        self.pool.begin_wait("warm", 100000)
+        self.assertEqual(self.reader("new", 10), "gpu")
+
     def test_its_own_cache_in_the_slot_is_read_there_whatever_waits(self):
         """Read elsewhere, it would cost a copy out and a carry back."""
         self.pool.pins["a"] = pin("gpu", slot=0)

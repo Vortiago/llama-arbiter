@@ -5,8 +5,8 @@
  */
 
 /** @typedef {{ id: number, busy: boolean, prompt: number, done: number, cached: number,
- *              decoded: number, pp_rate: number | null, tg_rate: number | null,
- *              phase: "idle"|"reading"|"generating" }} Slot */
+ *              decoded: number, whole?: number | null, pp_rate: number | null,
+ *              tg_rate: number | null, phase: "idle"|"reading"|"generating" }} Slot */
 /** @typedef {{ busy_per_decode?: number, pp_rate?: number, tg_rate?: number, accept?: number,
  *              cached?: number, longest?: number, generated?: number, pp_live?: number,
  *              tg_live?: number, read_s?: number, gen_s?: number, prompt_tokens?: number,
@@ -227,7 +227,10 @@ export function promptBands(slot) {
   if (!slot.busy) return null;
   const reused = slot.cached || 0, left = slot.prompt || 0;
   const read = slot.done || 0;
-  const total = reused + read + left;
+  // The whole is what the task arrived with. Pinned, the track does not grow
+  // while the prompt is read. `cached + done + left` equals it when the
+  // backend reports whole; that sum is the fallback when it does not.
+  const total = slot.whole || reused + read + left;
   if (!total) return null;
   return { total, reused, read, left };
 }

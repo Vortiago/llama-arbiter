@@ -724,7 +724,11 @@ class Pool:
             return True
         for w in self.waiters.values():
             other = self.pins.get(w["conv"]) if w["conv"] != conv else None
-            if self._holds_here(other, be) and not other.get("inflight"):
+            # A waiter that cannot fit on `be` must spill elsewhere, so it
+            # holds nothing here. Left in, it kept the generator idle for a
+            # turn that would never run on it.
+            if (self._holds_here(other, be) and not other.get("inflight")
+                    and w["tokens"] <= be["n_ctx"]):
                 return True
         # Only what is measured holds a read back. A guess either way could
         # hold it for as long as the other read runs, and one read measures.
