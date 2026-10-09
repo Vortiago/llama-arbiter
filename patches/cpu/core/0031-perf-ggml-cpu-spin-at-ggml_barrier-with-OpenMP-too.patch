@@ -1,0 +1,54 @@
+From a52c50074fbd147a79e62b4d4549b627d979c245 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 20:28:45 +0200
+Subject: [PATCH] perf(ggml-cpu): spin at ggml_barrier with OpenMP too
+
+With GGML_OPENMP, ggml_barrier was an omp barrier, which waits as
+OMP_WAIT_POLICY says. koishi sets PASSIVE (and GOMP_SPINCOUNT=0) so that
+idle workers sleep between graphs. Then every barrier inside a graph
+puts the threads to sleep in the kernel and wakes them again, and a
+decode or MTP verify graph has a barrier after nearly every node.
+
+ggml_barrier now uses the atomic spin barrier of the non-OpenMP build in
+both builds. Inside a graph every thread is busy until the graph ends,
+so a wait is short. Between graphs the workers still wait as
+OMP_WAIT_POLICY says: the omp parallel region and its end barrier are
+unchanged.
+
+GGML_CPU_BARSTAT on a CPU-only 4-token verify step (koishi, node 0, 18
+threads, one run each): 34.1% of the thread time was barrier wait, and
+GOMP_SPINCOUNT=200000 cut it to 13.9% and the step from 325.6 to
+280.5 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index bdbb94e90..db75962b6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -580,9 +580,10 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+         return;
+     }
+ 
+-#ifdef GGML_USE_OPENMP
+-    #pragma omp barrier
+-#else
++    // A spin barrier with OpenMP too. Every thread of a graph is busy until its end, so none
++    // waits long here. An omp barrier waits as OMP_WAIT_POLICY says, and with PASSIVE (set so
++    // that idle workers sleep between graphs) each barrier puts the threads to sleep and wakes
++    // them through the kernel.
+     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
+ 
+     // enter barrier (full seq-cst fence)
+@@ -609,7 +610,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+     #else
+     atomic_thread_fence(memory_order_seq_cst);
+     #endif
+-#endif
+ }
+ 
+ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {

@@ -14,6 +14,155 @@ The GPU box runs the arbiter at about 130k context on one 16 GiB card, with
 recurrent state and the KV cache are on the card. All 48 expert layers are in
 RAM. The CPU box runs about 250k context.
 
+## Results on koishi
+
+koishi is the GPU box: two Xeon Gold 6150 sockets of 18 cores (AVX-512
+F/BW/VL, no VNNI), an RTX A4000 16 GiB on PCIe gen3 x8, ctx 150000. Every row
+is one A/B in one session, the rounds alternating. "CPU run" is a CPU-only
+server bound to node 0; "GPU run" is the gpu backend's layout (experts in RAM,
+the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
+1024- or 2000-token prompt, and steps of 4 tokens (an MTP verify).
+
+### Deployed
+
+| change | conditions | baseline | with it | change |
+|---|---|---|---|---|
+| pin + core CPU patches (PR #3) vs the old fork | CPU-only server, node 0 idle, 120 / 2000-token prompts | 25.1-28.9 / 34.8-36.0 tok/s | 34.6-39.3 / 50.2-50.3 tok/s | prefill +38 / +42% |
+| `GGML_OP_OFFLOAD_MIN_BATCH=1000000` on the gpu backend | GPU run, idle, 120 / 2000-token prompts | 8.8-11.0 / 29.5-30.0 tok/s | 61.7-75.8 / 111.5-112.1 tok/s | prefill 4-7x |
+| `--cpu-moe-draft` (needed to fit ctx 150000) | gpu backend at ctx 130000, generate, 3 prompts x 2 rounds | 15.0-15.2 / 19.7-20.0 / 17.5-18.0 tok/s | 14.4-14.5 / 18.9-19.1 / 16.8-17.1 | generate -4 to -5% |
+| `--backend-sampling` | gpu backend, temperature 1.0, 3 prompts x 2 rounds | 13.2-13.6 / 18.0-18.1 / 16.5-16.7 tok/s | 13.5-14.6 / 18.7-19.4 / 16.9-17.1 | generate +2 to +5% |
+| `core/0018`: chunk work when the process is on one node | CPU run, node 0 idle, 2 rounds | verify 322.1, 316.5 ms; prompt 19.56, 19.18 ms/token | verify 304.0, 304.5 ms; prompt 19.21, 19.39 | generate +5%, prompt the same. PPL identical |
+
+### Measured, not deployed
+
+| change | conditions | baseline | with it | verdict |
+|---|---|---|---|---|
+| optional I1 + Q1, together | CPU run, node 0 quiet, 3 rounds (main session) | prompt 19.51 / 19.56 / 19.62 ms/token; verify 317.0 / 317.2 / 318.5 ms | prompt 18.10 / 18.35 / 18.52; verify 302.8 / 301.8 / 301.9 | conflicts with the row below: unresolved |
+| optional I1 alone, Q1 alone | CPU run, node 0 quiet, 3 rounds B / I1 / Q1 (agent optsets) | prompt 19.79 / 19.84 / 19.56; verify 323.2 / 314.8 / 310.8 | I1: prompt 22.01 / 18.58 / 18.02, verify 316.1 / 307.5 / 312.1. Q1: prompt 19.14 / 18.93 / 20.07, verify 310.8 / 309.1 / 305.1 | no end-to-end gain beyond the baseline's spread (verify 12.4 ms). Q1 was faster at verify in every round, by 6 to 12 ms |
+| quality of I1 and Q1 | 20 chunks of 512, KLD against the deployed build, which is deterministic (base against base: KLD 0, 100% same top) | PPL 11.5921 | I1: KLD 0.0449, same top 89.3%, PPL 11.7051 (the SIMD sigmoid alone: KLD 0.0451). Q1: KLD 0.0017, same top 99.3%, PPL 11.5974, identical for 3 chunks | I1: KLD at the level of any change of summation order here (a CPU-only run is 0.047 from a GPU run), so quality does not rule it out; its end-to-end speed gain is unproven. Q1 not bit-exact (router ties, unverified), small |
+| MoE weighted sum where the experts run (agent moesum, `exp/moesum` 5ee87eeb4, `src/llama-graph.cpp`) | GPU run, node 0 quiet, 3 rounds, 1024-token prompt | prompt 8.38 / 8.39 / 8.47 ms/token; verify 136.5 / 132.9 / 134.1 ms | prompt 7.48 / 7.55 / 7.51; verify 131.6 / 130.4 / 132.8 | prefill +10.7% (2000 tokens: 8.42 -> 7.57). Verify about 2%, within noise. The boundary copy per layer at 512 tokens fell from 50 MB to 5 MB. 20 chunks: KLD 0.0447, same top 89.8%, PPL ratio 0.998 ± 0.005, against the GPU run; a CPU-only run gives KLD 0.0471, same top 89.0%. Ready to deploy as `patches/moe-sum-where-the-experts-run.patch` |
+| Q8_0 expert rows read once for up to 4 tokens, with prefetch (agent kern4, `core/0020`) | CPU run, node 0 quiet, 3 rounds; kernel benchmark at the model's shapes | verify 311.9 / 311.2 / 309.6 ms; 4-token gate / down 597-604 / 612-622 us | verify 303.8 / 305.2 / 307.5; gate / down 543-557 / 547-559 | bit-exact. Kernel +9-10%, verify +1.7 to 2.8%. AVX-512BW was slower (568-588 us). Ready to deploy |
+| #29796 rebased (fewer CUDA syncs), and split input copies queued between host and card (agent verifygpu, `exp/verifygpu` a5ff2d62b, 268a09ba9) | GPU run, node 0 quiet, 3 rounds; a callback-free tool, verify steps 2-31 | verify 128.5 / 124.3, 125.7 / 124.5, 126.8 / 125.6 ms | #29796 alone: the same. With the queued copies: 124.9 / 122.4, 123.1 / 122.2, 125.6 / 123.6 | generate about +2% (syncs 404 -> 78 a step), exact (PPL identical). #29796 alone: no gain. A host gate thread: no further steady gain, on hold |
+| MTP draft depth: none, n-max 1 to 5 (agent mtpdepth) | test server in the gpu backend's layout, 4 prompts x temperature 1.0 (seed 42) and 0, 256 tokens, 2 passes in reversed order | n-max 3: 19.25 / 19.32 tok/s | no draft 12.76 / 13.05; n1 15.63 / 15.99; n2 18.24 / 18.47; n4 18.44 / 18.62; n5 17.95 / 17.90 | keep n-max 3. MTP is worth +49% here. A step costs 78 ms without a draft, 116 / 137 / 156 / 179 / 201 ms at n1-n5; acceptance at positions 1-4 is 0.81 / 0.63 / 0.49 / 0.34. n4 wins on code and reasoning at temperature 0 and loses on prose and lists: a case for adaptive depth (H4) |
+| expert pages on the local node (R3 check) | CPU run on node 0, 2 runs before and after evicting node 0's model files and reading them again with `numactl --membind=0`; before, about 10% of the mapped expert pages were on node 1 | verify 314.5 / 313.9 ms; prompt 19.64 / 19.44 ms/token | verify 313.3 / 308.8; prompt 19.97 / 20.68 | no gain beyond noise; node 1 left as it is (it holds 7 GB of its expert pages and most of its draft on node 0) |
+| MTP draft `hnorm` over all four streams, as vLLM, SGLang and TensorRT-LLM do (R6, agent hnorm, `exp/hnorm` a7e9b19c0) | test server in the gpu backend's layout, 10 prompts x temperature 0 and 1.0, 3 rounds | acceptance 0.682 (temp 0), 0.578 (temp 1.0); 19.22 / 17.27 tok/s aggregate | acceptance 0.645, 0.543; 18.54-18.63 / 16.63-16.71 tok/s | rejected: the reference form accepts fewer drafts here (-3.5% generate). Outputs identical. Lead: something else in llama.cpp's draft path may differ from the reference (the MTP block's rope_theta 1e7 is unchecked) |
+| keep the scheduler on re-reserve, #28872 ported (R1, agent schedreuse, `patches/sched-reserve-keeps-the-scheduler.patch`) | test server in the gpu backend's layout, 1000-token cached prefix + 10-50 new tokens a request, 3 rounds, medians | time to first token with backend sampling: plain 1331-1374 ms, alternating with grammar 1352-1371 ms; without backend sampling 966-1002 / 962-976 | plain 1013-1036 ms, alternating 1020-1056 | about 300 ms saved per request after a plain one; backend sampling now costs 40-80 ms of time to first token instead of 330-380. Identical outputs. Ready to deploy. #29986 (R14): no effect here |
+| the MoE sum patch + core/0020 + core/0021 + core/0022 together (agent integrate, `exp/integrate`) | test server in the gpu backend's layout, 3 rounds; profiler GPU and CPU runs, 3 rounds | server: generate 17.41 / 17.28 / 17.26 tok/s, 148.9-150.2 ms a verify step, 2000-token read 108.6-110.2 tok/s. GPU run: prompt 8.25 ms/token, verify 124.6 ms. CPU run: verify 315.5 ms | server: 18.38 / 18.22 / 18.28 tok/s, 133.9-135.1 ms a step, 121.5-123.1 tok/s. GPU run: 7.36, 112.1. CPU run: 308.5 | generate +5.6% (per step -10%; acceptance 0.540 -> 0.497 because the text differs), prompt read +11.9%. GPU-run KLD 0.0447, all from the MoE sum; CPU run bit-identical. Tool calls and grammar answers correct; one question's grammar_mass moved 0.68 -> 0.39. Ready to deploy |
+| Strata GPU kernels (N10, agent stratakern): #413 DeltaNet 3 heads a warp, #188 GDN prefetch, #187 indexer keys read once; and a concat fix | GPU run, verify steps, 3 rounds; nsys kernel trace; test-backend-ops | verify 123.8 / 124.6 / 125.3 ms; card kernel time 24.3 ms a step | verify 127.1 / 123.3 / 123.5 ms; 23.3 ms | #413 slower (4 tokens 25.6 -> 29.9 us), reverted; #188 no change; #187 exact, gains only at long context (kv 32768: 190 -> 115 us); concat exact, 945 -> 97 us a step. End to end within the spread. Kept as core/0023-0025 |
+| 2 MiB pages for the experts (R8, agent hugepages) | one 4-token MoE step on the real layer-0 experts, 300 steps, 3 rounds; kernel benchmark with and without THP | deployed file mmap, 4 KiB: 2209 / 2238 / 2224 us (93-95 GB/s) | anonymous 2 MiB: 2309 / 2325 / 2328; anonymous 4 KiB: 2301 / 2270 / 2304 | rejected: huge pages are no faster (the file mmap is about 4% faster). A no-root tmpfs huge=always mount works in a user namespace, if ever needed |
+| MTP draft path against vLLM / SGLang / TensorRT-LLM, line by line (agent mtpparity, `exp/mtpparity` 84677fea2) | test server in the gpu backend's layout, 10 prompts x temperature 0 and 1.0, 3 rounds | acceptance 0.6746 / 0.5829; 22.1-22.7 / 20.1-20.2 tok/s | stale first draft-KV entry removed: 0.6773 / 0.5796, 22.1-22.3 / 19.9-20.1 tok/s | the inputs, conversion, layer, RoPE (1e7 in both), FFN and head match the reference; only the hnorm form differs, and the reference form lost again (-4%). The cache fix is correct but gives no speed; not deployed |
+| Gumbel-coupled MTP drafts (R9, Strata #1281 ported; agent gumbel, `exp/gumbel` fda2c75e5) | test server in the gpu backend's layout, 8 prompts x 3 seeds at temperature 1.0, 8 at temperature 0, 3 rounds; node 1 busy | acceptance 0.544 (temp 1), 0.597 (temp 0); about 135 ms a step | acceptance 0.575 (95% CI +0.003 to +0.059), 0.598; the same step cost | +3.5% tokens a step at temperature 1.0; tok/s not shown above the round spread (15-20 tok/s, node 1 load). Greedy and PPL identical; a fixed seed gives other text. Rerun on rel3 (agent gumbel2), 4 rounds, order alternated: 20.61 -> 22.10 tok/s at temperature 1.0 (+7.2%, rounds 2-4), the candidate faster in every round; greedy identical. Ready to deploy as core/0034-0035 |
+| small GPU kernels of a verify step (agent gpusmall, core/0026-0030) | GPU run, 3 rounds, node 1 idle; again with node 1 busy | verify 111.9 / 111.1 / 110.9 ms; card kernels 23.26 ms a step (3628 kernels) | verify 108.7 / 109.3 / 108.2 ms; 20.92 ms (3074 kernels) | generate about +2.4%, exact (bit-identical 4-token logits). With node 1 busy: faster in every pair by 0.9-1.7 ms. Ready to deploy |
+| spin barrier inside a graph, and a fused small-batch MoE op (agent moebarrier, `exp/moebarrier` c23cd8d77, 6635eacfc, 2efebd55a) | CPU and GPU runs, 3 rounds, one instance on node 0 | CPU: verify 312.9 / 309.6 / 310.2 ms, prompt 19.8-20.6; GPU: verify 116.0-116.7 | spin: CPU verify 270.7 / 271.9 / 269.1 (-13%), prompt 19.6-19.8; GPU 114.6-115.0. Spin + fused: CPU 268.5-271.5, GPU 113.5-114.1 | OMP_WAIT_POLICY=PASSIVE made every ggml_barrier sleep in the kernel: 34% of a CPU verify step's thread time was barrier wait. Exact (PPL identical at ub 512 and 4). With the fused op and 128/256-row blocks (2efebd55a): CPU verify 260.5-262.1 ms (-15%), GPU 109.9-110.7 (-6%). Two busy instances on node 0: 365-370 -> 327-334 ms each. Ready to deploy as core/0031-0033 |
+| adaptive MTP draft length 1-5 (H4, agent adaptdepth, `exp/adaptdepth` c620c122d) | test server in the gpu backend's layout, 8 prompts x temperature 0 and 1.0, 3 rounds, quiet box | pooled 22.38 / 22.36 / 22.54 tok/s | 22.51 / 22.56 / 22.57 | rejected: +0.1 to +0.9%, within the spread. It wins on json, sql, code and loses as much on lists and reasoning; each change of length costs a graph rebuild. Greedy text depends on the verify width, so no draft-length change keeps greedy output byte-identical |
+| CPU expert phase from the GPU stream (R5, agent doorbell, `exp/doorbell` b71b6e369 single-thread gate; 138794077 host function) | GPU run, 3 rounds; test server, 3 rounds (base always first) | verify 113.5 / 112.1 ms (r2, r3); server 17.61 / 16.84 tok/s | gate: 112.1 / 111.9 ms; server 18.75 / 18.78. Host function: 116-118 ms | the launch gap per layer falls from 115 to 7.5 us, exact, but the profiler gain is within the spread; the server gain (+6 to +11%) needs a rerun with the order swapped. The host function was slower (the CPU split runs slower on CUDA's callback thread). Rerun on rel3 (agent doorbell2, 4 quiet rounds of 8, order alternated): generate +1.0% at temperature 0 and 1.0 (20.17 -> 20.37, 17.11 -> 17.29 tok/s), faster in every round, exact. Candidate, after a soak test (the host gate deadlocked once in an earlier form); integrated in rel/5 as core/0043-0044 |
+| skip parking /v1/systemone conversations (agent park-worth) | cache events 7 Oct 09:30 to 8 Oct 08:00 (22.6 h, 1851 calls) | 440 systemone parks, 278 recalled (63%); 13.5 GB/h, 19 backend-s/h; a recalled large call about 47 s of backend time, a cold one about 94 s | not changed | rejected: the parks pay for themselves (about 570 backend-s/h saved against 19 spent). The 4671 parks of 7 October were the stale-claim bug (4525 before the fix at 09:09). A guard test pins the behaviour |
+| the gpu backend on both sockets, each reading its own copy of the experts (agent dualsocket, `exp/dualsocket` b9dc6482e; LLAMA_NUMA_MIRROR, --numa distribute, 36 threads) | node 1 drained; GPU run 3 rounds in rotating order; test server 4 rounds, order alternated, 8 prompts, temperature 0 | rel3 on node 0: verify 118.6 / 119.5 / 119.3 ms, prompt 7.52-7.57 ms/token; server 20.69-20.73 tok/s | both sockets, local copies: verify 101.2 / 100.3 / 101.4 ms (-15%), prompt 5.83-5.85 (+29% read rate); server 22.91-23.08 tok/s (+10.9%). Both sockets without the second copy: verify 134.7-135.1 (worse) | exact (PPL and every greedy text identical). Needs node 1's cores, which two CPU readers use: the contended case is not measured |
+| re-reserve only when the backend sampling graph changes (agent reserve2, core/0036-0038) | test server in the gpu backend's layout, a cached 1000-token prefix + 10-50 new tokens a request; on rel3 rounds 4-7, on gumbel2 2 rounds | time to first token, plain requests: 884-909 ms (rel3), 876 / 894 (gumbel2) | 836-864 ms, 824 / 837 | -45 to -57 ms a plain request, identical outputs. Alternating grammar and plain requests unchanged (a grammar turns backend sampling off). Ready to deploy |
+| CUDA graphs survive a prompt read (agent graphwarm, `exp/graphwarm` 4aae8ded1: key = first node + first and last node shapes; sched_reserve resets the previous graph results) | profiler sequence prompt, verify, prompt, verify; test server 600-token prompts, 4 rounds AB BA AB BA | first two verify steps after a same-size prompt 270-272 ms; gen of 16 tokens 891-907 ms | 245-250 ms; 862-877 ms | about 30 ms a request, exact. Not when the KV size changed or requests are over 10 s apart (graph eviction). #29768 did not help. Candidate for the release after rel4 (overlaps the re-reserve patches); integrated in rel/5 as core/0040-0042 |
+| prefill split: each layer's experts with 32 or more tokens of a ubatch on the card, the rest on the CPU, in parallel (R4, agent prefillsplit, `exp/prefillsplit` c8d5a0baf; LLAMA_MOE_SPLIT=32, GGML_CUDA_REGISTER_HOST=1 pins the mmapped experts) | GPU run, 3 rounds; test server 4 rounds, order alternated | prompt 7.67-7.69 ms/token (1024), 7.74-7.78 (2000); server 2000-token read 118.8-121.7 tok/s | 5.41-5.43, 5.52-5.54 (-29%); 163.9-166.1 tok/s (+37%) | generation not slower; KLD 0.0452, same top 89.1% (calibration line 0.047). Pinning is required (pageable: 7.24 ms/token) and takes 17 s at the first prompt. A layer's 42-45 experts of 32+ tokens carry 52% of its routed slots. Candidate for the release after rel4, tested with the dual-socket change; integrated in rel/5 as core/0045-0046 |
+| N1 expert cache, #29887, 1500 MiB | GPU run, ctx 150000, 3 prompts x 2 rounds | 14.5-14.8 / 18.9-20.2 / 16.9-18.7 tok/s | 1.8-1.9 / 2.1 / 2.0 tok/s | rejected: 0.00% hits on this card |
+| `--spec-draft-p-min 0.5` (H3) | gpu backend, temperature 1.0, 2 rounds | see `--backend-sampling` baseline | 12.9-13.4 / 17.3-17.6 / 15.3-16.3 tok/s | rejected: -2 to -5% |
+| threads 14 / 16 / 17 / 18 (`-t` = `-tb`) | CPU run and GPU run, node 0 quiet, two passes in reversed order | 18: GPU prompt 8.41, 8.37 ms/token; CPU prompt 20.27, 19.61 | GPU prompt 17: 8.69, 8.72; 16: 9.16, 9.02. CPU prompt 17: 20.25, 20.40; 14: 24.09, 23.51 | keep 18. Verify: no count beats the spread (up to 21 ms CPU, 4 ms GPU). A 4-token verify runs on the `-tb` pool, so `-t` alone changes nothing there |
+| 36 threads (hyperthreads) for the experts | test-backend-ops, model shapes, box busy | 4-token matmul 0.83-0.86 ms | 10.9-12.1 ms | rejected |
+
+### Where the time goes (op-profile, GPU run, ctx 150000, idle)
+
+- 2000-token prompt, 9.2 ms a token: the CPU expert matmuls take 82% (gate
+  29%, down 28%, up 25%). The card, the copies and the waits take 17%.
+- A 4-token verify step, 145 ms: the CPU expert matmuls take 74%, the card,
+  copies and waits 23%.
+- At 4 tokens the expert matmul reads its weights at about 84 GB/s, against
+  about 128 GB/s in theory for one socket.
+
+### Where a verify step goes on the card (nsys, deployed build, GPU run)
+
+Per 4-token step of about 143 ms: CUDA graph execution 23.4 ms (48 per-layer
+graphs, about 75 nodes each); host-to-card copies 3.3 ms (48 expert outputs
+of 400 KB); card-to-host 1.1 ms; host time in CUDA calls while the card idles
+10.5 ms (graph launches 114 us each, 5.4 ms; 404 stream syncs). The CPU and
+llama.cpp take the other 105 ms. The first two steps after a prompt take
+about 210 ms each: they build the CUDA graphs for the new batch shape.
+
+### Where the card's 24 ms of a verify step go (nsys, kernel level)
+
+Dense Q8_0 matrix-vector products (MMVQ) take 61%, at 340 to 400 GB/s for
+the large weights, near the A4000's 448 GB/s; the small-K hyper-connection
+`hc_up` runs at about 145 GB/s (2.35 ms a step). Then `quantize_q8_1` 4.7%
+(665 calls), the F32 router matmul 3.7% (16 blocks), GATED_DELTA_NET 3.1%,
+GET_ROWS 2.0%, the indexer 0.3%. The kernels Strata tuned are a small share
+here at short context.
+
+### The release in service (llama.cpp-rel4, 8 October 15:15)
+
+Patches through core/0039: rel3 plus the Gumbel-coupled drafts (0034-0035),
+re-reserve only when the backend sampling graph changes (0036-0038) and each
+socket reading its own copy of the experts (0039). PPL identical to rel3 at
+ub 4. The gpu backend runs on both sockets (NODE=0,1, --numa distribute, 36
+threads, LLAMA_NUMA_MIRROR) and reads every path under the reader-speed
+router; cpu0_0 and cpu1_0 are the CPU readers, cpu1_1 is gone. First chat
+after the restart: read and generated on the gpu backend at 29.0 tok/s.
+Two router faults kept the gpu backend off /v1/systemone at first (37a1b49:
+the guard reserved it for typed turns that never move; 120efeb: its read rate
+came from 46 tokens of smoke tests). After both: the peer's 28-case subset
+took 5m56s at concurrency 3 (8m06s before the fixes); seconds a call:
+gpu0_0 27.3 (12 calls), cpu1_0 41.9, cpu0_0 44.5. No outcome moved.
+
+### The release after (llama.cpp-rel5, in the tree, 8 October 21:48)
+
+Patches through core/0046: rel4 plus the three candidates measured below and
+their tests. core/0040-0042 key a CUDA graph by the first and the last node's
+shape and keep the previous graph results when the scheduler re-reserves
+(agent graphwarm, about 30 ms a request); core/0043-0044 queue a CPU split
+behind the GPU split's host gate (agent doorbell2, +1.0% generate on rel3);
+core/0045-0046 split a prefill ubatch's experts between the card and the CPU
+(agent prefillsplit, +37% read on the gpu backend). Built as `llama.cpp-rel5`
+(971a0d3d1) and pointed at by `SERVER_MTP`; `test-moe-split` and
+`test-backend-sched-host` pass. `start-all.sh` warms the gpu backend once (a
+~130-token prefill, then the slot is erased), so the one-time expert pin is
+paid at startup instead of by the first turn; `WARM_MOE_SPLIT=0` skips it. Not
+measured together yet: the prefill split is inert without `LLAMA_MOE_SPLIT=32`
+and `GGML_CUDA_REGISTER_HOST=1`, and the doorbell host gate still wants a soak
+test. The release is not declared until the joint A/B runs.
+
+### The release before (llama.cpp-rel3, 8 October 07:05)
+
+Patches through core/0033. Against llama.cpp-live, profiler, 2 rounds: GPU
+verify step 112.2 to 103.0 ms (-8%), CPU verify step 300.6 to 254.9 ms (-15%),
+prompts the same; PPL identical at ub 4 and 512. Generating directly on the
+gpu backend, warm: 27.7-30.7 tok/s against 24.9-27.1. A chat turn handed off
+to the gpu backend generated at about 9 tok/s (about 360 ms a step) only as
+the first work of a freshly restarted gpu backend whose model pages were out
+of the page cache (1.39 million major faults); warm, a hand-off from either
+node runs at 122-144 ms a step. Since 07:05 llama.cpp-rel3 is in service:
+rel2 plus a slot file that carries the MTP draft's KV (a restored slot drafts
+as the server that saved it: 75/154 drafts accepted against 70/170 on a long
+prompt). After its restart the gpu backend took 0 major faults and handed-off
+turns ran at 122-128 ms a step. A gpu backend with
+"prefill": true lost chat generation to the cpu readers; it reads
+/v1/systemone only.
+
+### Facts about this box
+
+- The ggml-org draft must be the 30 September upload. The 9 September file
+  gives the MTP layer a compress ratio of 0, and the server aborts at load
+  with `GGML_ASSERT(buffer) failed`.
+- #29887 now needs upstream 6753a033f first: it was rebased after this page
+  checked it.
+- This model is sensitive to the order of f32 sums: a CPU-only run and a GPU
+  run of the same build differ by mean KLD 0.047 and 11% of top tokens over
+  20 chunks. Judge a change's KLD against that line, not against 0.
+- The live model's experts are a file mmap on 4 KiB pages (`FilePmdMapped`
+  0 kB). Huge pages were measured and do not help (see the table).
+- The CPU backends' compute threads are bound to their node, but ggml clears
+  the main thread's affinity after a graph, so it may run on the other
+  socket (cpu1_0: 39 threads on 18-35,54-71, the main thread on 0-71).
+- Load on node 1 moves node-0 numbers: the same CPU-run setting read prompts
+  at 19.6 to 20.3 ms/token with node 1 busy and 18.7 to 18.8 with it idle.
+  Compare only inside one session's alternating rounds.
+- CUDA graphs are captured per GPU split, that is per layer between two CPU
+  expert phases.
+
 ## Sizes that decide most of this
 
 These come from the model header: 48 layers, 512 experts, 10 used, an expert

@@ -4,6 +4,7 @@ network.
 """
 import atexit
 import base64
+import http.server
 import io
 import json
 import os
@@ -123,6 +124,43 @@ class AnOpeningIsRenderedByItsOwnProtocol(unittest.TestCase):
                            pool.backends[0], Rendering(), "/v1/messages",
                            lambda: True)
         self.assertEqual(set(asked), {"/v1/messages/apply-template"})
+
+
+class AnOpeningRendersWithTheRequestsTemplateOptions(unittest.TestCase):
+    """`chat_template_kwargs` change what the template writes, and not only
+    at the end. Without `enable_thinking: false` this model's template puts
+    a line about reasoning effort at the top of the system prompt. An opening
+    rendered without the request's options shared 3 tokens with every typed
+    question, which then read all 4150 from the start."""
+
+    KWARGS = {"enable_thinking": False}
+
+    def test_the_render_carries_them(self):
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                           watch=False)
+        sent = []
+
+        class Rendering(FakeLink):
+            def render(inner, be, route, payload, alive, timeout=None):
+                sent.append(payload.get("chat_template_kwargs"))
+                return {"prompt": "rendered"}
+
+        pool._render_block("rules", [], [{"role": "user", "content": "hi"}],
+                           pool.backends[0], Rendering(),
+                           "/v1/chat/completions", lambda: True,
+                           template=self.KWARGS)
+        self.assertEqual(sent, [self.KWARGS, self.KWARGS])
+
+    def test_they_name_a_different_opening(self):
+        def keys(**extra):
+            body = dict(extra, messages=[
+                {"role": "system", "content": "rules " * 1000},
+                {"role": "user", "content": "hi"}])
+            cuts, _, _, _ = router.prompt_cuts(json.dumps(body))
+            return [key for _, key in cuts]
+
+        self.assertTrue(keys())
+        self.assertNotEqual(keys(), keys(chat_template_kwargs=self.KWARGS))
 
 
 class ARequestCanBeWrittenDown(unittest.TestCase):
@@ -1822,6 +1860,193 @@ class Recall(unittest.TestCase):
                   FakeLink(fail_on="restore")).recall("conv1", self.cpu, 1)
         self.assertEqual(self.pool.pins["conv1"]["backend"], "gpu")
 
+    def test_a_copy_the_backend_refuses_is_forgotten(self):
+        """Kept, it stays the conversation's own cache, so the turn loads no
+        opening either and reads its whole prompt."""
+        removed = []
+        post = FakeLink()
+
+        def restore(be, slot, name, timeout=None):
+            raise router.Rejected("400 on /slots/1?action=restore: "
+                                  "invalid slot save file")
+
+        post.restore = restore
+        self.pool.link = post
+        self.assertFalse(self.pool.recall("conv1", self.cpu, 1,
+                                          remove=removed.append))
+        self.assertIsNone(self.pool.pins["conv1"]["parked"])
+        self.assertEqual(removed, ["conv1.park"])
+
+    def test_a_copy_on_a_backend_that_is_down_is_kept(self):
+        post = FakeLink()
+
+        def restore(be, slot, name, timeout=None):
+            raise ConnectionRefusedError("connection refused")
+
+        post.restore = restore
+        self.pool.link = post
+        self.assertFalse(self.pool.recall("conv1", self.cpu, 1))
+        self.assertEqual(self.pool.pins["conv1"]["parked"], "conv1.park")
+
+
+class SettleWatch(router.Store):
+    """A store that records each file it is asked to settle, and the link
+    calls made by then."""
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.link = FakeLink(written=1 << 30)
+        self.settled = []
+
+    def settle(self, name):
+        self.settled.append((name, self.link.ops()))
+
+
+class ASlotFileLeavesThePageCache(unittest.TestCase):
+    """A backend holds a saved or restored cache in its own memory, so the
+    file's pages in the page cache are a second copy nobody reads. On
+    8 October the parked copies held 40 GiB of the page cache (3.7 TB passed
+    through it the day before), and model pages went out in their place: a
+    gpu backend restarted that morning took 1.39 million major faults and its
+    first turns ran 3x slower. So each file is settled once the router is
+    done with it."""
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="settle-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.store = SettleWatch(self.root)
+        self.post = self.store.link
+        self.pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1}],
+            store=self.store, link=self.post, watch=False)
+        self.gpu, self.cpu = self.pool.backends
+        for be in self.pool.backends:
+            be.update(up=True, slots=2, n_ctx=150000,
+                      slots_detail=[{"id": 0, "busy": False},
+                                    {"id": 1, "busy": False}])
+
+    def test_a_park_settles_its_copy_after_the_save(self):
+        self.pool.pins["c"] = pin("cpu", slot=0)
+        self.assertTrue(self.pool._save_park("c", self.cpu, 0))
+        self.assertEqual(self.store.settled, [("c.park", ["save"])])
+
+    def test_a_recall_settles_the_copy_it_read(self):
+        self.pool.pins["c"] = pin("gpu", slot=0, parked="c.park")
+        self.assertTrue(self.pool.recall("c", self.cpu, 1))
+        self.assertEqual(self.store.settled, [("c.park", ["restore"])])
+
+    def test_an_opening_load_settles_its_file(self):
+        self.assertTrue(self.pool._load_prefix("k" * 16, "base-k.park",
+                                               self.cpu, 0))
+        self.assertEqual(self.store.settled, [("base-k.park", ["restore"])])
+
+    def test_an_opening_build_settles_its_file(self):
+        self.assertTrue(self.pool._read_prefix(
+            (0, "k" * 16), [{"role": "user", "content": "hi"}], "rules", [],
+            self.cpu, 0, "/v1/messages", lambda: True))
+        self.assertEqual([name for name, _ in self.store.settled],
+                         ["base-" + "k" * 16 + ".park"])
+        self.assertEqual(self.store.settled[0][1][-1], "save")
+
+    def test_a_deep_opening_build_settles_its_file(self):
+        start = ("d" * 16, "the shared start", "k" * 16, 0, None)
+        self.assertTrue(self.pool._read_start(
+            start, [{"role": "user", "content": "the shared start, then"}],
+            "rules", [], self.cpu, 0, "/v1/messages", lambda: True, None))
+        self.assertEqual([name for name, _ in self.store.settled],
+                         ["deep-" + "d" * 16 + ".park"])
+        self.assertEqual(self.store.settled[0][1][-1], "save")
+
+    def test_a_hand_off_settles_its_copy_once_the_target_has_read_it(self):
+        """Settled after the save, the restore right behind it would read the
+        whole copy back from the disk."""
+        self.pool.tuning = replace(self.pool.tuning, handoff=True)
+        self.cpu.update(prefill=True, generate=False)
+        self.gpu.update(prefill=False, generate=True)
+        self.pool.pins["c"] = pin("cpu", slot=0, inflight=True)
+        self.cpu["busy"] = 1
+        self.assertIs(self.pool.hand_off("c", self.cpu, 1000), self.gpu)
+        self.assertEqual(self.store.settled, [("c.park", ["save", "restore"])])
+
+    def test_a_failed_save_settles_nothing(self):
+        self.post.fail_on = "save"
+        self.pool.pins["c"] = pin("cpu", slot=0)
+        self.assertFalse(self.pool._save_park("c", self.cpu, 0))
+        self.assertEqual(self.store.settled, [])
+
+
+class SettlingAFile(unittest.TestCase):
+    """What settle does on the disk. A backend wrote the file, so the router
+    can only drop its pages after the write: forced down first, because
+    POSIX_FADV_DONTNEED skips a dirty page."""
+
+    def setUp(self):
+        from unittest import mock
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="settle-disk-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.store = router.Store(self.root, self.root / "blocks")
+        self.store.slots.mkdir(parents=True)
+        self.calls = []
+        self.done = threading.Event()
+        self.hold = threading.Event()
+        self.hold.set()
+        real_fdatasync, real_fadvise = os.fdatasync, os.posix_fadvise
+
+        def fdatasync(fd):
+            self.hold.wait(10.0)
+            self.calls.append(("fdatasync", os.readlink(f"/proc/self/fd/{fd}")))
+            real_fdatasync(fd)
+
+        def fadvise(fd, offset, length, advice):
+            self.calls.append(("fadvise", os.readlink(f"/proc/self/fd/{fd}"),
+                               offset, length, advice))
+            real_fadvise(fd, offset, length, advice)
+            self.done.set()
+
+        for name, fake in (("fdatasync", fdatasync),
+                           ("posix_fadvise", fadvise)):
+            patcher = mock.patch.object(os, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_it_writes_the_file_down_then_drops_all_of_it(self):
+        path = self.store.slots / "c.park"
+        path.write_bytes(b"x" * 65536)
+        self.store.settle("c.park")
+        self.assertTrue(self.done.wait(10.0))
+        self.assertEqual(self.calls, [
+            ("fdatasync", str(path)),
+            ("fadvise", str(path), 0, 0, os.POSIX_FADV_DONTNEED)])
+
+    def test_it_settles_the_block_a_link_points_at(self):
+        self.store.link_block("base-k.park")
+        (self.store.blocks / "base-k.park").write_bytes(b"x" * 4096)
+        self.store.settle("base-k.park")
+        self.assertTrue(self.done.wait(10.0))
+        self.assertEqual(self.calls[-1][1],
+                         str((self.store.blocks / "base-k.park").resolve()))
+
+    def test_the_caller_does_not_wait_for_the_disk(self):
+        """A hand-off and an opening build settle inside a turn. The write
+        down takes seconds for a gigabyte."""
+        (self.store.slots / "c.park").write_bytes(b"x" * 4096)
+        self.hold.clear()
+        began = time.monotonic()
+        self.store.settle("c.park")
+        self.assertLess(time.monotonic() - began, 0.5)
+        self.assertFalse(self.done.is_set())
+        self.hold.set()
+        self.assertTrue(self.done.wait(10.0))
+
+    def test_a_file_already_deleted_is_skipped(self):
+        self.store.settle("gone.park")
+        (self.store.slots / "c.park").write_bytes(b"x" * 4096)
+        self.store.settle("c.park")
+        self.assertTrue(self.done.wait(10.0))
+        self.assertEqual([call[0] for call in self.calls],
+                         ["fdatasync", "fadvise"])
+
 
 LONG = "You are a careful assistant. " * 400      # a client-sized system prompt
 
@@ -1922,6 +2147,159 @@ class PrefixCase:
         return post.ops()
 
 
+class TheSharedStartOfAMessage(PrefixCase, unittest.TestCase):
+    """Two requests whose first message after the system prompt starts with
+    the same long text. A cut can only fall where a message ends, so without
+    this every one of them reads that text again.
+
+    On production a test audit sends one state a call, and the first 4,800
+    characters of every state are the same rubric. It was 1,000 of the 1,300
+    tokens a call read, about 45 s of a 110 s call."""
+
+    RUBRIC = "Judge the test by these rules.\n" * 120      # 3,720 characters
+
+    def messages(self, case):
+        return [{"role": "system", "content": "rules " * 400},
+                {"role": "user", "content": self.RUBRIC + case}]
+
+    def renders(self):
+        class Render(FakeLink):
+            def render(inner, be, route, payload, alive, timeout=None):
+                inner._note("render", be, route, alive)
+                return {"prompt": "".join(f"<{m['role']}>{m['content']}</>"
+                                          for m in payload["messages"])}
+
+            def prefill(inner, be, blk, slot, alive, timeout=None):
+                inner._note("prefill", be, slot, blk, alive)
+                return {"timings": {"prompt_n": 900, "cache_n": 1700}}
+
+            def save(inner, be, slot, name, timeout=None):
+                inner._note("save", be, slot, name)
+                return {"n_saved": 1, "n_written": 700_000_000}
+
+        return Render()
+
+    def ask(self, conv, case):
+        link = self.renders()
+        self.pool.pins[conv] = pin("cpu", slot=None, inflight=True)
+        self.pool.link = link
+        cuts, messages, system, tools = router.prompt_cuts(
+            json.dumps({"messages": self.messages(case)}))
+        loaded = self.pool.warm_prefix(conv, cuts, messages, system, tools,
+                                       self.cpu, 1, "/v1/chat/completions")
+        return loaded, link
+
+    def setUp(self):
+        super().setUp()
+        cuts, _, _, _ = router.prompt_cuts(
+            json.dumps({"messages": self.messages("x")}))
+        self.base = cuts[0][1]
+        self.pool.openings[self.base] = f"base-{self.base}.park"
+
+    def test_the_first_request_has_nothing_to_share_with(self):
+        loaded, link = self.ask("one", "case one")
+        self.assertTrue(loaded)
+        self.assertEqual(link.files(), [f"base-{self.base}.park"])
+
+    def test_the_second_reads_and_keeps_what_both_start_with(self):
+        self.ask("one", "case one")
+        loaded, link = self.ask("two", "case two")
+        self.assertTrue(loaded)
+        self.assertEqual(link.ops(), ["restore", "render", "prefill", "save"])
+        block = [call for call in link.calls if call[0] == "prefill"][0][3]
+        self.assertTrue(block.endswith(self.RUBRIC), block[-60:])
+        saved = link.files("save")[0]
+        self.assertTrue(saved.startswith("deep-"), saved)
+
+    def test_the_third_loads_it_and_reads_nothing(self):
+        self.ask("one", "case one")
+        _, made = self.ask("two", "case two")
+        loaded, link = self.ask("three", "case three")
+        self.assertTrue(loaded)
+        self.assertEqual(link.ops(), ["restore"])
+        self.assertEqual(link.files(), made.files("save"))
+
+    def test_a_short_shared_start_is_not_worth_a_file(self):
+        self.RUBRIC = "Judge it.\n"
+        self.ask("one", "case one")
+        _, link = self.ask("two", "case two")
+        self.assertEqual(link.files("save"), [])
+
+    def test_it_is_still_there_after_a_restart(self):
+        self.ask("one", "case one")
+        _, made = self.ask("two", "case two")
+        name = made.files("save")[0]
+        (SANDBOX.store.slots / name).write_bytes(b"x")
+        (SANDBOX.store.slots / f"base-{self.base}.park").write_bytes(b"x")
+        self.pool.save_openings()
+        again = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                          store=SANDBOX.store, watch=False)
+        again.adopt(remove=lambda name: None)
+        self.assertIn(name, again.openings.values())
+        self.pool, self.cpu = again, again.backends[0]
+        self.cpu.update(up=True, slots=3, n_ctx=150000, slots_detail=[])
+        _, link = self.ask("four", "case four")
+        self.assertEqual(link.files(), [name])
+
+
+class TheSharedStartAfterAShortSystemPrompt(TheSharedStartOfAMessage):
+    """The same, where the system prompt is too short to be a cut. A typed
+    question's is a few lines, so the shared start is all there is to keep,
+    and nothing is loaded before it is read."""
+
+    def messages(self, case):
+        return [{"role": "system", "content": "Answer with one letter."},
+                {"role": "user", "content": self.RUBRIC + case}]
+
+    def setUp(self):
+        PrefixCase.setUp(self)
+        cuts, _, _, _ = router.prompt_cuts(
+            json.dumps({"messages": self.messages("x")}))
+        self.assertEqual(cuts, [], "the system prompt became a cut after all")
+
+    def test_the_first_request_has_nothing_to_share_with(self):
+        loaded, link = self.ask("one", "case one")
+        self.assertFalse(loaded)
+        self.assertEqual(link.ops(), [])
+
+    def test_the_second_reads_and_keeps_what_both_start_with(self):
+        self.ask("one", "case one")
+        loaded, link = self.ask("two", "case two")
+        self.assertTrue(loaded)
+        self.assertEqual(link.ops(), ["render", "prefill", "save"])
+        block = [call for call in link.calls if call[0] == "prefill"][0][3]
+        self.assertTrue(block.startswith("<system>Answer with one letter."))
+        self.assertTrue(block.endswith(self.RUBRIC), block[-60:])
+
+    def test_it_is_still_there_after_a_restart(self):
+        self.ask("one", "case one")
+        _, made = self.ask("two", "case two")
+        name = made.files("save")[0]
+        (SANDBOX.store.slots / name).write_bytes(b"x")
+        self.pool.save_openings()
+        again = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                          store=SANDBOX.store, watch=False)
+        again.adopt(remove=lambda name: None)
+        self.assertIn(name, again.openings.values())
+        self.pool, self.cpu = again, again.backends[0]
+        self.cpu.update(up=True, slots=3, n_ctx=150000, slots_detail=[])
+        _, link = self.ask("four", "case four")
+        self.assertEqual(link.files(), [name])
+
+    def test_template_options_name_a_different_start(self):
+        """They change what the template writes before the start."""
+        self.ask("one", "case one")
+        _, made = self.ask("two", "case two")
+        self.pool.link = self.renders()
+        self.pool.pins["five"] = pin("cpu", slot=None, inflight=True)
+        cuts, messages, system, tools = router.prompt_cuts(
+            json.dumps({"messages": self.messages("case five")}))
+        self.pool.warm_prefix("five", cuts, messages, system, tools,
+                              self.cpu, 1, "/v1/chat/completions",
+                              template={"enable_thinking": False})
+        self.assertNotIn(made.files("save")[0], self.pool.link.files())
+
+
 class WarmPrefix(PrefixCase, unittest.TestCase):
     """What a request does about an opening.
 
@@ -1938,6 +2316,40 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
         self.assertTrue(self.warm(post, cuts=self.CUTS))
         self.assertEqual(self.paths(post), ["restore"])
         self.assertEqual(post.files()[0], "deep-k2.park")
+
+    def refusing(self, error):
+        talk = self.talker()
+
+        def restore(be, slot, name, timeout=None):
+            talk._note("restore", be, slot, name)
+            raise error
+
+        talk.restore = restore
+        return talk
+
+    def test_an_opening_the_backend_refuses_is_dropped(self):
+        """A llama.cpp of another state version refuses every file the old
+        one saved. Kept, the opening failed to load on every request, and
+        nobody read a new one, because the router still had it."""
+        self.pool.openings["k1"] = "base-k1.park"
+        (SANDBOX.store.slots / "base-k1.park").write_bytes(b"old")
+        post = self.refusing(router.Rejected(
+            "400 on /slots/1?action=restore: invalid slot save file"))
+        self.assertFalse(self.warm(post))
+        self.assertNotIn("k1", self.pool.openings)
+        self.assertFalse((SANDBOX.store.slots / "base-k1.park").exists())
+
+        post = linked(self.pool, self.talker())
+        self.assertTrue(self.warm(post, system="rules"))
+        self.assertEqual(self.paths(post),
+                         ["render", "render", "prefill", "save"])
+
+    def test_an_opening_on_a_backend_that_is_down_is_kept(self):
+        """No answer is not a refusal: the backend may be restarting."""
+        self.pool.openings["k1"] = "base-k1.park"
+        post = self.refusing(ConnectionRefusedError("connection refused"))
+        self.assertFalse(self.warm(post))
+        self.assertIn("k1", self.pool.openings)
 
     def test_reads_nothing_when_the_opening_is_already_on_the_shelf(self):
         self.pool.openings["k1"] = "base-k1.park"
@@ -2062,6 +2474,44 @@ class WarmPrefix(PrefixCase, unittest.TestCase):
         self.assertEqual(list(self.pool.openings), ["k1", "k0"])
 
 
+class ABackendThatAnswersNoIsNotDown(unittest.TestCase):
+    """A slot file call raises either way, and the caller needs to know
+    which: a refused file is dead, an unreachable backend may come back."""
+
+    def serve(self, code, body):
+        class Answer(http.server.BaseHTTPRequestHandler):
+            def do_POST(inner):
+                inner.rfile.read(int(inner.headers["Content-Length"]))
+                inner.send_response(code)
+                inner.send_header("Content-Type", "application/json")
+                inner.end_headers()
+                inner.wfile.write(json.dumps(body).encode())
+
+            def log_message(inner, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Answer)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
+    def test_an_error_reply_is_a_rejection_with_the_reason(self):
+        url = self.serve(400, {"error": {"message": "invalid slot save file"}})
+        with self.assertRaises(router.Rejected) as said:
+            router.http_post(url, "/slots/0?action=restore", {}, timeout=5)
+        self.assertIsInstance(said.exception, OSError)
+        self.assertIn("invalid slot save file", str(said.exception))
+
+    def test_no_answer_is_no_rejection(self):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        with self.assertRaises(OSError) as said:
+            router.http_post(f"http://127.0.0.1:{port}", "/slots/0", {},
+                             timeout=5)
+        self.assertNotIsInstance(said.exception, router.Rejected)
+
+
 class SlotHistory(unittest.TestCase):
     """What a slot holds, so a later request can start from it."""
 
@@ -2100,8 +2550,9 @@ class AdoptFiles(unittest.TestCase):
         self.assertEqual(spent, [])
 
     def test_a_deeper_opening_is_given_back_to_the_disk(self):
-        """Nothing reads one, so keeping them is 8 GB of a 92% full nvme held
-        by four files that have never been loaded once."""
+        """Unless the last run said how much of a message it holds. Without
+        that nothing can match one, so keeping them is 8 GB of a 92% full
+        nvme held by four files that have never been loaded once."""
         openings, _, _, spent = self.sized(["base-k1.park", "deep-k2.park"])
         self.assertEqual(openings, OrderedDict(k1="base-k1.park"))
         self.assertEqual(spent, ["deep-k2.park"])
@@ -2592,6 +3043,15 @@ class DrainABackend(unittest.TestCase):
         self.assertEqual(self.pool.pins["a"]["parked"], "a.park")
         self.assertEqual(post.ops()[0], "save")
 
+    def test_a_cache_too_small_to_keep_is_not_left_behind(self):
+        """park_all skips it on purpose: reading it again is cheaper than a
+        copy. Counted as left, it made every drain answer 409, and
+        restart-backend.sh would not restart the backend at all."""
+        self.pool.pins["small"] = pin("gpu", slot=0, tokens=20)
+        linked(self.pool, self.saver())
+        report = self.pool.drain("gpu")
+        self.assertEqual(report["left"], 0)
+
     def test_draining_leaves_the_other_backend_alone(self):
         self.pool.pins["b"] = pin("cpu", slot=1)
         post = linked(self.pool, self.saver())
@@ -2663,10 +3123,10 @@ class PrefillStaysOffABackendThatDoesNotRead(unittest.TestCase):
         self.assertNotEqual(self.pool.acquire("a", 1000)[0]["name"], "gpu")
 
     def test_it_fills_the_reading_backends_in_order(self):
-        """Backwards through pref, so the best place to generate is read on
-        last and stays free to generate."""
-        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu2")
-        self.assertEqual(self.pool.acquire("b", 1000)[0]["name"], "cpu")
+        """Neither is measured yet, so the better generator reads first and
+        the next prompt goes to the other."""
+        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu")
+        self.assertEqual(self.pool.acquire("b", 1000)[0]["name"], "cpu2")
 
     def test_a_conversation_living_on_the_gpu_still_reads_elsewhere(self):
         """A later turn is not a few tokens. It can carry a whole file, and
@@ -2981,6 +3441,17 @@ class TheBackendTableIsCheckedAtStartup(unittest.TestCase):
         code, said = self.loading([self.row("gen", prefill=False)])
         self.assertNotEqual(code, 0)
         self.assertIn("can prefill", said)
+
+    def test_a_table_where_every_reader_names_its_paths_is_refused(self):
+        """A chat turn would find no backend to read it."""
+        code, said = self.loading([self.row("gpu", prefill=["/v1/systemone"])])
+        self.assertNotEqual(code, 0)
+        self.assertIn("reads every path", said)
+
+    def test_a_reader_for_some_paths_beside_one_for_all_loads(self):
+        code, said = self.loading([self.row("gpu", prefill=["/v1/systemone"]),
+                                   self.row("cpu", pref=1)])
+        self.assertEqual(code, 0, said)
 
     def test_a_table_with_nothing_to_generate_on_is_refused(self):
         code, said = self.loading([self.row("pre", generate=False)])
@@ -3407,17 +3878,20 @@ class WhatIsLeftToRead(unittest.TestCase):
 
 
 class WhereToGenerate(unittest.TestCase):
-    """Only the gpu generates, and a turn waits for it.
+    """A turn moves to the best place to generate that will take it.
 
-    It decodes about five times faster than a socket of cpu, and a generation
-    started on a cpu holds a slot that could be prefilling for the whole of
-    it: minutes of somebody else's read spent to save seconds on this turn.
-    So there is nothing to choose between. The turn goes to the gpu, and if
-    the gpu is busy it queues for it rather than settle for a cpu.
+    `pref` is the operator's order of where to generate. A turn read on one
+    backend moves to the first generator in that order, if it comes before
+    the reader: the gpu decodes about five times faster than a socket of cpu,
+    and a generation started on a cpu holds a slot that could be reading.
+    Busy is a queue to join, not a reason to settle for a cpu.
 
-    The one answer that is not the gpu is no answer at all: the gpu down,
-    draining, or too small for this prompt. Then the turn generates where its
-    prompt was read, because the alternative is not answering."""
+    Whether the generator also reads does not matter. A gpu that reads every
+    path is still where a turn read on a cpu should generate.
+
+    The answers that are not the gpu are no answer at all: the gpu down,
+    draining or too small for this prompt, or the turn already on it. Then
+    the turn generates where its prompt was read."""
 
     def setUp(self):
         self.pool = make_pool(
@@ -3434,47 +3908,74 @@ class WhereToGenerate(unittest.TestCase):
         be["busy"] = be["slots"]
 
     def test_the_gpu(self):
-        self.assertEqual(self.pool.generator(1000)["name"], "gpu")
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "gpu")
 
     def test_the_gpu_even_when_every_cpu_is_idle_and_it_is_not(self):
         """Busy is a queue to join, not a reason to go elsewhere."""
         self.fill(self.gpu)
-        self.assertEqual(self.pool.generator(1000)["name"], "gpu")
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "gpu")
 
     def test_never_a_cpu(self):
         for be in self.pool.backends:
             self.fill(be)
-        self.assertEqual(self.pool.generator(1000)["name"], "gpu")
+        self.assertEqual(self.pool.generator(1000, self.cpu2)["name"], "gpu")
 
     def test_nothing_when_the_gpu_is_down(self):
         self.gpu["up"] = False
-        self.assertIsNone(self.pool.generator(1000))
+        self.assertIsNone(self.pool.generator(1000, self.cpu))
 
     def test_nothing_when_the_gpu_is_draining(self):
         self.gpu["draining"] = True
-        self.assertIsNone(self.pool.generator(1000))
+        self.assertIsNone(self.pool.generator(1000, self.cpu))
 
     def test_nothing_when_the_prompt_outgrew_the_gpu(self):
         self.gpu["n_ctx"] = 4096
-        self.assertIsNone(self.pool.generator(100000))
+        self.assertIsNone(self.pool.generator(100000, self.cpu))
 
-    def test_a_migration_target_generates_and_does_not_prefill(self):
-        """Both halves, not one derived from the other: an instance that does
-        both is not worth carrying a turn to."""
-        self.assertFalse(self.gpu["prefill"])
-        self.assertTrue(self.gpu["generate"])
-        self.assertEqual(self.pool.generator(1000)["name"], "gpu")
-
-    def test_nothing_when_the_only_generator_also_prefills(self):
-        """A turn already sitting in a slot that can generate stays there."""
+    def test_a_generator_that_also_reads_is_still_the_place_to_generate(self):
+        """The rule that kept chat on a cpu at 5-7 tokens/s: an instance
+        that read as well was never a place to carry a turn to."""
         self.gpu["prefill"] = True
-        self.assertIsNone(self.pool.generator(1000))
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "gpu")
+
+    def test_a_generator_that_reads_some_paths_is_the_place_for_all(self):
+        self.gpu["prefill"] = ["/v1/systemone"]
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "gpu")
+
+    def test_nothing_when_the_turn_was_read_on_the_gpu(self):
+        """It is already in the best place: no carry to make."""
+        self.gpu["prefill"] = True
+        self.assertIsNone(self.pool.generator(1000, self.gpu))
+
+    def test_the_next_in_order_when_the_gpu_cannot_take_it(self):
+        """pref is the order. With the gpu down, the next one in it."""
+        self.gpu["up"] = False
+        self.assertEqual(self.pool.generator(1000, self.cpu2)["name"], "cpu")
+
+    def test_nothing_from_a_peer_of_the_same_pref(self):
+        """Equal pref says neither is a better place to generate, so a carry
+        between them buys nothing. Give peers the same pref."""
+        self.gpu["up"] = False
+        for be in (self.cpu, self.cpu0, self.cpu2):
+            be["pref"] = 1
+        self.assertIsNone(self.pool.generator(1000, self.cpu2))
+
+    def test_nothing_after_the_reader_in_the_order(self):
+        """A generator the operator ranked below the reader is no better
+        place to generate, even one that does nothing else."""
+        self.gpu["pref"] = 5
+        self.assertIsNone(self.pool.generator(1000, self.cpu))
+
+    def test_any_generator_for_a_reader_that_may_not_generate(self):
+        self.cpu["generate"] = False
+        self.gpu["pref"] = 5
+        self.assertEqual(self.pool.generator(1000, self.cpu)["name"], "cpu0")
 
     def test_nothing_when_the_candidate_does_not_generate(self):
         """prefill off and generate off is refused at startup, but a backend
         that only prefills is not a place to carry a turn to."""
         self.gpu["generate"] = False
-        self.assertIsNone(self.pool.generator(1000))
+        self.assertIsNone(self.pool.generator(1000, self.cpu))
 
 
 class AnInstanceThatDoesNotGenerate(unittest.TestCase):
@@ -3887,6 +4388,26 @@ class HandOff(unittest.TestCase):
         self.assertIs(self.go(self.mover()), self.gpu)
         hand.join()
 
+    def test_the_move_says_how_long_it_waited_for_the_generator(self):
+        """A turn read elsewhere waits for the generator to be free. That
+        wait is what a read on the generator costs the others."""
+        said = self.pool.events = Said()
+        self.gpu["busy"] = 1
+
+        def free_it():
+            time.sleep(0.3)
+            with self.pool.cv:
+                self.gpu["busy"] = 0
+                self.pool.cv.notify_all()
+
+        hand = threading.Thread(target=free_it, daemon=True)
+        hand.start()
+        self.go(self.mover())
+        hand.join()
+        (moved,) = said.of("migrate")
+        self.assertGreaterEqual(moved["waited"], 0.3)
+        self.assertLess(moved["waited"], 5)
+
     def test_gives_up_the_wait_when_the_client_leaves(self):
         """Nobody is owed an answer, and the reader is already back.
 
@@ -3957,6 +4478,35 @@ class HandOff(unittest.TestCase):
         self.go(self.mover())
         self.assertEqual(self.pool.recent[0]["did"], "moved")
 
+    def test_a_generator_that_also_reads_takes_the_turn(self):
+        """Read on a cpu, generated on the gpu, though the gpu reads too."""
+        self.gpu["prefill"] = True
+        self.assertIs(self.go(self.mover()), self.gpu)
+        self.assertEqual(self.pool.pins["a"]["backend"], "gpu")
+
+    def test_a_turn_read_on_the_generator_stays_there(self):
+        self.gpu["prefill"] = True
+        self.pool.pins["a"] = pin("gpu", slot=0, inflight=True)
+        self.gpu["busy"], self.cpu["busy"] = 1, 0
+        post = linked(self.pool, self.mover())
+        self.assertIs(self.pool.hand_off("a", self.gpu, 1000), self.gpu)
+        self.assertEqual(post.calls, [])
+
+    def test_the_cache_the_generator_holds_is_parked_before_the_restore(self):
+        """The restore writes over the generator's slot. Whatever another
+        conversation left there is copied out first, as it is before a read
+        lands on a backend. A generator that also reads keeps no copy after
+        its turns, so without this the next turn of that conversation read
+        its whole prompt again."""
+        self.pool.pins["b"] = pin("gpu", slot=0)
+        post = linked(self.pool, self.mover())
+        self.assertIs(self.go(post), self.gpu)
+        on_gpu = [(op, name) for op, be, *rest in post.calls if be == "gpu"
+                  for name in rest[1:2]]
+        self.assertEqual(on_gpu, [("save", "b.park"), ("restore", "a.park")])
+        self.assertEqual(self.pool.pins["b"]["parked"], "b.park")
+        self.assertIsNone(self.pool.pins["b"]["slot"])
+
 
 class WhatMustStayResident(unittest.TestCase):
     """The backend says what it mapped and what it reads lazily. The
@@ -3997,6 +4547,266 @@ class WhatMustStayResident(unittest.TestCase):
         self.assertEqual(router.resident_bytes({}), 0)
 
 
+def reads_at(be, rate):
+    """Give a backend a lifetime prompt rate, as its /metrics would."""
+    be["counters"] = {"prompt_tokens_total": rate * 100.0,
+                      "prompt_seconds_total": 100.0}
+
+
+class TheFastestReaderReadsFirst(unittest.TestCase):
+    """A prompt goes to the free reader that reads fastest, as measured.
+
+    pref says where to generate, not where to read. Read backwards through
+    pref, the best generator was read on last, so a gpu that reads two to
+    three times faster than a cpu socket read nothing while a cpu was free.
+    The measure is the backend's own lifetime prompt rate. A reader not yet
+    measured goes first, or it is never measured. Between equal rates the
+    better generator reads: then the turn needs no move."""
+
+    def setUp(self):
+        self.pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": True, "generate": True, "node": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1, "prefill": True, "generate": True, "node": 1}],
+            watch=False)
+        self.gpu, self.cpu = self.pool.backends
+        for be in self.pool.backends:
+            be.update(up=True, slots=1, n_ctx=150000)
+
+    def first(self):
+        return self.pool.acquire("a", 1000)[0]["name"]
+
+    def test_the_faster_reader(self):
+        reads_at(self.gpu, 100)
+        reads_at(self.cpu, 45)
+        self.assertEqual(self.first(), "gpu")
+
+    def test_whatever_pref_says(self):
+        reads_at(self.gpu, 30)
+        reads_at(self.cpu, 45)
+        self.assertEqual(self.first(), "cpu")
+
+    def test_one_not_yet_measured_reads_first(self):
+        reads_at(self.cpu, 45)
+        self.assertEqual(self.first(), "gpu")
+
+    def test_one_not_yet_measured_reads_first_whatever_its_pref(self):
+        reads_at(self.gpu, 100)
+        self.assertEqual(self.first(), "cpu")
+
+    def test_between_equal_rates_the_better_generator(self):
+        reads_at(self.gpu, 45)
+        reads_at(self.cpu, 45)
+        self.assertEqual(self.first(), "gpu")
+
+    def test_a_busy_node_still_counts_before_speed(self):
+        """Two reads on one socket halve each other, and the gpu reads with
+        its socket's cores: its experts are in RAM."""
+        pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0, "node": 0},
+             {"name": "cpu0", "url": "http://cpu0", "pref": 1, "node": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1, "node": 1}],
+            watch=False)
+        gpu, cpu0, cpu = pool.backends
+        for be in pool.backends:
+            be.update(up=True, slots=1, n_ctx=150000)
+        cpu0.update(busy=1, slots_detail=[{"id": 0, "busy": True,
+                                           "phase": "reading"}])
+        reads_at(gpu, 100)
+        reads_at(cpu, 45)
+        self.assertEqual(pool.acquire("a", 1000)[0]["name"], "cpu")
+
+
+class Said:
+    """An event log that keeps what it was told, for a case to read."""
+
+    def __init__(self):
+        self.rows = []
+
+    def write(self, event, **fields):
+        self.rows.append(dict(fields, event=event))
+
+    def of(self, event):
+        return [row for row in self.rows if row["event"] == event]
+
+
+class AReadOnTheGeneratorEndsBeforeItIsNeeded(unittest.TestCase):
+    """The best generator reads too, but not into the time it owes.
+
+    A read cannot be stopped once it starts, and while it runs the gpu
+    generates for nobody. A turn read on a cpu that finds the gpu reading
+    waits for it, or the router would have to settle for 5-7 tokens/s on
+    the cpu. So the gpu takes a read only when the read should end before
+    the first turn that wants it to generate: none waits to generate there,
+    none whose cache is in its slot waits to come back, and the read ends
+    before every read in flight on a cpu whose turn moves to the gpu.
+
+    The router knows each of those: the rates, the queue, and how much is
+    left to read, from the slot's own count or the turn's estimate."""
+
+    def setUp(self):
+        self.said = Said()
+        self.pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": True, "generate": True, "node": 0},
+             {"name": "cpu", "url": "http://cpu", "pref": 1, "prefill": True, "generate": True, "node": 1},
+             {"name": "cpu2", "url": "http://cpu2", "pref": 1, "prefill": True, "generate": True, "node": 1}],
+            events=self.said, watch=False)
+        self.gpu, self.cpu, self.cpu2 = self.pool.backends
+        for be in self.pool.backends:
+            be.update(up=True, slots=1, n_ctx=150000)
+        reads_at(self.gpu, 100)
+        reads_at(self.cpu, 50)
+        reads_at(self.cpu2, 50)
+
+    def reading_on(self, be, conv, left, phase="reading"):
+        """A turn in flight on `be`, with `left` tokens still to read."""
+        self.pool.pins[conv] = dict(pin(be["name"], slot=0, inflight=True),
+                                    using=0)
+        be["busy"] = 1
+        be["slots_detail"] = [{"id": 0, "busy": True, "phase": phase,
+                               "prompt": left}]
+
+    def reader(self, conv, tokens):
+        return self.pool.acquire(conv, tokens)[0]["name"]
+
+    def test_with_nothing_in_flight_a_long_read_takes_the_gpu(self):
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_a_long_read_goes_elsewhere_when_a_turn_wants_the_gpu_first(self):
+        """500 tokens left on a cpu is 10 s. 100,000 on the gpu is 1000 s."""
+        self.reading_on(self.cpu, "x", 500)
+        self.assertEqual(self.reader("new", 100000), "cpu2")
+
+    def test_a_turn_that_answers_where_it_reads_holds_nothing_back(self):
+        """A typed /v1/systemone turn answers on the backend that read it, so
+        it never needs the gpu to generate. Counted as one that does, it kept
+        the gpu idle while typed calls queued for the cpus."""
+        self.reading_on(self.cpu, "x", 500)
+        self.pool.note_stage("x", "prefill", "cpu", 0, "typed", stays=True)
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_a_short_read_still_takes_the_gpu(self):
+        """2,000 tokens on the gpu is 20 s, done before the cpu's 100 s."""
+        self.reading_on(self.cpu, "x", 5000)
+        self.assertEqual(self.reader("new", 2000), "gpu")
+
+    def test_no_read_while_a_turn_waits_to_generate_there(self):
+        self.pool.generate_waits["gpu"] = 1
+        self.assertNotEqual(self.reader("new", 10), "gpu")
+
+    def test_a_turn_whose_cache_is_in_the_slot_goes_first(self):
+        self.pool.pins["warm"] = pin("gpu", slot=0)
+        self.pool.begin_wait("warm", 1000)
+        self.assertNotEqual(self.reader("new", 10), "gpu")
+
+    def test_a_parked_copy_still_holds_its_warm_slot(self):
+        """A park is a copy: the slot keeps the cache until a turn takes it,
+        so a waiter with both still holds the generator. Guarding on `parked`
+        would read a warm reuse as a disk recall."""
+        self.pool.pins["warm"] = pin("gpu", slot=0, parked="warm.park")
+        self.pool.begin_wait("warm", 1000)
+        self.assertNotEqual(self.reader("new", 10), "gpu")
+
+    def test_a_waiter_too_big_for_the_generator_holds_nothing(self):
+        """A waiter that cannot fit on the generator must spill to a cpu, so
+        it must not keep the generator idle while a read waits for it."""
+        self.pool.pins["warm"] = pin("gpu", slot=0)
+        self.gpu["n_ctx"] = 500
+        self.pool.begin_wait("warm", 100000)
+        self.assertEqual(self.reader("new", 10), "gpu")
+
+    def test_its_own_cache_in_the_slot_is_read_there_whatever_waits(self):
+        """Read elsewhere, it would cost a copy out and a carry back."""
+        self.pool.pins["a"] = pin("gpu", slot=0)
+        self.reading_on(self.cpu, "x", 10)
+        self.pool.generate_waits["gpu"] = 1
+        self.assertEqual(self.reader("a", 100000), "gpu")
+
+    def test_a_pin_to_the_gpu_without_its_cache_there_is_held_too(self):
+        """A stale copy or a lost slot makes a pinned turn read from
+        nothing, as long a read as any."""
+        self.pool.pins["a"] = pin("gpu", slot=None)
+        self.reading_on(self.cpu, "x", 500)
+        self.pool.tuning = replace(self.pool.tuning, pin_patience=0.0)
+        self.assertEqual(self.reader("a", 100000), "cpu2")
+
+    def test_a_turn_generating_where_it_was_read_wants_nothing(self):
+        self.reading_on(self.cpu, "x", 0, phase="generating")
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_a_read_whose_turn_moves_nowhere_wants_nothing(self):
+        """A peer of the gpu's pref keeps its turns, so the gpu owes it
+        nothing."""
+        self.gpu["pref"] = 1
+        self.reading_on(self.cpu, "x", 500)
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_a_turn_not_yet_reading_counts_by_its_estimate(self):
+        """Between the claim and the first poll that shows it reading, the
+        estimate is all there is. 1,000 tokens on a cpu is 20 s."""
+        self.pool._take(self.cpu, "x", tokens=1000)
+        self.assertEqual(self.reader("new", 100000), "cpu2")
+        self.assertEqual(self.reader("short", 1000), "gpu")
+
+    def test_only_what_is_left_to_read_counts(self):
+        """A copy on disk is restored, so only what came after it is read:
+        1,000 tokens, 10 s on the gpu, done before the cpu's 20 s."""
+        self.reading_on(self.cpu, "x", 1000)
+        self.pool.pins["back"] = pin("(before the restart)", slot=None,
+                                     parked="back.park", tokens=99000)
+        self.assertEqual(self.reader("back", 100000), "gpu")
+
+    def test_without_a_copy_the_whole_prompt_counts(self):
+        self.reading_on(self.cpu, "x", 1000)
+        self.pool.pins["back"] = pin("(before the restart)", slot=None,
+                                     tokens=99000)
+        self.assertEqual(self.reader("back", 100000), "cpu2")
+
+    def test_nothing_is_held_on_a_rate_not_measured_yet(self):
+        """Without a rate there is no telling which read ends first, and a
+        guess either way could hold a read back for as long as the other
+        one runs. One read measures it."""
+        self.reading_on(self.cpu, "x", 500)
+        del self.gpu["counters"]
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_nor_on_a_reader_elsewhere_not_measured_yet(self):
+        self.reading_on(self.cpu, "x", 500)
+        del self.cpu["counters"]
+        self.assertEqual(self.reader("new", 100000), "gpu")
+
+    def test_with_no_other_reader_free_it_waits_for_one(self):
+        self.reading_on(self.cpu, "x", 500)
+        self.reading_on(self.cpu2, "y", 500)
+        got = {}
+
+        def ask():
+            got["be"] = self.pool.acquire("new", 100000)[0]["name"]
+
+        threading.Thread(target=ask, daemon=True).start()
+        time.sleep(0.3)
+        self.assertNotIn("be", got, "it read on the gpu")
+        with self.pool.cv:
+            self.cpu["busy"] = 0
+            self.cpu["slots_detail"] = [{"id": 0, "busy": False, "phase": "idle"}]
+            self.pool.pins["x"]["inflight"] = False
+            self.pool.cv.notify_all()
+        for _ in range(30):
+            if "be" in got:
+                break
+            time.sleep(0.1)
+        self.assertEqual(got.get("be"), "cpu")
+
+    def test_it_says_when_it_kept_the_gpu_free(self):
+        self.reading_on(self.cpu, "x", 500)
+        self.reader("new", 100000)
+        self.assertEqual([(row["backend"], row["reader"])
+                          for row in self.said.of("keep")], [("gpu", "cpu2")])
+
+    def test_it_says_nothing_when_it_kept_nothing(self):
+        self.reader("new", 100000)
+        self.assertEqual(self.said.of("keep"), [])
+
+
 class SpreadReadsAcrossNodes(unittest.TestCase):
     """Two reads on one socket share its cores. On two sockets they do not.
 
@@ -4022,17 +4832,12 @@ class SpreadReadsAcrossNodes(unittest.TestCase):
                                "phase": "reading" if n < how_many else "idle"}
                               for n in range(be["slots"])]
 
-    def test_reading_takes_the_opposite_order_to_generating(self):
-        """pref says where to generate. A prompt goes to the last of those, so
-        the instances kept for generating stay free to generate."""
-        self.assertEqual(self.pool.acquire("a", 1000)[0]["name"], "cpu2")
-
     def test_the_second_read_crosses_to_the_other_node(self):
         """Not the other slot on node 1, which would share its cores."""
         self.reading(self.cpu2, 1)
         self.assertEqual(self.pool.acquire("b", 1000)[0]["name"], "cpu0")
 
-    def test_the_generating_instance_is_read_on_last(self):
+    def test_a_quiet_instance_beats_a_second_slot_on_a_node_as_busy(self):
         self.reading(self.cpu2, 1)
         self.reading(self.cpu0, 1)
         self.assertEqual(self.pool.acquire("c", 1000)[0]["name"], "cpu")
@@ -4054,7 +4859,7 @@ class SpreadReadsAcrossNodes(unittest.TestCase):
         turn while cpu generates, and loses it the moment cpu reads."""
         self.cpu["slots_detail"] = [{"id": 0, "busy": True, "phase": "generating"},
                                     {"id": 1, "busy": False, "phase": "idle"}]
-        self.assertEqual(self.pool.acquire("e", 1000)[0]["name"], "cpu2")
+        self.assertEqual(self.pool.acquire("e", 1000)[0]["node"], 1)
         self.reading(self.cpu, 1)
         self.assertEqual(self.pool.acquire("f", 1000)[0]["name"], "cpu0")
 
@@ -4198,6 +5003,15 @@ class TheHandoffCanBeTurnedOff(unittest.TestCase):
 
         post = linked(self.pool, FakeLink(written=200_000_000))
         self.assertIs(self.pool.hand_off("a", self.cpu, 1000), self.gpu)
+
+    def test_the_slot_it_moves_into_holds_nobody_else_after(self):
+        """The restore overwrites the generator's slot. A claim left on it
+        was copied again before later turns, with this cache inside."""
+        self.pool.tuning = replace(SANDBOX.tuning, handoff=True)
+        self.pool.pins["old"] = pin("gpu0_0", slot=0, parked="old.park")
+        linked(self.pool, FakeLink(written=200_000_000))
+        self.assertIs(self.pool.hand_off("a", self.cpu, 1000), self.gpu)
+        self.assertIsNone(self.pool.pins["old"]["slot"])
 
 
 class TheRightPingForTheProtocol(unittest.TestCase):

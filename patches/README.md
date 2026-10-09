@@ -5,8 +5,8 @@ ggml-org master `8e1642198`, the commit that `llama-ref` names.
 
 - The server patches in this directory change `llama-server`. Three of them
   are required.
-- The CPU speed patches in `cpu/` make Qwen3.8-Flash-Next faster on the CPU
-  backend. None of them is required. `cpu/core/` applies by default, and each
+- The speed patches in `cpu/` make Qwen3.8-Flash-Next faster on the CPU
+  backend; from `core/0021` on, some change the scheduler and the CUDA backend. None of them is required. `cpu/core/` applies by default, and each
   set in `cpu/optional/` applies only when `CPU_OPTIONAL` names it.
 
 `tools/get-llama.sh` checks out that commit and applies the server patches in
@@ -74,6 +74,61 @@ it does not move. `n_prompt_tokens` keeps its existing meaning.
 The anthropic endpoint converts a request body through a whitelist. It drops
 every field that is not on that list, including `id_slot`. A router in front of
 the server therefore cannot say which slot a request must use.
+
+### moe-sum-where-the-experts-run.patch
+
+Not required. It speeds up a backend that keeps its experts in RAM and the
+rest on a card.
+
+The weighting of the expert outputs by the router and their sum have no
+weight, so the scheduler places them by their neighbours, and its
+expand-gpu-up pass put them on the card. Every layer then copied all the
+used experts' rows over PCIe: at 512 tokens and 10 experts, 50 MB, where
+the sum is 5 MB. The patch puts them on the backend that runs the experts'
+matmul. A backend with its experts on the card, or op offload of a large
+batch, keeps them there.
+
+Measured on koishi (RTX A4000 on PCIe gen3 x8, experts in RAM, op offload
+off), three alternating rounds: prompt 8.38 / 8.39 / 8.47 ms a token
+against 7.48 / 7.55 / 7.51 (+10.7%); a 4-token verify step 134.5 to 131.6
+ms, within noise. Over 20 chunks the outputs moved by mean KLD 0.045
+against the unpatched GPU run, less than a CPU-only run of the same model
+(0.047): the size of any change of summation order on this model. PPL
+ratio 0.998 ± 0.005.
+
+`weight_op_backend` repeats the rule of pass 1 of
+`ggml_backend_sched_split_graph`. If upstream changes that rule, this
+copy must follow it.
+
+### sched-reserve-keeps-the-scheduler.patch
+
+Not required. A port of upstream #28872.
+
+With `--backend-sampling`, llama-server's slot reset detaches the sampler
+after every request, so the next one sets `sched_need_reserve`, and
+`sched_reserve()` destroyed and rebuilt the whole backend scheduler: every
+compute buffer and the pinned host input buffer, freed and allocated again.
+The patch re-reserves on the existing scheduler.
+
+Measured on koishi's gpu backend layout, a cached 1000-token prefix plus 10
+to 50 new tokens per request, three rounds: time to first token rose by 332
+to 377 ms per plain request with backend sampling against without it, and
+by 40 to 56 ms with the patch. A run of grammar requests never paid it,
+because a grammar turns backend sampling off. Outputs, grammar
+probabilities and perplexity identical.
+
+### slot-state-carries-the-draft-kv.patch
+
+Not required, but every hand-off from a reader to a generator needs it to
+draft well. A slot file held only the target context's state; the MTP draft
+keeps its own KV over the prompt, so after a restore it drafted over an empty
+or a foreign KV. The save appends the draft's state after the checkpoints
+(magic "QDFT", about 5 MB per 2K tokens), and the restore loads it; a file
+without the block restores with the draft KV cleared. A context checkpoint
+also keeps the MTP head's pending hidden state. Measured on a CPU test server,
+an 1856-token prompt, 128 tokens at temperature 0, the same text: a fresh
+server after a restore accepted 70 of 170 drafts before and 75 of 154 after,
+the same as the server that read the prompt.
 
 ### anthropic-apply-template.patch
 
@@ -201,6 +256,18 @@ and 12.2% on tg128, so a smaller single-run change is not a result.
 | `core/0010` | K3 | The MoE weighted reduction runs as one kernel, not one multiply and one add per expert, each with a barrier. A port of the CUDA fusion. | *paired* on stack2: pp512 +2.6%, pp2048 +3.2%, 8k prefill +0.7% | bit-exact (306 cases) |
 | `core/0011 to 0013` | U4 | Batch-1 flash attention decode scores KV cells in blocks of 32, with one vectorised softmax for each block. 0012 aligns large host buffers to 2 MiB for huge pages. 0013 adds test cases. A port of upstream #27478. | tg128 +1.7% | numerically close: 4574 of 5317 cases differ. KLD 0 at 8192, but the perplexity test reads in batches and does not run this path. Greedy replies differ. |
 | `core/0014 to 0017` | K1 | A long prefill honours the `n_kv_max` sparse hint: each group of 8 query tokens reads only the 64-cell KV tiles in which one of its rows sees a cell. CUDA, Vulkan and Metal already do this. | on U4: 32k depth read 30.7 tok/s against 24.0 (+27.6%) | bit-exact against U4 (5338 cases, 32 and 16 threads). KLD 0, PPL ratio 1.0001 at 8192 |
+| `core/0018` | N0 | `ggml_is_numa()` is true on any machine with two nodes, and matmul, `mul_mat_id`, repack, flash attention and `gated_delta_net` then split work in fixed slices per thread. A backend that numactl binds to one node lost the balance for nothing, and X3's flat work list never ran. The split now asks whether the process's own CPUs span nodes. | koishi, one node of a 2x Xeon Gold 6150: verify step of 4 tokens 322 and 317 ms against 304 and 305 (about +5% generate) idle, and about +9% on a busy box. Prompt unchanged when idle. | the same rows by other threads. PPL identical to the last printed digit (3 chunks of 512), old against new |
+| `core/0019` | | `test-backend-ops` perf cases at Qwen3.8-Flash-Next's expert shapes (512 experts, 10 used, 2560 and 640 wide, 1, 4 and 512 tokens), and `GGML_TEST_THREADS` for the CPU backend's thread count. | | tests only |
+| `core/0020` | N2 | A Q8_0 expert with 1 to 4 rows reads each weight row once for all its rows, with a software prefetch 4 KiB ahead, instead of once per row. | koishi, node 0: 4-token expert matmul +9 to 10%; verify step 310.9 to 305.5 ms mean (+1.7 to 2.8%, beyond the spread in two of three A/Bs) | bit-exact (27000 outputs; PPL identical) |
+| `core/0021` | | upstream #29796 rebased: on one device, a stream synchronize returns at once when nothing was submitted since the last one. | no gain alone on koishi | exact |
+| `core/0022` | N3 | The scheduler queues the copies between host memory and a backend's own buffer on that backend's stream: host-to-card copies run ahead of the graph launch, and the card-to-host copies of one split share one synchronize. An event lets the call return once the host memory it reads is free. | with 0021, a 4-token verify step about 2% faster on koishi; 404 syncs a step fell to 78 | exact. Tested on one card only |
+| `core/0023` | | `test-backend-ops` cases for the GPU verify path at the model's shapes: GDN with 3 value heads per q/k head, the dense Q8_0 weights, the indexer at kv 256, 8192 and 32768. | | tests only |
+| `core/0024` | | CUDA `concat` of a non-contiguous source runs one thread per element; one 256-thread block per row left 249 threads idle. The DeltaNet conv-state concat went 25.5 to 2.6 us a call. | koishi: 945 to 97 us of card time a verify step, below the 1-3 ms spread end to end | exact (a copy) |
+| `core/0025` | | The CUDA vector lightning indexer reads its keys once for all the batches of a block (Strata #187). | kv 32768 (about 128K context): 190 to 115 us; the same at short context | exact |
+| `core/0026` to `0030` | N4 | CUDA, for a 4-token verify step: up to 4 MMVQ products of one input run as one launch on one q8_1 quantization (0026); MMF uses 16-row tiles for matrices of few row tiles, so the router runs 32 blocks, not 16 (0027); a warp per row pair for MMVQ at K of 1024 or less (0028); 0029 drops perf cases that timed the wrong node; qwen4exp builds the hyper-connection inject product where it is made, so all 96 down+inject pairs fuse (0030). | koishi: card kernel time a verify step 23.26 to 20.92 ms; verify step 111.3 to 108.7 ms mean (clean A/B) | exact: the logits of a 4-token run are bit-identical; MUL_MAT 2127 OK |
+| `core/0031` to `0033` | N5 | `ggml_barrier` spins on an atomic with OpenMP too (0031): under `OMP_WAIT_POLICY=PASSIVE` every `omp barrier` slept in the kernel, and 34% of a CPU verify step's thread time was barrier wait. Idle workers still sleep between graphs. Below 64 routed rows, gate, up, SWIGLU, the Q8_0 quantize and down run as one op with 3 barriers instead of 7, threads taking row blocks from a counter (0032), 128/256-row blocks (0033). | koishi: CPU verify step 313 to 261 ms (-15%), CPU prompt about -7%, GPU verify step 118 to 110 ms (-6%). Two busy instances on one node: both faster (about 367 to 330 ms) | exact: PPL identical at ub 512 and 4, CPU and GPU runs |
+| `core/0034`, `0035` | G1 | The dist sampler picks by the Gumbel-max trick, its noise a hash of (seed, accepted count, token id), and the MTP drafter picks with a copy of the target's sampler chain, so a draft and the target agree more often when sampling (Strata #1281). dist runs on the CPU, after the backend's top-k. 0035 updates `test-backend-sampler`. | koishi, temperature 1.0: generate 20.61 to 22.10 tok/s (+7.2%, rounds 2-4 of 4, order alternated), acceptance 0.555 to 0.611; temperature 0 unchanged | the output distribution is the same; a fixed seed gives other text than before. Greedy output byte-identical |
+| `core/0036` to `0038` | G2 | `set_sampler()` stores a key of the chain's backend sampling graph per sequence and no longer asks for a reserve; `sched_reserve()` runs only when the keys differ from the last reserve. With `--backend-sampling` every request re-reserved, because the slot reset detaches the sampler and the next request attaches a new chain with the same graph. | koishi, on top of 0034-0035: time to first token of a plain request 876 / 894 to 824 / 837 ms (-52, -57 ms); reserves per 10 requests 10 to 1 | identical outputs; `test-backend-sampler` passes on GPU and CPU |
 | `optional/I1/0001, 0002` | I1 | A SIMD sigmoid, which the gated `dsv4_hc_pre` now uses row by row. | *paired* on stack2: pp512 +2.4%, 8k prefill +1.7% | at most 1.2e-7 per op. KLD 0.020, same top token 96.0%, PPL ratio 0.9972 ± 0.0037 at 512 |
 | `optional/Q1/0001, 0002` | Q1 | `ggml_argsort_top_k` passes k as a hint, and the CPU kernel sorts only the top k of a row. The MoE router sorted 512 ids to read 10. | *paired* on stack2: generate +0.9 to +3.2%, tg128 +1.3% | bit-exact (1047 cases). KLD 0.002, same top token 99.5%, PPL ratio 0.9984 ± 0.0015 at 512 |
 

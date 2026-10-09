@@ -17,6 +17,13 @@
 # Where llama-server is. Default: the patched llama.cpp that tools/get-llama.sh
 # builds under the checkout. patches/README.md says what the patches do and why.
 # SERVER_MTP=/opt/llama.cpp/build/bin/llama-server
+# koishi builds the pin in a second worktree, llama.cpp-pin, so the old fork
+# kept running while it built: DIR=$PWD/llama.cpp-pin LLAMA_REF= CUDA=1
+# CMAKE_ARGS=-DCMAKE_CUDA_ARCHITECTURES=86 tools/get-llama.sh. Its
+# SERVER_MTP points at the newest release worktree (llama.cpp-rel4), built
+# the same way from the current patches/; the one before it (llama.cpp-rel3)
+# stays for a rollback and as the baseline of open experiments. llama.cpp-pin stays
+# at the commit the experiments in docs/GPU-FOLLOWUPS.md measure against.
 
 # A different model. MODELS only moves the directory, so a model with another
 # name needs these too. DRAFT is the MTP draft model. Default: ggml-org's
@@ -75,17 +82,44 @@
 # '
 #
 # The JSON has the same names plus what each instance may do: "prefill" and
-# "generate". "pref" orders the instances a turn would rather generate on.
-# Both on: read and answer in place. Prefill off: the generator that turns
-# migrate to. Generate off: read for the pool and hand every turn on. The
-# router refuses a table with nothing to prefill on, nothing to generate on,
-# or an instance that does neither.
+# "generate". "pref" orders the instances a turn would rather generate on,
+# lowest first. A turn read on one instance moves to the first instance in
+# that order that generates and can take it, if that one comes before the
+# reader; otherwise it is answered where it was read. Peers get the same pref:
+# a move between two equal instances costs a copy and buys nothing.
+# Prefill off: an instance that only answers. Generate off: read for the pool
+# and hand every turn on. The router refuses a table with nothing to prefill
+# on, nothing to generate on, or an instance that does neither.
+#
+# "prefill" can also list the paths an instance reads for. At least one
+# instance must read every path.
+# A prompt is read on the free reader with the highest measured prompt rate,
+# after the rule that keeps two reads off one socket. A reader that turns
+# move to reads only what it should finish before the first turn that needs
+# it to generate: none waiting to generate there, and every read in flight
+# whose turn moves there ends later. So a gpu that reads every path reads
+# short prompts and quiet-time long ones, and stays free for the rest.
+#
+# koishi runs gpu0_0 with "prefill": ["/v1/systemone"]. Before the rules
+# above, "prefill": true made it one reader among four: the router read on it
+# last, and a cpu reader kept the turn it read, so chat generated on a cpu at
+# 5-7 tok/s instead of the gpu. With them, the table to try is gpu0_0
+# "prefill": true, pref 0, and the three cpu readers at one shared pref 1.
+# It first went back
+# to false: the gpu read 120-token questions at 9.4 tokens/s, because each
+# batch copied the experts over PCIe. With GGML_OP_OFFLOAD_MIN_BATCH high
+# (bin/qwen-mtp.sh) it reads them at about 68, against 37 on a cpu socket.
 #
 #   [{"name": "gpu0_0", "url": "http://127.0.0.1:8080", "pref": 0,
 #     "prefill": false, "generate": true,  "node": 0},
 #    {"name": "cpu1_0", "url": "http://127.0.0.1:8081", "pref": 1,
 #     "prefill": true,  "generate": true,  "node": 1}]
 #
+# koishi runs the gpu backend on both sockets (core/0039): each socket's
+# threads read the experts from that socket's own copy of the model files.
+#   gpu0_0 8080 qwen-mtp.sh BATCH=512 UBATCH=512 NODE=0,1 NUMA_MODE=distribute LLAMA_NUMA_MIRROR=1:/mnt/nvme/models/=/mnt/nvme/models-node1/
+# and one CPU reader per node (cpu0_0, cpu1_0). With node 1 to itself it
+# generated 10.9% faster and read prompts 29% faster than on node 0 alone.
 # export ROUTER_BACKENDS=$ROOT/backends.local.json
 
 # The provider id in a generated client config. It names the machine, not

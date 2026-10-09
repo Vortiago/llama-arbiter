@@ -1,0 +1,385 @@
+From 947431d9b757698bbceef8357532c85b6ea5edba Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 09:22:10 +0200
+Subject: [PATCH] tests: backend-sampler tests for a dist that picks on the CPU
+
+dist has no backend implementation since the Gumbel-max pick. A chain that ends in dist
+now runs its filters on the backend and picks on the CPU, so no backend token is set.
+
+- The tests that read a backend dist token now sample with the chain.
+- dist_and_cpu: a CPU dist that was never set on the context picks what the context's
+  chain picks, with the same seed (it used two seeds before).
+- The multi-output tests check each pick against a new dist(seed) that has accepted the
+  same count, over the row's candidates. This replaces the mt19937 inverse-CDF reference.
+  It still checks that a row sampled without accept, or a state restored with
+  llama_sampler_copy, does not move the noise, and that each sequence uses its own seed.
+- No backend sampler fills probs now; the probs checks are gone.
+
+The old test fails 10 of 19 cases on this branch; this one passes 19 of 19 (Qwen3-0.6B,
+CUDA). Against rel3 it fails 6, the cases that check the new pick.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ tests/test-backend-sampler.cpp | 166 +++++++++++++++++----------------
+ 1 file changed, 88 insertions(+), 78 deletions(-)
+
+diff --git a/tests/test-backend-sampler.cpp b/tests/test-backend-sampler.cpp
+index 56736ac46..6ec70baa6 100644
+--- a/tests/test-backend-sampler.cpp
++++ b/tests/test-backend-sampler.cpp
+@@ -316,6 +316,34 @@ static llama_sampler * test_single_output_backend_sampler_init(
+     return llama_sampler_init(&test_single_output_backend_sampler_i, ctx);
+ }
+ 
++// Apply smpl to the candidates the backend left in output row idx, without accept. Returns the selected id.
++static llama_token apply_to_row(llama_sampler * smpl, llama_context * ctx, int32_t idx) {
++    const float *       logits = llama_get_sampled_logits_ith(ctx, idx);
++    const llama_token * ids    = llama_get_sampled_candidates_ith(ctx, idx);
++    const uint32_t      n      = llama_get_sampled_logits_count_ith(ctx, idx);
++    GGML_ASSERT(logits != nullptr && ids != nullptr && n > 0);
++
++    std::vector<llama_token_data> cur(n);
++    for (uint32_t i = 0; i < n; ++i) {
++        cur[i] = { ids[i], logits[i], 0.0f };
++    }
++    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++    llama_sampler_apply(smpl, &cur_p);
++    GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < (int64_t) cur_p.size);
++
++    return cur_p.data[cur_p.selected].id;
++}
++
++// The pick of a new dist(seed) that has accepted n_accept tokens, over the candidates of output row idx.
++// dist draws its noise from (seed, accepted count, token id), so this is the pick a dist with that history makes.
++static llama_token reference_dist_pick(llama_context * ctx, int32_t idx, uint32_t seed, int n_accept) {
++    llama_sampler_ptr dist(llama_sampler_init_dist(seed));
++    for (int i = 0; i < n_accept; ++i) {
++        llama_sampler_accept(dist.get(), 0);
++    }
++    return apply_to_row(dist.get(), ctx, idx);
++}
++
+ static void test_backend_greedy_sampling(const test_params & params) {
+     const int seq_id = 0;
+ 
+@@ -730,15 +758,21 @@ static void test_backend_dist_sampling(const test_params & params) {
+     }
+ 
+     int32_t batch_idx = test_ctx.idx_for_seq(seq_id);
+-    llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
+-    printf("dist sampled id:%d, string:'%s'\n", token, test_ctx.token_to_piece(token, false).c_str());
+-    GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+-    //GGML_ASSERT(llama_get_sampled_logits_ith(test_ctx.ctx.get(), batch_idx) == nullptr);
+ 
+-    token = llama_get_sampled_token_ith(test_ctx.ctx.get(), -1);
++    // dist has no backend implementation: the backend leaves the full logits, and the chain picks on the CPU
++    GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx) == LLAMA_TOKEN_NULL);
++    GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), batch_idx) == (uint32_t) test_ctx.n_vocab);
++
++    // index -1 is the last output, the same row as batch_idx
++    llama_sampler_ptr chain_last(llama_sampler_clone(backend_sampler_chain.get()));
++    llama_token token = llama_sampler_sample(backend_sampler_chain.get(), test_ctx.ctx.get(), batch_idx);
+     printf("dist sampled id:%d, string:'%s'\n", token, test_ctx.token_to_piece(token, false).c_str());
+     GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+ 
++    llama_token token_last = llama_sampler_sample(chain_last.get(), test_ctx.ctx.get(), -1);
++    printf("dist sampled id:%d, string:'%s'\n", token_last, test_ctx.token_to_piece(token_last, false).c_str());
++    GGML_ASSERT(token_last == token);
++
+     printf("backend dist sampling test PASSED\n");
+ }
+ 
+@@ -759,12 +793,13 @@ static void test_backend_dist_sampling_and_cpu(const test_params & params) {
+ 
+     int32_t batch_idx = test_ctx.idx_for_seq(seq_id);
+ 
+-    // Sample using CPU sampler
++    // Sample using a CPU sampler that was never set on the context. With the same seed it picks what the
++    // chain set on the context picks.
+     struct llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+     llama_sampler_ptr chain(llama_sampler_chain_init(chain_params));
+-    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(18));
++    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(seed));
+ 
+-    llama_token backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
++    llama_token backend_token = llama_sampler_sample(backend_sampler_chain.get(), test_ctx.ctx.get(), batch_idx);
+     llama_token cpu_token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), batch_idx);
+     printf("dist & cpu sampled id:%d, string:'%s'\n", cpu_token, test_ctx.token_to_piece(cpu_token, false).c_str());
+     GGML_ASSERT(backend_token == cpu_token);
+@@ -811,7 +846,7 @@ static void test_backend_logit_bias_sampling(const test_params & params) {
+         GGML_ASSERT(false && "Failed to decode token");
+     }
+ 
+-    llama_token backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    llama_token backend_token = llama_sampler_sample(backend_sampler_chain.get(), test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+     printf("sampled token = %d, expected = %d\n", backend_token, bias_token);
+     GGML_ASSERT(backend_token == bias_token);
+ 
+@@ -1377,7 +1412,7 @@ static void test_backend_penalties_sampling(const test_params & params) {
+ }
+ 
+ // This test verifies that it is possible to have two different backend samplers,
+-// one that uses the backend dist sampler, and another that uses CPU dist sampler.
++// one that is only dist (it picks on the CPU), and another that is top-k on the backend.
+ static void test_backend_mixed_sampling(const test_params & params) {
+     struct llama_sampler_chain_params chain_params_0 = llama_sampler_chain_default_params();
+     llama_sampler_ptr sampler_chain_0(llama_sampler_chain_init(chain_params_0));
+@@ -1404,10 +1439,11 @@ static void test_backend_mixed_sampling(const test_params & params) {
+         GGML_ASSERT(false && "Failed to decode token");
+     }
+ 
+-    // Verify sequence 0 that used the dist backend sampler.
++    // Verify sequence 0 that used the dist sampler. dist picks on the CPU.
+     {
+         int32_t batch_idx = test_ctx.idx_for_seq(0);
+-        llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
++        GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx) == LLAMA_TOKEN_NULL);
++        llama_token token = llama_sampler_sample(sampler_chain_0.get(), test_ctx.ctx.get(), batch_idx);
+         const std::string token_str = test_ctx.token_to_piece(token, false);
+         printf("sampled token id=%d, string='%s'\n", token, token_str.c_str());
+         GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+@@ -1445,8 +1481,8 @@ static void test_backend_set_sampler(const test_params & params) {
+ 
+     int32_t batch_idx = test_ctx.idx_for_seq(seq_id);
+ 
+-    // Sample using backend sampler configured above
+-    llama_token backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
++    // Sample using the sampler configured above
++    llama_token backend_token = llama_sampler_sample(backend_sampler_chain.get(), test_ctx.ctx.get(), batch_idx);
+     const std::string backend_token_str = test_ctx.token_to_piece(backend_token, false);
+     printf("dist sampled token = %d, string='%s'\n", backend_token, backend_token_str.c_str());
+ 
+@@ -1486,7 +1522,11 @@ static void test_backend_set_sampler(const test_params & params) {
+         GGML_ASSERT(false && "Failed to decode token");
+     }
+ 
+-    llama_token new_backend_token = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    // top-k runs on the backend, dist on the CPU over the k candidates
++    const int32_t new_idx = test_ctx.idx_for_seq(seq_id);
++    GGML_ASSERT(llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), new_idx) == 20);
++    llama_token new_backend_token = llama_sampler_sample(new_backend_sampler_chain.get(), test_ctx.ctx.get(), new_idx);
++    GGML_ASSERT(new_backend_token >= 0 && new_backend_token < test_ctx.n_vocab);
+     const std::string new_backend_token_str = test_ctx.token_to_piece(new_backend_token, false);
+     printf("dist sampled token = %d, string='%s'\n", new_backend_token, new_backend_token_str.c_str());
+ 
+@@ -1518,7 +1558,7 @@ static void test_backend_cpu_mixed_batch(const test_params & params) {
+     // Verify sequence 0 (backend sampled)
+     {
+         int32_t batch_idx = test_ctx.idx_for_seq(0);
+-        llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
++        llama_token token = llama_sampler_sample(sampler_chain_0.get(), test_ctx.ctx.get(), batch_idx);
+         const std::string token_str = test_ctx.token_to_piece(token, false);
+         printf("Seq 0 (backend) sampled token id=%d, string='%s'\n", token, token_str.c_str());
+         GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+@@ -1572,7 +1612,7 @@ static void test_backend_cpu_mixed_batch(const test_params & params) {
+         }
+ 
+         int32_t batch_idx = test_ctx.idx_for_seq(0);
+-        llama_token token = llama_get_sampled_token_ith(test_ctx.ctx.get(), batch_idx);
++        llama_token token = llama_sampler_sample(sampler_chain.get(), test_ctx.ctx.get(), batch_idx);
+         const std::string token_str = test_ctx.token_to_piece(token, false);
+         printf("re-added backend sampled token id=%d, string='%s'\n", token, token_str.c_str());
+         GGML_ASSERT(token >= 0 && token < test_ctx.n_vocab);
+@@ -1646,52 +1686,38 @@ static void test_backend_multi_sequence_multi_output_dist(const test_params & pa
+         GGML_ASSERT(llama_process(reference_ctx.ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch_ref.get()) == 0);
+     }
+ 
+-    std::mt19937 reference_rngs[] = {
+-        std::mt19937(seeds[0]),
+-        std::mt19937(seeds[1]),
+-    };
+-    std::uniform_real_distribution<double> reference_dist(0.0, 1.0);
++    // the number of tokens each sequence's chain has accepted
++    int n_accepted[2] = { 0, 0 };
+ 
+     for (int i = 0; i < batch.size(); ++i) {
+         const llama_seq_id seq_id = batch.tokens[i].seq_id;
+         GGML_ASSERT(seq_id == 0 || seq_id == 1);
+ 
++        // the pick a dist with this sequence's seed and history makes. If the rows used the other sequence's
++        // seed or count, the pick would differ.
++        const llama_token expected = reference_dist_pick(test_ctx.ctx.get(), i, seeds[seq_id], n_accepted[seq_id]);
++
+         llama_sampler * chain = seq_id == 0 ? chain_0.get() : chain_1.get();
+         const llama_token backend_token = llama_sampler_sample(chain, test_ctx.ctx.get(), i);
++        n_accepted[seq_id]++;
++
+         const float * sampled_logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), i);
+-        const float * sampled_probs = llama_get_sampled_probs_ith(test_ctx.ctx.get(), i);
+         const uint32_t n_logits = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), i);
+-        const uint32_t n_probs = llama_get_sampled_probs_count_ith(test_ctx.ctx.get(), i);
+         const float * reference_logits = llama_get_logits_ith(reference_ctx.ctx.get(), i);
+ 
+         GGML_ASSERT(backend_token >= 0 && backend_token < n_vocab);
+         GGML_ASSERT(sampled_logits != nullptr);
+-        GGML_ASSERT(sampled_probs != nullptr);
+         GGML_ASSERT(reference_logits != nullptr);
+         GGML_ASSERT(n_logits == (uint32_t) n_vocab);
+-        GGML_ASSERT(n_probs == (uint32_t) n_vocab);
+ 
+-        float prob_sum = 0.0f;
+-        float cumsum_before = 0.0f;
++        // temp ran on the backend
+         for (llama_token token = 0; token < n_vocab; ++token) {
+             const float expected_logit = reference_logits[token] / temp;
+             const float tolerance = 1e-4f * std::max(1.0f, std::fabs(expected_logit));
+             GGML_ASSERT(std::fabs(sampled_logits[token] - expected_logit) <= tolerance);
+-            GGML_ASSERT(std::isfinite(sampled_probs[token]));
+-            GGML_ASSERT(sampled_probs[token] >= 0.0f);
+-
+-            prob_sum += sampled_probs[token];
+-            if (token < backend_token) {
+-                cumsum_before += sampled_probs[token];
+-            }
+         }
+ 
+-        GGML_ASSERT(std::fabs(prob_sum - 1.0f) <= 1e-3f);
+-
+-        const float rnd = reference_dist(reference_rngs[seq_id]);
+-        const float cumsum_sampled = cumsum_before + sampled_probs[backend_token];
+-        GGML_ASSERT(rnd >= cumsum_before - 1e-4f);
+-        GGML_ASSERT(rnd <= cumsum_sampled + 1e-4f);
++        GGML_ASSERT(backend_token == expected);
+     }
+ 
+     printf("backend multi-sequence multi-output dist test PASSED\n");
+@@ -1708,32 +1734,18 @@ static void test_backend_multi_output_dist_transaction(const test_params & param
+     std::vector<llama_sampler_seq_config> configs = {{ seq_id, chain.get() }};
+     test_context test_ctx(params, configs, 1, 3, 2, 3);
+ 
+-    auto verify_random = [&](int32_t row, float rnd, bool accept = true) {
++    // dist draws its noise from the accepted count: a row sampled without accept, or a state put back with
++    // llama_sampler_copy, must not move it
++    auto verify_count = [&](int32_t row, int n_accept, bool accept = true) {
++        const llama_token expected = reference_dist_pick(test_ctx.ctx.get(), row, seed, n_accept);
+         const llama_token token = accept ?
+             llama_sampler_sample(chain.get(), test_ctx.ctx.get(), row) :
+-            llama_get_sampled_token_ith(test_ctx.ctx.get(), row);
+-        const float * probs = llama_get_sampled_probs_ith(test_ctx.ctx.get(), row);
++            apply_to_row(chain.get(), test_ctx.ctx.get(), row);
+ 
+         GGML_ASSERT(token >= 0 && token < llama_vocab_n_tokens(vocab));
+-        GGML_ASSERT(probs != nullptr);
+-
+-        float cumsum_before = 0.0f;
+-        for (llama_token i = 0; i < token; ++i) {
+-            cumsum_before += probs[i];
+-        }
+-
+-        const float cumsum_sampled = cumsum_before + probs[token];
+-        GGML_ASSERT(rnd >= cumsum_before - 1e-4f);
+-        GGML_ASSERT(rnd <= cumsum_sampled + 1e-4f);
++        GGML_ASSERT(token == expected);
+     };
+ 
+-    std::mt19937 rng(seed);
+-    std::uniform_real_distribution<double> dist(0.0, 1.0);
+-    float randoms[3];
+-    for (float & rnd : randoms) {
+-        rnd = dist(rng);
+-    }
+-
+     int32_t pos = 0;
+     auto decode = [&]() {
+         common_batch batch(test_ctx.ctx.get());
+@@ -1744,20 +1756,22 @@ static void test_backend_multi_output_dist_transaction(const test_params & param
+     };
+ 
+     decode();
+-    verify_random(0, randoms[0], false);
++    verify_count(0, 0, false);
+ 
+     decode();
+-    verify_random(0, randoms[0]);
+-    verify_random(1, randoms[1]);
++    verify_count(0, 0);
++    verify_count(1, 1);
+ 
+     decode();
+     llama_sampler_ptr saved(llama_sampler_clone(chain.get()));
+-    verify_random(0, randoms[2]);
++    verify_count(0, 2);
+ 
+     llama_sampler_copy(saved.get(), chain.get());
+ 
+     decode();
+-    verify_random(0, randoms[2]);
++    // the check below can only fail if counts 2 and 3 pick different tokens
++    GGML_ASSERT(reference_dist_pick(test_ctx.ctx.get(), 0, seed, 2) != reference_dist_pick(test_ctx.ctx.get(), 0, seed, 3));
++    verify_count(0, 2);
+ 
+     printf("backend multi-output dist transaction test PASSED\n");
+ }
+@@ -1815,22 +1829,21 @@ static void test_backend_multi_output_sampling_chain(const test_params & params)
+     }
+ 
+     for (int i = 0; i < batch.size(); ++i) {
++        // the filters run on the backend; dist picks on the CPU over what they leave, with the count of row i
++        const llama_token expected = reference_dist_pick(test_ctx.ctx.get(), i, seed, i);
+         const llama_token backend_token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), i);
+         const float * sampled_logits = llama_get_sampled_logits_ith(test_ctx.ctx.get(), i);
+-        const float * sampled_probs = llama_get_sampled_probs_ith(test_ctx.ctx.get(), i);
+         const llama_token * sampled_candidates = llama_get_sampled_candidates_ith(test_ctx.ctx.get(), i);
+         const uint32_t n_logits = llama_get_sampled_logits_count_ith(test_ctx.ctx.get(), i);
+-        const uint32_t n_probs = llama_get_sampled_probs_count_ith(test_ctx.ctx.get(), i);
+         const uint32_t n_candidates = llama_get_sampled_candidates_count_ith(test_ctx.ctx.get(), i);
+         const float * reference_logits = llama_get_logits_ith(reference_ctx.ctx.get(), i);
+ 
+         GGML_ASSERT(backend_token >= 0 && backend_token < n_vocab);
++        GGML_ASSERT(backend_token == expected);
+         GGML_ASSERT(sampled_logits != nullptr);
+-        GGML_ASSERT(sampled_probs != nullptr);
+         GGML_ASSERT(sampled_candidates != nullptr);
+         GGML_ASSERT(reference_logits != nullptr);
+         GGML_ASSERT(n_logits == k);
+-        GGML_ASSERT(n_probs == n_logits);
+         GGML_ASSERT(n_candidates == n_logits);
+ 
+         for (llama_token token = 0; token < n_vocab; ++token) {
+@@ -1865,20 +1878,15 @@ static void test_backend_multi_output_sampling_chain(const test_params & params)
+         }
+         size_t n_backend_only = 0;
+         int32_t sampled_index = -1;
+-        float prob_sum = 0.0f;
+ 
+         for (uint32_t j = 0; j < n_logits; ++j) {
+             GGML_ASSERT(sampled_candidates[j] >= 0 && sampled_candidates[j] < n_vocab);
+-            GGML_ASSERT(std::isfinite(sampled_probs[j]));
+-            GGML_ASSERT(sampled_probs[j] >= 0.0f);
+-            prob_sum += sampled_probs[j];
+ 
+             if (sampled_candidates[j] == backend_token) {
+                 sampled_index = j;
+             }
+             if (!std::isfinite(sampled_logits[j])) {
+                 GGML_ASSERT(std::isinf(sampled_logits[j]) && sampled_logits[j] < 0.0f);
+-                GGML_ASSERT(sampled_probs[j] == 0.0f);
+                 continue;
+             }
+ 
+@@ -1901,10 +1909,9 @@ static void test_backend_multi_output_sampling_chain(const test_params & params)
+             GGML_ASSERT(boundary_distance <= cdf_epsilon);
+         }
+ 
++        // a token the filters removed has logit -inf, and dist does not pick it
+         GGML_ASSERT(sampled_index >= 0);
+         GGML_ASSERT(std::isfinite(sampled_logits[sampled_index]));
+-        GGML_ASSERT(sampled_probs[sampled_index] > 0.0f);
+-        GGML_ASSERT(std::fabs(prob_sum - 1.0f) <= 1e-3f);
+     }
+ 
+     batch = make_batch(test_ctx.ctx.get(), 2);
+@@ -1939,8 +1946,11 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
+         GGML_ASSERT(sampler_ctx->backend_initialized);
+         GGML_ASSERT(sampler_ctx->backend_outputs_max_per_seq == 1);
+         GGML_ASSERT(sampler_ctx->backend_apply_count > 0);
++        // dist picks on the CPU; the chain skips the part that ran on the backend
++        GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), 0) == LLAMA_TOKEN_NULL);
++        const llama_token token = llama_sampler_sample(chain.get(), test_ctx.ctx.get(), 0);
++        GGML_ASSERT(token >= 0 && token < llama_vocab_n_tokens(vocab));
+         GGML_ASSERT(sampler_ctx->apply_count == 0);
+-        GGML_ASSERT(llama_get_sampled_token_ith(test_ctx.ctx.get(), 0) != LLAMA_TOKEN_NULL);
+     }
+ 
+     {

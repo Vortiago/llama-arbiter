@@ -1,0 +1,34 @@
+From 5e458a90d41693e031719ce7cfacaf36e206f195 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 20:56:01 +0200
+Subject: [PATCH] test(test-backend-ops): drop the MUL_MAT_MULTI perf cases
+
+Perf mode times the graph's last node, here the concat that gathers the
+products, not the products.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ tests/test-backend-ops.cpp | 9 ---------
+ 1 file changed, 9 deletions(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e18afe167..9ad453583 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12011,15 +12011,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 512, 4, 2560, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 128, 4, 2560, {1, 1}, {1, 1}));
+ 
+-    // Qwen3.8-Flash-Next weights that read one input: hyper-connection down and inject, shared expert
+-    // gate and up, DeltaNet qkv, gate, beta and alpha, attention q, k and v
+-    for (int n : {1, 4}) {
+-        test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 10240, n, {320, 4}));
+-        test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 2560, n, {640, 640}));
+-        test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 2560, n, {10240, 6144, 48, 48}));
+-        test_cases.emplace_back(new test_mul_mat_multi(GGML_TYPE_Q8_0, 2560, n, {12288, 512, 512}));
+-    }
+-
+     // Qwen3.8-Flash-Next QSA indexer in a 4-token verify window: 4 heads, F32 pooled keys, one
+     // pooled key per 4 cells (1K, 32K and 128K context)
+     for (int kv : {256, 8192, 32768}) {

@@ -1,0 +1,56 @@
+From dafa431f4482100a295e359a2f2514e95df923d7 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 02:58:29 +0200
+Subject: [PATCH] perf(ggml-cpu): longer row runs in the fused MoE op
+
+The fused op of the routed experts handed out units of 32 rows of gate
+and up, and 64 rows of down. Each unit starts new streams over the
+expert rows. Units of 128 and 256 rows are faster.
+
+On koishi (node 0 quiet, 18 threads, 4-token verify steps, one build
+with the unit sizes read from the environment for the test, three
+alternating rounds):
+- GPU run: 32/64 116.51 113.22 112.38 ms, 64/128 113.27 110.22 110.44,
+  128/256 108.84 109.57 107.61.
+- CPU run: 32/64 267.18 267.29 277.75 ms, 64/128 261.39 265.57 271.03,
+  128/256 257.71 270.79 260.82; the rounds spread more than the sizes
+  differ.
+The results stay bit-exact: the block boundaries are multiples of 128,
+so of 16 and of the Q8_0 block.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 106bd71cc..0eb43bc84 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2138,10 +2138,11 @@ static void ggml_compute_forward_mul_mat_id(
+ // and the down quantization works per block, so the result is bit-exact.
+ 
+ // Rows in a block of step 2. A multiple of 16, and of the block size of down's vec_dot type,
+-// so that the quantization of a block is whole.
++// so that the quantization of a block is whole. A thread reads each block of gate and up rows
++// as one run, and longer runs were faster on koishi: 128 rows beat 32 and 64.
+ static int64_t ggml_moe_ffn_block_rows(const struct ggml_tensor * down) {
+     const enum ggml_type vdt = type_traits_cpu[down->src[0]->type].vec_dot_type;
+-    return MAX(32, ggml_blck_size(vdt));
++    return MAX(128, ggml_blck_size(vdt));
+ }
+ 
+ static size_t ggml_moe_ffn_wsize(const struct ggml_tensor * gate, const struct ggml_tensor * glu, const struct ggml_tensor * down) {
+@@ -2288,9 +2289,9 @@ static void ggml_compute_forward_moe_ffn(
+ 
+     ggml_barrier(params->threadpool);
+ 
+-    // 3. down, in units of 64 rows of one expert, taken the same way
++    // 3. down, in units of 256 rows of one expert, taken the same way
+     {
+-        const int64_t blk = 64;
++        const int64_t blk = 256;
+         const int64_t nb  = (down->src[0]->ne[1] + blk - 1)/blk;
+ 
+         for (int64_t u = ith; u < n_active*nb;

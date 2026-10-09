@@ -106,6 +106,12 @@ def prompt_cuts(body, tuning=None):
     tools = fields.get("tools")
     tools = tools if isinstance(tools, list) else []
     running = hashlib.sha256()
+    # They change what the template writes, so two requests that differ only
+    # here share no opening.
+    template = fields.get("chat_template_kwargs")
+    if template:
+        running.update(b"template\x00" + json.dumps(
+            template, sort_keys=True).encode("utf-8", "replace"))
     size = 0
     cuts = []
     # The template renders the tools inside the system block. For Claude
@@ -142,6 +148,56 @@ def deepest_shared(cuts, known):
         if cut[1] in known:
             return cut
     return None
+
+
+def head_of(messages):
+    """The first user message, as (index, text), when only system messages
+    come before it and it is plain text. Requests that share a system
+    prompt part there first, and it is the one place a long shared start
+    inside a message is worth finding."""
+    for index, message in enumerate(messages or ()):
+        if not isinstance(message, dict):
+            return None
+        role = message.get("role")
+        if role in SYSTEM_ROLES:
+            continue
+        content = message.get("content")
+        if role == "user" and isinstance(content, str):
+            return index, content
+        return None
+    return None
+
+
+def lead_key(system, tools, lead, template):
+    """What comes before the first user message, as a key: the system
+    prompt, the tools, the messages before it and the template's options.
+    A shared start is only shared under the same lead."""
+    said = json.dumps([system, tools, lead, template], sort_keys=True,
+                      separators=(",", ":"))
+    return hashlib.sha256(said.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def shared_start(text, others, least):
+    """The text this message starts with that another recent one also starts
+    with, ending at a line break, or None when it is shorter than `least`.
+    The shortest such start, so that two messages which happen to share more
+    do not each make a file nobody else will match."""
+    best = None
+    for other in others:
+        if other == text:
+            continue                    # the same message again: a retry
+        same = common_prefix(text, other)
+        cut = same.rfind("\n") + 1
+        if cut >= least and (best is None or cut < best):
+            best = cut
+    return text[:best] if best else None
+
+
+def start_key(base_key, text):
+    """The name of an opening that runs from a base cut into a message."""
+    running = hashlib.sha256(f"{base_key}\x00start\x00".encode())
+    running.update(text.encode("utf-8", "replace"))
+    return running.hexdigest()[:16]
 
 
 def common_prefix(first, second):

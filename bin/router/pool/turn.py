@@ -127,7 +127,7 @@ class Turn:
                                                     pool.tuning)
         # `tokens` carries reply_tokens of room the client never sent.
         prompt_tokens = max(0, tokens - pool.tuning.reply_tokens)
-        largest = pool.largest()
+        largest = pool.largest(ask.path)
         if largest and tokens > largest:
             return client.fail(413, f"needs about {tokens} tokens. "
                                     f"The largest backend holds {largest}.")
@@ -162,7 +162,7 @@ class Turn:
         mine = False
         try:
             mine = pool.claim_turn(conv, ticket, client.alive, work)
-            got = pool.acquire(conv, tokens, client.alive) if mine else None
+            got = pool.acquire(conv, tokens, client.alive, ask.path) if mine else None
         except BaseException:
             # The same ending as the branch below, for a way out nobody
             # planned. finish_turn matches on the ticket, so it is a no-op
@@ -195,8 +195,12 @@ class Turn:
         # has no deadline, so a claim left behind stops the conversation.
         try:
             warm = bool(conv) and pool.holds_slot(conv)
-            pool.note_stage(conv, "prefill", be["name"], slot, work)
+            # A typed turn answers where it is read: hand_off is not asked to
+            # move it, so nothing waits for a generator on its behalf.
+            pool.note_stage(conv, "prefill", be["name"], slot, work,
+                            stays=bool(ask.plan))
             pool.ensure_parked(be, conv)
+            pool.take_slot(be, slot, conv)
             if pool.forget_stale_park(conv, cuts):
                 pool.events.write("start_over", conv=short, reason="stale_copy",
                                   client=client.kind, path=ask.path)
@@ -204,7 +208,9 @@ class Turn:
             loaded = (not recalled
                       and pool.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, ask.path,
-                                           alive=client.alive))
+                                           alive=client.alive,
+                                           template=(asked or {}).get(
+                                               "chat_template_kwargs")))
             # warm_prefix was their last reader, and each holds a parsed
             # copy of the prompt. The read below runs for tens of minutes.
             messages = system = tools = None
@@ -251,7 +257,8 @@ class Turn:
                 if left:
                     pool.park_partial(conv, be, slot)
                 if serving is not None:
-                    parking = pool.park_later(serving, conv, ticket)
+                    parking = pool.park_later(serving, conv, ticket,
+                                              path=ask.path)
             except Exception as err:
                 # claim_turn has no deadline, so the lines below must run.
                 print(f"[router] {short} could not be put away: {err}",

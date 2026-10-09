@@ -7,6 +7,10 @@ reading and holds what carries between polls.
 """
 
 RATE_FLOOR = 1.0     # seconds. Under this a count is not a rate.
+# A read rate needs this many tokens too: per-request overhead dominates a
+# few short prompts, and a reader ranked by such a figure is never chosen to
+# read enough to be measured again.
+READ_TOKENS_FLOOR = 2048
 
 
 def per_second(tokens, seconds):
@@ -27,6 +31,17 @@ def counters(text):
         except ValueError:
             pass
     return value
+
+
+def read_rate(value):
+    """Tokens a second this backend has read prompts at over its life, from
+    the raw counters, or None before it has read for RATE_FLOOR seconds and
+    READ_TOKENS_FLOOR tokens."""
+    seconds = value.get("prompt_seconds_total", 0)
+    tokens = value.get("prompt_tokens_total", 0)
+    if seconds < RATE_FLOOR or tokens < READ_TOKENS_FLOOR:
+        return None
+    return tokens / seconds
 
 
 def stats(value):
@@ -123,11 +138,16 @@ def slot_state(raw, previous, rate_window, now):
         busy = bool(slot.get("is_processing"))
         whole = slot.get("n_prompt_tokens_total")
         if whole is None:
-            # Without the patch, the old arithmetic is the fallback.
+            # Without the patch, the old arithmetic is the fallback. It is not
+            # the prompt's size: it is only what the slot holds, and it grows
+            # while the prompt is read. Left unnamed so the bar does not pin
+            # its track to a number that moves.
             whole = max(0, slot.get("n_prompt_tokens", 0) - decoded)
             to_read = max(0, whole - cached)
+            known = None
         else:
             to_read = max(0, whole - cached - processed)
+            known = whole
         detail.append({
             "id": sid,
             "busy": busy,
@@ -136,6 +156,10 @@ def slot_state(raw, previous, rate_window, now):
             "done": processed,
             "cached": cached,
             "decoded": decoded,
+            # The prompt the task arrived with, when the backend reports it
+            # (patches/slots-report-the-prompt-size.patch). The bar pins its
+            # track to this; absent, it falls back to cached + done + left.
+            "whole": known,
             # null, not 0.0, until a window has resolved.
             "pp_rate": round(pp_rate, 1) if measured else None,
             "tg_rate": round(tg_rate, 1) if measured else None,
