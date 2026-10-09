@@ -11,11 +11,13 @@ import atexit
 import http.client
 import json
 import shutil
+import socket
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -190,12 +192,17 @@ class EndToEnd(unittest.TestCase):
                 "the pool never saw the stub backends come up")
         return made
 
-    def serve(self, pool):
-        """Put the real Handler in front of this pool. Returns its base url."""
+    def serve(self, pool, control_key=None):
+        """Put the real Handler in front of this pool. Returns its base url.
+
+        `control_key` is the shared secret the control endpoints need; the
+        default None leaves them refused, which is what production does
+        without ROUTER_CONTROL_KEY."""
         server = router.Server(("127.0.0.1", 0), router.Handler)
         # The Handler reads the pool off its own server, so two servers in one
         # process cannot take each other's.
         server.pool = pool
+        server.control_key = control_key
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.servers.append((server, thread))
@@ -482,6 +489,63 @@ class DrainUnderLoad(EndToEnd):
         pool.drain("cpu2", deadline=PATIENCE)
         self.turn(url, "after-resume")
         self.assertEqual(len(self.cpu.answers), 1)
+
+
+class ControlEndpointsNeedTheKey(EndToEnd):
+    """drain, resume and reset-rates change the pool. Unset, they stay open,
+    for a box only the operator can reach. With ROUTER_CONTROL_KEY set, a
+    control call must carry it in X-Router-Key, or a passer-by could 503 the
+    service."""
+
+    def post(self, url, path, key=None):
+        """POST a control path. Returns (status, body), a 4xx and all."""
+        headers = {"Content-Type": "application/json"}
+        if key is not None:
+            headers["X-Router-Key"] = key
+        request = urllib.request.Request(url + path, b"", headers=headers,
+                                         method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as reply:
+                return reply.status, reply.read()
+        except urllib.error.HTTPError as err:
+            return err.code, err.read()
+
+    def test_with_no_key_set_a_drain_is_served(self):
+        pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 1)])
+        url = self.serve(pool)                  # no key set on the server
+
+        code, body = self.post(url, "/router/drain/cpu")
+
+        self.assertEqual(code, 200, body)
+        self.assertTrue(self.backend(pool, "cpu")["draining"])
+
+    def test_a_drain_without_a_key_is_refused_when_one_is_set(self):
+        pool = self.pool([self.stub("cpu", 1), self.stub("cpu2", 1)])
+        url = self.serve(pool, control_key="secret")
+
+        code, _ = self.post(url, "/router/drain/cpu")
+
+        self.assertEqual(code, 401)
+        self.assertFalse(self.backend(pool, "cpu")["draining"],
+                         "an unauthenticated drain took the backend out")
+
+    def test_a_drain_with_a_wrong_key_is_refused(self):
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool, control_key="secret")
+
+        code, _ = self.post(url, "/router/drain/cpu", key="nope")
+
+        self.assertEqual(code, 401)
+        self.assertFalse(self.backend(pool, "cpu")["draining"])
+
+    def test_a_drain_with_the_key_is_served(self):
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool, control_key="secret")
+
+        code, body = self.post(url, "/router/drain/cpu", key="secret")
+
+        self.assertEqual(code, 200, body)
+        self.assertTrue(self.backend(pool, "cpu")["draining"])
 
 
 class ShutdownRoundTrip(EndToEnd):
@@ -1301,6 +1365,113 @@ class ARefusalReachesAStreamAsAnEvent(EndToEnd):
         self.assertEqual(reply.status, 200, "the stream had already opened")
         names = [name for name, _ in sse_events(reply)]
         self.assertEqual(names, ["message_start", "error"], names)
+
+
+class ABodyIsBoundedInTimeAndInTotal(EndToEnd):
+    """A request body is read into memory, and the read waits for it.
+
+    `self.rfile.read` blocked forever, and ThreadingHTTPServer spawns a thread
+    per connection, so a client that sent a length and then trickled held both
+    for the life of the process. max_body bounds one body; nothing bounded
+    their sum across connections. The router answers both for itself now."""
+
+    @staticmethod
+    def addr(url):
+        parts = urllib.parse.urlsplit(url)
+        return parts.hostname, parts.port
+
+    def test_a_trickling_body_is_refused_and_closed(self):
+        SANDBOX.tuning = replace(SANDBOX.tuning, body_timeout=0.5)
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool)
+
+        sock = socket.create_connection(self.addr(url), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\n"
+                     b"Host: 127.0.0.1\r\n"
+                     b"Content-Length: 100000\r\n"
+                     b"Content-Type: application/json\r\n\r\n")
+        sock.sendall(b"x")             # the first arrival opens the clock
+        time.sleep(1.0)                # well past body_timeout=0.5
+        sock.sendall(b"y")             # the arrival on which it is checked
+
+        sock.settimeout(5)
+        reply = b""
+        try:
+            while True:                # the server closes after answering
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                reply += piece
+        except OSError:
+            pass
+        self.assertIn(b" 408 ", reply.split(b"\r\n", 1)[0])
+
+    def test_a_second_body_over_the_total_is_refused(self):
+        SANDBOX.tuning = replace(SANDBOX.tuning, body_total=1024,
+                                  body_timeout=30.0)
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool)
+        server = self.servers[-1][0]
+
+        first = socket.create_connection(self.addr(url), timeout=5)
+        self.addCleanup(first.close)
+        # 800 bytes promised, one sent: the read is in flight, holding 800.
+        first.sendall(b"POST /v1/chat/completions HTTP/1.1\r\n"
+                      b"Host: 127.0.0.1\r\n"
+                      b"Content-Length: 800\r\n\r\n" + b"x")
+        self.assertTrue(wait_for(lambda: server.body_held == 800),
+                        "the first body was never held")
+
+        second = http.client.HTTPConnection(*self.addr(url), timeout=5)
+        self.addCleanup(second.close)
+        second.request("POST", "/v1/chat/completions", b"x" * 800,
+                       {"Content-Type": "application/json"})
+        reply = second.getresponse()
+        reply.read()
+        self.assertEqual(reply.status, 413)
+
+    def test_a_body_short_of_its_content_length_is_refused(self):
+        """A client that promises Content-Length and then closes its end has
+        sent a short body. `read1` returns what arrived and then b"", and
+        `_read_body` answers 400 rather than handing a truncated body on."""
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool)
+
+        sock = socket.create_connection(self.addr(url), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\n"
+                     b"Host: 127.0.0.1\r\n"
+                     b"Content-Length: 100\r\n"
+                     b"Content-Type: application/json\r\n\r\n"
+                     b"{\"x\":")
+        sock.shutdown(socket.SHUT_WR)     # the rest of the body never comes
+
+        sock.settimeout(5)
+        reply = b""
+        try:
+            while True:                   # the server closes after answering
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                reply += piece
+        except OSError:
+            pass
+        self.assertIn(b" 400 ", reply.split(b"\r\n", 1)[0])
+
+    def test_an_idle_connection_is_closed_after_the_timeout(self):
+        was = router.Handler.timeout
+        router.Handler.timeout = 0.5
+        self.addCleanup(setattr, router.Handler, "timeout", was)
+        pool = self.pool([self.stub("cpu", 1)])
+        url = self.serve(pool)
+
+        sock = socket.create_connection(self.addr(url), timeout=5)
+        self.addCleanup(sock.close)
+        sock.settimeout(5)
+        # Say nothing at all: without the timeout a thread waited for a
+        # request line that would never come.
+        self.assertEqual(sock.recv(1), b"")
 
 if __name__ == "__main__":
     unittest.main()

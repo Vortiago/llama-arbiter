@@ -170,6 +170,34 @@ class ATurnRefusesAPromptNoBackendCanHold(unittest.TestCase):
         self.assertEqual([code for code, _ in client.failed], [413])
 
 
+class ATypedPlanIsSizedByItsLargestQuestion(unittest.TestCase):
+    """A typed plan asks every question against the slot the read pass filled.
+
+    The handler rebuilds the turn body from the first question, and the size
+    check read only that. A later, longer question could then exceed n_ctx
+    mid-plan: the backend drops the whole slot and every answer is lost. The
+    plan has to be refused up front instead."""
+
+    def test_a_later_long_question_refuses_the_plan_up_front(self):
+        pool = one_backend(n_ctx=2000)
+        raw = json.dumps({
+            "state": "x" * 40,
+            "questions": {
+                "small": {"type": "noul", "instructions": "one word"},
+                "big": {"type": "noul", "instructions": "y" * 20000},
+            },
+        }).encode()
+        plan = router.systemone_plan(raw)
+        body = router.systemone_body(plan, plan["questions"][0])
+        client = FakeClient()
+
+        pool.turn(router.Ask(router.SYSTEMONE, body, None, plan, body), client)
+
+        self.assertEqual([code for code, _ in client.failed], [413])
+        self.assertEqual(pool.link.ops(), [],
+                         "the link saw work despite the refusal")
+
+
 class ATurnNeedsABackendThatReads(unittest.TestCase):
     """The largest prompt any prefiller will read is 0 while none is up. A
     turn that went on from there would wait in acquire for a backend that

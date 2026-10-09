@@ -36,11 +36,14 @@ echo "draining $name (this waits for work already running)..."
 # name, and the reply then lands wherever that link points.
 answer=$(mktemp) || die "no temporary file"
 trap 'rm -f "$answer"' EXIT
-code=$(curl -s -o "$answer" -w '%{http_code}' -X POST "$ROUTER/router/drain/$name")
+code=$(curl -s -o "$answer" -w '%{http_code}' \
+  -H "X-Router-Key: ${ROUTER_CONTROL_KEY:-}" \
+  -X POST "$ROUTER/router/drain/$name")
 cat "$answer"; echo
 if [[ $code != 200 ]]; then
   echo "not drained, leaving $name alone" >&2
-  curl -s -X POST "$ROUTER/router/resume/$name" >/dev/null
+  curl -s -H "X-Router-Key: ${ROUTER_CONTROL_KEY:-}" \
+    -X POST "$ROUTER/router/resume/$name" >/dev/null
   exit 1
 fi
 
@@ -50,7 +53,8 @@ pid=$(pid_on_port "$port")
 [[ -z ${pid:-} ]] && pid=$(cat "$RUN/$name.pid" 2>/dev/null || true)
 if [[ -n ${pid:-} ]] && kill -0 "$pid" 2>/dev/null && ! ours "$pid"; then
   echo "$name: pid $pid is something else now, leaving it alone" >&2
-  curl -s -X POST "$ROUTER/router/resume/$name" >/dev/null
+  curl -s -H "X-Router-Key: ${ROUTER_CONTROL_KEY:-}" \
+    -X POST "$ROUTER/router/resume/$name" >/dev/null
   exit 1
 fi
 if [[ -n ${pid:-} ]] && kill -0 "$pid" 2>/dev/null; then
@@ -68,7 +72,10 @@ fi
 # backend reads. Set PLACE_COPIES=0 to skip.
 if [[ ${PLACE_COPIES:-1} == 1 ]]; then
   read -ra place_nodes <<<"$(printf '%s\n' $rest | sed -n 's/^NODE=//p' | tail -1 | tr ',' ' ')"
-  place_copies "${place_nodes[@]}"
+  # A row with no NODE is no instruction to place anything. place_copies with
+  # no node argument reads every node with a copy, which for one backend's
+  # restart is both copies. A row that wants both says NODE=0,1.
+  (( ${#place_nodes[@]} )) && place_copies "${place_nodes[@]}"
 fi
 
 echo "starting $name..."
@@ -98,5 +105,6 @@ if [[ ${KEEP_DRAINED:-0} == 1 ]]; then
   exit 0
 fi
 
-curl -s -X POST "$ROUTER/router/resume/$name" >/dev/null
+curl -s -H "X-Router-Key: ${ROUTER_CONTROL_KEY:-}" \
+  -X POST "$ROUTER/router/resume/$name" >/dev/null
 echo "$name is back in service"

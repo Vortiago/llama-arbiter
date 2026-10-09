@@ -153,6 +153,13 @@
 # ROUTER_PORT=8090
 # ROUTER_HOST=::
 
+# Shared secret for the router's control endpoints. The router reads it to
+# gate /router/drain, /router/resume and /router/reset-rates, and
+# bin/restart-backend.sh sends it. Unset, those endpoints are open, for a box
+# only the operator can reach. Set the same value wherever the router and the
+# restart script run.
+# export ROUTER_CONTROL_KEY=<a shared secret>
+
 # Read and generate in the same slot, for one instance with one slot. Set 0
 # when the backend table has no generate-only instance, or when llama.cpp
 # cannot carry a slot's checkpoints across a restore (see

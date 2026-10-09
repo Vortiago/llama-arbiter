@@ -1,6 +1,6 @@
 """The public port: what it serves and what it refuses."""
 
-import http.client, http.server, json, os, select, socket, threading, time
+import hmac, http.client, http.server, json, os, select, socket, threading, time
 from pathlib import Path
 from ..identity import client_kind, session_key, short_key
 from ..pool.turn import Ask
@@ -76,6 +76,11 @@ def on_the_page(rel):
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "qwen-router"
+    # StreamRequestHandler.setup applies this to the connection, so it bounds
+    # the request line and a read that arrives nothing. Without it a client
+    # that connects and says nothing holds a thread for the life of the
+    # process.
+    timeout = 60
 
     def log_message(self, fmt, *args):
         pass                                   # the router prints its own line
@@ -95,6 +100,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if rest.startswith("drain/") or rest.startswith("resume/"):
                 return self._service(*rest.split("/", 1))
             if rest == "reset-rates":
+                if not self._control():
+                    return
                 if self.command != "POST":
                     return self._error(405, "post to reset the rates")
                 self.server.pool.reset_rates(True)
@@ -107,8 +114,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     do_POST = do_DELETE = do_GET
 
+    def _control(self):
+        """The shared secret that guards the endpoints which change the pool.
+        Fail open: with no key set, the endpoints are open, for a box only the
+        operator can reach. With a key set, the request must carry it in
+        X-Router-Key. compare_digest, so the answer takes the same time
+        whichever bytes match."""
+        key = self.server.control_key
+        if not key:
+            return True
+        given = self.headers.get("X-Router-Key") or ""
+        if hmac.compare_digest(key.encode("utf-8"), given.encode("utf-8")):
+            return True
+        return self._error(401, "the control endpoints need X-Router-Key")
+
     def _service(self, what, name):
         """Drain a backend, or put it back. POST only: both change the pool."""
+        if not self._control():
+            return
         if self.command != "POST":
             return self._error(405, "post to drain or resume a backend")
         if what == "resume":
@@ -250,6 +273,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         props["total_slots"] = sum(be["slots"] for be in live)
         return self._send(200, json.dumps(props).encode())
 
+    def _read_body(self, length):
+        """Read one request body against a wall clock. read1 returns what has
+        arrived, so the clock is checked as each piece lands rather than after
+        the whole body: a client that trickles a byte at a time is answered
+        408 instead of holding a thread. A body short of its count is a 400.
+        Returns None, having answered, in either case."""
+        deadline = time.monotonic() + self.server.pool.tuning.body_timeout
+        chunks, left = [], length
+        while left:
+            try:
+                piece = self.rfile.read1(min(1 << 20, left))
+            except TimeoutError:
+                self.close_connection = True
+                return self._error(408, "the request body did not arrive "
+                                        "in time")
+            if not piece:
+                self.close_connection = True
+                return self._error(400, "the request body ended before its "
+                                        "Content-Length")
+            chunks.append(piece)
+            left -= len(piece)
+            if time.monotonic() > deadline:
+                self.close_connection = True
+                return self._error(408, "the request body did not arrive "
+                                        "in time")
+        return b"".join(chunks)
+
     def _route(self):
         # A client's header. int() on junk raised before a status line went
         # out, and BaseHTTPRequestHandler catches only TimeoutError.
@@ -271,7 +321,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return self._error(411, "send the body with a Content-Length: "
                                     "this router does not read chunked requests")
-        body = self.rfile.read(length) if length else b""
+        # The per-request cap above bounds one body; this bounds every body
+        # being read at once, or a hundred slow clients each pin max_body.
+        # Held across the read and given back in the finally, whatever way
+        # _read_body returns.
+        total = self.server.pool.tuning.body_total
+        with self.server.body_lock:
+            over = self.server.body_held + length > total
+            if not over:
+                self.server.body_held += length
+        if over:
+            self.close_connection = True
+            return self._error(
+                413, f"bodies of {length} bytes; this router reads "
+                     f"{total} bytes at once")
+        try:
+            body = self._read_body(length) if length else b""
+        finally:
+            with self.server.body_lock:
+                self.server.body_held -= length
+        if body is None:
+            return
         path = self.path.split("?")[0].rstrip("/") or "/"
         # Per request, not per connection: one handler serves a whole
         # keep-alive connection.

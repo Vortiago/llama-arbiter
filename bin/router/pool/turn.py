@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 
 from ..identity import conversation_id, prompt_key, short_key
-from ..protocol.systemone import SYSTEMONE_UP, answers
+from ..protocol.systemone import SYSTEMONE_UP, answers, systemone_largest
 from ..protocol.body import (hoist_system, prompt_cuts, read_only,
                              wants_stream)
 from ..protocol.sse import opening_event
@@ -123,7 +123,10 @@ class Turn:
 
     def run(self, ask, client):
         pool = self.pool
-        tokens, images, image_charge = request_cost(ask.body, pool.vision(),
+        # A typed plan asks every question against one slot, so size it by
+        # its longest question, not by the first one the read pass carries.
+        sized = systemone_largest(ask.plan) if ask.plan else ask.body
+        tokens, images, image_charge = request_cost(sized, pool.vision(),
                                                     pool.tuning)
         # `tokens` carries reply_tokens of room the client never sent.
         prompt_tokens = max(0, tokens - pool.tuning.reply_tokens)
