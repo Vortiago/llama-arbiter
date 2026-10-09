@@ -1,0 +1,274 @@
+From 971a0d3d1e7dd645a9989dc3c181840f447fa25d Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 13:01:24 +0200
+Subject: [PATCH] moe split: distinct card ids per token; pin the experts
+ merged, at the first split
+
+The CUDA MUL_MAT_ID takes an expert at most once per token (mm_ids_helper
+keeps one slot per token and expert). The slots the CPU computes all
+pointed at card slot 0, so a token with several of them, or with card
+slot 0 as a real expert, lost rows: PPL 6.30 against 5.65 on the first
+chunk. They now take the lowest card slots the token does not use.
+
+The expert ranges are pinned once, merged and rounded out to whole pages,
+instead of per tensor with the edge pages left out, so that every expert
+copy lies inside one registration. Also a non-finite count in the debug
+output.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ src/llama-moe-split.cpp  | 112 +++++++++++++++++++++++++++------------
+ src/llama-moe-split.h    |  23 ++++++--
+ tests/test-moe-split.cpp |  10 +++-
+ 3 files changed, 108 insertions(+), 37 deletions(-)
+
+diff --git a/src/llama-moe-split.cpp b/src/llama-moe-split.cpp
+index d9d9938bf..b643a47dc 100644
+--- a/src/llama-moe-split.cpp
++++ b/src/llama-moe-split.cpp
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
+ #include <condition_variable>
+ #include <cstdlib>
+ #include <cstring>
+@@ -77,7 +78,7 @@ split_state & state() {
+     return *st;
+ }
+ 
+-bool init(split_state & st, const llama_moe_split_exps & exps) {
++bool init(split_state & st, const llama_moe_split_exps & exps, int n_used) {
+     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+     if (dev == nullptr) {
+         return false;
+@@ -91,7 +92,8 @@ bool init(split_state & st, const llama_moe_split_exps & exps) {
+     st.wctx = ggml_init(ip);
+     const ggml_tensor * src[3] = { exps.up, exps.gate, exps.down };
+     for (int i = 0; i < 3; i++) {
+-        st.w[i] = ggml_new_tensor_3d(st.wctx, src[i]->type, src[i]->ne[0], src[i]->ne[1], st.max_experts);
++        // a token's slots that the CPU computes take free card slots below n_used
++        st.w[i] = ggml_new_tensor_3d(st.wctx, src[i]->type, src[i]->ne[0], src[i]->ne[1], std::max(st.max_experts, n_used));
+     }
+     st.wbuf = ggml_backend_alloc_ctx_tensors(st.wctx, st.gpu);
+     if (st.wbuf == nullptr) {
+@@ -198,6 +200,68 @@ void helper_main(split_state * st) {
+     }
+ }
+ 
++// Pinned host memory for the experts: the uploads then run without the CPU, at the full rate of
++// the link. ggml-cuda registers only with GGML_CUDA_REGISTER_HOST set. The ranges are collected
++// while the graphs are built, and registered at the first split, merged and rounded out to whole
++// pages, so that no page is registered twice and every expert lies inside one registration.
++struct pin_state {
++    std::mutex mu;
++    std::vector<uintptr_t> seen;
++    std::vector<std::pair<uintptr_t, uintptr_t>> pending;
++};
++
++pin_state & pins() {
++    static pin_state * ps = new pin_state();
++    return *ps;
++}
++
++void pin_pending() {
++    pin_state & ps = pins();
++    std::lock_guard<std::mutex> lk(ps.mu);
++    if (ps.pending.empty()) {
++        return;
++    }
++    static bool (*reg_fn)(void *, size_t) = nullptr;
++    if (reg_fn == nullptr) {
++        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++        if (dev != nullptr) {
++            reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_register_host_buffer");
++        }
++        if (reg_fn == nullptr) {
++            ps.pending.clear();
++            return;
++        }
++    }
++    const uintptr_t page = 4096;
++    auto & r = ps.pending;
++    for (auto & x : r) {
++        x.first  &= ~(page - 1);
++        x.second  = (x.second + page - 1) & ~(page - 1);
++    }
++    std::sort(r.begin(), r.end());
++    const auto t0 = clk::now();
++    size_t total = 0;
++    int n_ok = 0, n_fail = 0;
++    for (size_t i = 0; i < r.size(); ) {
++        uintptr_t a = r[i].first, b = r[i].second;
++        size_t j = i + 1;
++        while (j < r.size() && r[j].first <= b) {
++            b = std::max(b, r[j].second);
++            j++;
++        }
++        if (reg_fn((void *) a, b - a)) {
++            total += b - a;
++            n_ok++;
++        } else {
++            n_fail++;
++        }
++        i = j;
++    }
++    r.clear();
++    LLAMA_LOG_INFO("%s: pinned %.2f GiB of experts in %d ranges (%d failed) in %.1f s\n", __func__, total/1073741824.0, n_ok, n_fail,
++        std::chrono::duration<double>(clk::now() - t0).count());
++}
++
+ // src: 0 cur [n_embd, n_tokens], 1 selected experts [n_used, n_tokens], 2 weights [1, n_used, n_tokens],
+ //      3 up, 4 gate, 5 down. dst: the ids the CPU computes with.
+ void begin_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+@@ -221,7 +285,7 @@ void begin_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+ 
+     if (!st.init_done) {
+         st.init_done = true;
+-        st.failed = !init(st, exps);
++        st.failed = !init(st, exps, (int) ids->ne[0]);
+         if (st.failed) {
+             LLAMA_LOG_WARN("%s: no card for the MoE split; the CPU computes every expert\n", __func__);
+         } else {
+@@ -229,6 +293,8 @@ void begin_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+         }
+     }
+ 
++    pin_pending();
++
+     const int     n_used   = (int) ids->ne[0];
+     const int64_t n_tokens = ids->ne[1];
+     const int     n_expert = (int) exps.up->ne[2];
+@@ -296,6 +362,10 @@ void end_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+ 
+     if (ith == 0) {
+         if (st.debug) {
++            auto bad = [](const float * v, int64_t n) { int64_t c = 0; for (int64_t i = 0; i < n; i++) c += !std::isfinite(v[i]); return c; };
++            const ggml_tensor * x = dst->src[2];
++            LLAMA_LOG_INFO("moe split: non-finite: x %lld, cpu share %lld, card share %lld\n", (long long) bad((const float *) x->data, ggml_nelements(x)),
++                (long long) bad(a, ggml_nelements(moe)), st.active ? (long long) bad(st.out.data(), (int64_t) st.out.size()) : -1LL);
+             const double cpu  = std::chrono::duration<double, std::milli>(t0 - st.t_begin).count();
+             const double wait = std::chrono::duration<double, std::milli>(t1 - t0).count();
+             LLAMA_LOG_INFO("moe split: %zu experts on the card, upload %.2f ms, card total %.2f ms; CPU share %.2f ms, wait %.2f ms\n",
+@@ -308,37 +378,13 @@ void end_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+ } // namespace
+ 
+ void llama_moe_split_register(const llama_moe_split_exps & exps) {
+-    // pinned host memory: the uploads then run without the CPU, at the full rate of the link.
+-    // ggml-cuda registers only with GGML_CUDA_REGISTER_HOST set.
+-    static std::mutex mu;
+-    static std::vector<const void *> done;
+-    static bool (*reg_fn)(void *, size_t) = nullptr;
+-    static bool looked = false;
+-
+-    std::lock_guard<std::mutex> lk(mu);
+-    if (!looked) {
+-        looked = true;
+-        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+-        if (dev != nullptr) {
+-            reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_register_host_buffer");
+-        }
+-    }
+-    if (reg_fn == nullptr) {
+-        return;
+-    }
+-    const size_t page = 4096;
++    pin_state & ps = pins();
++    std::lock_guard<std::mutex> lk(ps.mu);
+     for (const ggml_tensor * t : { exps.up, exps.gate, exps.down }) {
+-        if (std::find(done.begin(), done.end(), t->data) != done.end()) {
+-            continue;
+-        }
+-        done.push_back(t->data);
+-        // whole pages inside the tensor: a neighbour may register the pages at its ends
+-        const uintptr_t a = ((uintptr_t) t->data + page - 1) & ~(page - 1);
+-        const uintptr_t b = ((uintptr_t) t->data + ggml_nbytes(t)) & ~(page - 1);
+-        if (b > a && reg_fn((void *) a, b - a)) {
+-            static size_t total = 0;
+-            total += b - a;
+-            LLAMA_LOG_DEBUG("%s: pinned %s, %.2f GiB in all\n", __func__, t->name, total/1073741824.0);
++        const uintptr_t a = (uintptr_t) t->data;
++        if (std::find(ps.seen.begin(), ps.seen.end(), a) == ps.seen.end()) {
++            ps.seen.push_back(a);
++            ps.pending.push_back({ a, a + ggml_nbytes(t) });
+         }
+     }
+ }
+diff --git a/src/llama-moe-split.h b/src/llama-moe-split.h
+index 750b4494f..f61ba39ac 100644
+--- a/src/llama-moe-split.h
++++ b/src/llama-moe-split.h
+@@ -18,7 +18,9 @@
+ //   ids [n_tokens][n_used] (row stride ids_stride), w the routing weights (row stride w_stride).
+ //   heavy:   the experts the card computes, ascending; its slot j holds expert heavy[j]
+ //   ids_cpu: the expert of each slot, or -1 where the card computes it
+-//   ids_gpu: the card slot of each slot; 0 where the CPU computes it (its weight is then 0)
++//   ids_gpu: the card slot of each slot. Where the CPU computes it, its weight is 0 and the slot
++//            is the lowest card slot the token does not use yet, so below n_used: the CUDA
++//            MUL_MAT_ID takes an expert at most once per token
+ //   w_gpu:   the routing weight where the card computes the slot, else 0
+ // The experts with at least min_tokens tokens are heavy, at most max_experts of them: the most
+ // routed, the lower id first on a tie.
+@@ -50,13 +52,28 @@ inline void llama_moe_split_plan(
+         slot[heavy[j]] = (int32_t) j;
+     }
+ 
++    std::vector<int32_t> taken;
+     for (int64_t t = 0; t < n_tokens; t++) {
++        taken.clear();
++        for (int k = 0; k < n_used; k++) {
++            const int32_t j = slot[ids[t*ids_stride + k]];
++            if (j >= 0) {
++                taken.push_back(j);
++            }
++        }
++        int32_t next = 0;
+         for (int k = 0; k < n_used; k++) {
+             const int32_t e = ids[t*ids_stride + k];
+-            const int32_t j = slot[e];
++            int32_t j = slot[e];
+             ids_cpu[t*n_used + k] = j >= 0 ? -1 : e;
+-            ids_gpu[t*n_used + k] = j >= 0 ?  j : 0;
+             w_gpu  [t*n_used + k] = j >= 0 ? w[t*w_stride + k] : 0.0f;
++            if (j < 0) {
++                while (std::find(taken.begin(), taken.end(), next) != taken.end()) {
++                    next++;
++                }
++                j = next++;
++            }
++            ids_gpu[t*n_used + k] = j;
+         }
+     }
+ }
+diff --git a/tests/test-moe-split.cpp b/tests/test-moe-split.cpp
+index 08b640ab4..098d592ec 100644
+--- a/tests/test-moe-split.cpp
++++ b/tests/test-moe-split.cpp
+@@ -26,16 +26,24 @@ static void test_plan() {
+     CHECK(heavy.size() == 2 && heavy[0] == 1 && heavy[1] == 3);
+     for (int s = 0; s < 8; s++) {
+         if (ids[s] == 0) {
+-            CHECK(ids_cpu[s] == 0 && w_gpu[s] == 0.0f && ids_gpu[s] == 0);
++            CHECK(ids_cpu[s] == 0 && w_gpu[s] == 0.0f);
+         } else {
+             CHECK(ids_cpu[s] == -1 && heavy[ids_gpu[s]] == ids[s] && w_gpu[s] == w[s]);
+         }
+     }
+ 
++    // the card's ids of a token are distinct (the CUDA MUL_MAT_ID takes an expert at most once per
++    // token) and below max(heavy, n_used): token 1 routes to 1 (card slot 0) and 0 (the CPU)
++    CHECK(ids_gpu[2] == 0 && ids_gpu[3] == 1);
++
+     // at most one expert: the most routed
+     llama_moe_split_plan(ids, n_used, w, n_used, n_used, n_tokens, n_expert, 1, 1, heavy, ids_cpu, ids_gpu, w_gpu);
+     CHECK(heavy.size() == 1 && heavy[0] == 1);
+     CHECK(ids_cpu[1] == 3 && ids_cpu[0] == -1 && ids_gpu[0] == 0);
++    for (int t = 0; t < n_tokens; t++) {
++        CHECK(ids_gpu[2*t] != ids_gpu[2*t + 1]);
++        CHECK(ids_gpu[2*t] < 2 && ids_gpu[2*t + 1] < 2);
++    }
+ 
+     // none reaches the threshold: the CPU computes everything
+     llama_moe_split_plan(ids, n_used, w, n_used, n_used, n_tokens, n_expert, 5, 8, heavy, ids_cpu, ids_gpu, w_gpu);
