@@ -69,7 +69,14 @@ class Pool:
                               stats={}, slots_detail=[], slot_prev={}, misses=0,
                               cache={}, draining=False,
                               # slot id -> how many saves are reading it.
-                              saving=Counter())
+                              saving=Counter(),
+                              # Slots a carried turn was handed before its
+                              # restore lands and it is recorded as `using`.
+                              handed=set(),
+                              # Bumped on every restart. A save queued before
+                              # one cannot write a slot the fresh backend now
+                              # holds, even though its record kept the claim.
+                              generation=0)
                          for b in backends]
         # Each backend reports prompt cache evictions only in its own log.
         self.cache_watch = {be["name"]: CacheWatch(
@@ -195,6 +202,34 @@ class Pool:
                   f"conversation(s), dropped {len(spent)} stale file(s)",
                   flush=True)
 
+    def _sweep_order(self, keep=None):
+        """The pinned copies in the order park_budget spends them: used most
+        recently first, with `keep` (the copy just written) moved to the
+        front, where the drop loop exempts it. Held under the lock."""
+        held = sorted((c for c, p in self.pins.items() if p.get("parked")),
+                      key=lambda c: last_used(self.pins[c]))
+        held.reverse()                     # used most recently first
+        if keep in held:
+            held.remove(keep)
+            held.insert(0, keep)
+        return held
+
+    def _doomed(self, held, keep=None):
+        """Which of `held` a park_budget sweep drops, in _sweep_order order.
+        The rule both halves of the sweep read: a copy past the budget goes,
+        except `keep` (the copy just written, which _sweep_order front-loads)
+        and any record with `parking` set, which is the copy being written
+        now and must not have its file pulled out from under it. Held under
+        the lock."""
+        doomed, total = set(), 0
+        for name in held:
+            record = self.pins[name]
+            total += record.get("bytes") or 0
+            if (total > self.tuning.park_budget and name != keep
+                    and not record.get("parking")):
+                doomed.add(name)
+        return doomed
+
     def _trim_copies(self, keep=None):
         """Drop copies until they fit park_budget, least recently used first.
         Returns the file names to delete. Held under the lock.
@@ -206,18 +241,18 @@ class Pool:
         Ordered by write time instead, a copy the migration had just
         rewritten looked fresh though nobody had asked for it, and a
         conversation somebody was working in was dropped for a question
-        answered days ago."""
-        held = sorted((c for c, p in self.pins.items() if p.get("parked")),
-                      key=lambda c: last_used(self.pins[c]))
-        held.reverse()                     # used most recently first
-        if keep in held:
-            held.remove(keep)
-            held.insert(0, keep)
-        spent, total = [], 0
+        answered days ago.
+
+        `parking` is the other exemption: that record is the copy currently
+        being written, and a concurrent park sweeping it removed the file the
+        writer was filling. `_doomed` holds the rule for both this and the
+        dashboard's mark."""
+        held = self._sweep_order(keep)
+        doomed = self._doomed(held, keep)
+        spent = []
         for name in held:
-            record = self.pins[name]
-            total += record.get("bytes") or 0
-            if total > self.tuning.park_budget and name != keep:
+            if name in doomed:
+                record = self.pins[name]
                 spent.append(record["parked"])
                 record["parked"] = None
         return spent
@@ -404,13 +439,18 @@ class Pool:
         return be["config"]
 
     def vision(self):
-        """The vision encoder's geometry, from whichever backend printed it.
-        Read each time, so a restart onto a different mmproj is picked up."""
+        """Every vision encoder's geometry the fleet printed, one per distinct
+        mmproj, or the shipped one when none has. A mixed fleet sizes an image
+        by the dearest of them; naming only the first charged it by the wrong
+        one. Read each time, so a restart onto a different mmproj is picked
+        up."""
+        said = []
         for be in self.backends:
             self.read_settings(be)
-            if be.get("vision"):
-                return be["vision"]
-        return VISION
+            vision = be.get("vision")
+            if vision and vision not in said:
+                said.append(vision)
+        return said or [VISION]
 
     def _read_metrics(self, be):
         """Read the counters llama-server keeps, for the dashboard."""
@@ -518,7 +558,9 @@ class Pool:
                     # it is this conversation's own: the read would write into
                     # the slot the copy is being taken from. ensure_parked can
                     # have started one between this turn's release and now.
-                    and record["slot"] not in be["saving"]):
+                    # Nor while a carried turn is about to restore over it.
+                    and record["slot"] not in be["saving"]
+                    and record["slot"] not in be["handed"]):
                 # `taken` below is built from `using`. Without this a
                 # second request could be handed this warm slot.
                 record["using"] = record["slot"]
@@ -529,6 +571,7 @@ class Pool:
                 range(max(1, be.get("slots", 1))))
             working = {s["id"] for s in detail if s.get("busy")}
             taken.update(be["saving"])
+            taken.update(be["handed"])
             # Free by both accounts first. Then merely not handed out: the
             # poll is the older of the two.
             # None rather than ids[0]: a slot a save is still reading must
@@ -652,6 +695,7 @@ class Pool:
         patience = time.time() + self.tuning.pin_patience
         spill = False              # set once the pin is given up on
         kept = set()               # free backends held back for generating
+        got, lines = None, ()
 
         while True:
             with self.cv:
@@ -667,7 +711,8 @@ class Pool:
                         else:
                             got = self._take(target, conv, tokens)
                             if got:
-                                return self._said_kept(conv, kept, got)
+                                lines = self._said_kept(conv, kept, got)
+                                break
                     # A fifth of turns re-read everything: prefillers only.
                     if (not target["up"] or tokens > target["n_ctx"]
                             or not prefills(target, path)):
@@ -687,7 +732,10 @@ class Pool:
                             continue
                         got = self._take(be, conv, tokens)
                         if got:
-                            return self._said_kept(conv, kept, got)
+                            lines = self._said_kept(conv, kept, got)
+                            break
+                    if got:
+                        break
 
                 # Nothing that could serve this is up. Waiting cannot help.
                 served_by = target is not None or any(
@@ -702,6 +750,12 @@ class Pool:
                     spill = True
 
                 self.cv.wait(1.0)
+
+        # Printed with the lock let go: the condition is the one every turn's
+        # claim, acquire and release waits on.
+        for line in lines:
+            print(line, flush=True)
+        return got
 
     def _owed(self, be, conv, tokens):
         """True when reading this turn here would keep another turn from
@@ -781,16 +835,18 @@ class Pool:
         return record.get("to_read", record.get("tokens") or 0)
 
     def _said_kept(self, conv, kept, got):
-        """Say which free backends this turn was kept off, once it has a
-        reader. Held under the lock."""
+        """Note which free backends this turn was kept off, once it has a
+        reader. Returns the lines to print once the lock is let go, so a
+        print cannot stall a turn on the condition every turn waits on."""
         kept.discard(got[0]["name"])
+        said = []
         for name in sorted(kept):
             self.events.write("keep", conv=short_key(conv) if conv else None,
                               backend=name, reader=got[0]["name"])
-            print(f"[router] {short_key(conv) if conv else 'a turn'} reads on "
-                  f"{got[0]['name']}: {name} is kept free to generate",
-                  flush=True)
-        return got
+            said.append(
+                f"[router] {short_key(conv) if conv else 'a turn'} reads on "
+                f"{got[0]['name']}: {name} is kept free to generate")
+        return said
 
     def _take(self, be, conv, tokens=0):
         """Claim a backend and a slot on it. Answers (backend, slot), or
@@ -824,7 +880,16 @@ class Pool:
                 turns=record.get("turns", 0) + 1)
             self.pins.move_to_end(conv)
             while len(self.pins) > self.tuning.max_pins:
-                _, dropped = self.pins.popitem(last=False)
+                # Least recently used first, but never a record a save is
+                # reading or a turn is still on: evicting one drops its copy
+                # from the map and its `using` from _turn_slots, and its slot
+                # can be handed out mid-read.
+                victim = next((name for name, p in self.pins.items()
+                               if not p.get("inflight") and not p.get("parking")),
+                              None)
+                if victim is None:
+                    break
+                dropped = self.pins.pop(victim)
                 if dropped.get("parked"):
                     self.store.drop(dropped["parked"])   # its copy is orphaned
         return be, slot
@@ -845,7 +910,15 @@ class Pool:
         """Forget which slot on this backend held what. Held under the lock.
         A restarted backend loses every slot. The pins stay: the copies on
         disk are still good. A conversation mid-turn is left alone, because
-        its own thread owns that slot."""
+        its own thread owns that slot.
+
+        The generation moves with the restart. A queued save's record keeps
+        its claim across the restart (it is `parking`, skipped below), so the
+        claim alone would let it write whatever the fresh backend now holds in
+        that slot. `_save_park` compares the generation the job captured."""
+        for be in self.backends:
+            if be["name"] == name:
+                be["generation"] += 1
         for record in self.pins.values():
             if (record.get("backend") == name
                     and not record.get("inflight")
@@ -891,8 +964,9 @@ class Pool:
         another turn was handed, a slot a copy is being read out of, and the
         poll. The poll alone is two seconds old, so two turns carried inside
         one window were told the same slot and the second restore landed on
-        the first turn's cache."""
-        taken = self._turn_slots(be) | set(be["saving"])
+        the first turn's cache. `handed` is the fourth: a slot this router
+        gave a carry whose restore has not landed yet."""
+        taken = self._turn_slots(be) | set(be["saving"]) | be["handed"]
         detail = be.get("slots_detail") or []
         if not detail:
             return None if 0 in taken else 0   # nothing reported yet
@@ -929,17 +1003,46 @@ class Pool:
             self._save_park(conv, be, slot, remove)
 
     def _save_park(self, conv, be, slot, remove=None, timeout=None,
-                   settle=True):
+                   settle=True, claim=False, generation=None):
         """Write one cache to disk. Mark the pin only if it holds one.
         `settle` false leaves the copy in the page cache for a restore that
-        follows at once; that caller settles it."""
+        follows at once; that caller settles it.
+
+        `claim` re-checks, under the lock, that the record still names this
+        slot: a queued job waits, and take_slot can give its slot to another
+        conversation in the meantime. Saved anyway, the copy lands under the
+        wrong conversation's name. `park_partial` writes a slot its record
+        does not claim yet, so it leaves this off.
+
+        `generation` is the backend's counter when the job was queued. A
+        restart bumps it, and the record keeps its slot claim across the
+        restart, so the claim alone would save what the fresh backend holds.
+        A queued job passes the generation it captured."""
         remove = remove or self.store.drop
+        stale = False
         with self.cv:
-            # Counted, not a set: two pins can name one slot, so two saves of
-            # it can overlap. A set let whichever finished first drop the
-            # claim, and the slot was handed out while the other copy was
-            # still being read out of it.
-            be["saving"][slot] += 1
+            record = self.pins.get(conv)
+            if claim and (record is None or record.get("inflight")
+                          or record.get("backend") != be["name"]
+                          or record.get("slot") != slot
+                          or generation != be["generation"]):
+                stale = True
+                if record:
+                    # The job is skipped, so give back the claim park_later
+                    # took; the finally below never runs.
+                    record["parking"] = False
+                self.cv.notify_all()
+            else:
+                # Counted, not a set: two pins can name one slot, so two
+                # saves of it can overlap. A set let whichever finished first
+                # drop the claim, and the slot was handed out while the other
+                # copy was still being read out of it.
+                be["saving"][slot] += 1
+        if stale:
+            print(f"[router] {short_key(conv)}'s slot changed hands or the "
+                  f"backend restarted while its copy waited, so nothing was "
+                  f"saved", flush=True)
+            return False
         try:
             return self._park(conv, be, slot, remove, timeout, settle)
         finally:
@@ -1041,9 +1144,15 @@ class Pool:
             record = self.pins.get(conv)
             if not record or not record.get("parked"):
                 return False
-            # Already here, and still in a slot. acquire re-pins before this
-            # runs, so only the slot says whether the cache survived.
-            if record["backend"] == be["name"] and record["slot"] is not None:
+            # Already here, and still in the slot asked for. The record's slot
+            # alone is not enough: pick_slot refuses its own slot while a
+            # carried turn was handed it and hands out a different one, so
+            # the record keeps a stale claim. Comparing that claim against the
+            # requested slot lets the restore land instead of reading cold for
+            # the length of the other carry.
+            if (record["backend"] == be["name"]
+                    and record["slot"] is not None
+                    and record["slot"] == slot):
                 return False
             target_slot = slot
             name = record["parked"]
@@ -1463,19 +1572,25 @@ class Pool:
                         self.cv.wait(1.0)
 
             # The restore writes over the slot, as a read landing here would.
-            self.ensure_parked(target, conv, remove)
+            # ensure_parked is inside the try too: a save that throws must
+            # still give back the slot and the busy count the carry took, or
+            # the generator keeps a slot no turn holds. "A slow answer beats
+            # none."
             try:
+                self.ensure_parked(target, conv, remove)
                 self.link.restore(target, free, name)
             except Exception as err:
                 print(f"[router] {short_key(conv)} could not be carried to "
                       f"{target['name']}: {err}", flush=True)
                 with self.cv:
                     target["busy"] -= 1
+                    target["handed"].discard(free)
                     source["busy"] += 1        # it generates where it read instead
                     self.cv.notify_all()
                 return self._stay(source, f"{target['name']} refused the restore")
 
             with self.cv:
+                target["handed"].discard(free)
                 record = self.pins.get(conv)
                 if record:
                     self._end_claims(target, free, conv)
@@ -1540,6 +1655,10 @@ class Pool:
                         free = self._free_slot(target)
                         if free is not None:
                             target["busy"] += 1   # counted like a request
+                            # Recorded under the same hold, or a second carry
+                            # inside this window is handed the same slot and
+                            # its restore lands on the first's cache.
+                            target["handed"].add(free)
                             return free
                     if alive is not None and not alive():
                         return None
@@ -1572,11 +1691,16 @@ class Pool:
                                            # write the same file at once
             slot = record["slot"]
             record["parking"] = True       # hold it still while it copies
+            # The generation travels with the job. A restart between now and
+            # the worker waking bumps the backend's, and the save is skipped.
+            generation = be["generation"]
+            # Under the lock, so a stop_parks sentinel cannot overtake the
+            # job: an unbounded Queue.put never blocks.
+            self.park_jobs.put((conv, be, slot, remove, ticket, generation))
             if self.parker is None:
                 self.parker = threading.Thread(target=self._run_parks,
                                                name="park", daemon=True)
                 self.parker.start()
-        self.park_jobs.put((conv, be, slot, remove, ticket))
         return True
 
     def stop_parks(self):
@@ -1605,9 +1729,10 @@ class Pool:
             if job is None:               # stop_parks, once the queue is dry
                 self.park_jobs.task_done()
                 return
-            conv, be, slot, remove, ticket = job
+            conv, be, slot, remove, ticket, generation = job
             try:
-                self._save_park(conv, be, slot, remove)
+                self._save_park(conv, be, slot, remove, claim=True,
+                                generation=generation)
             except Exception as err:
                 print(f"[router] {short_key(conv)} could not be put away: "
                       f"{err}", flush=True)
@@ -1877,10 +2002,15 @@ class Pool:
             # `slot` is set only while the slot still holds the cache, or
             # three copies naming one single-slot backend look like three
             # caches in one slot. `parked_at` is the park_budget sweep order.
+            # `doomed` is the router's own mark for the next sweep. It reads
+            # the same rule _trim_copies applies, through `_doomed`: the copies
+            # past park_budget in _sweep_order, minus one being written now
+            # (`parking`) and minus `keep` when a sweep is in flight.
+            doomed = self._doomed(self._sweep_order())
             copies = [{"name": p["parked"], "kind": "copy", "conv": short_key(conv),
                        "bytes": p.get("bytes") or 0, "backend": p["backend"],
                        "slot": p.get("slot"), "parked_at": p.get("parked_at"),
-                       "used": last_used(p)}
+                       "used": last_used(p), "doomed": conv in doomed}
                       for conv, p in self.pins.items() if p.get("parked")]
             disk = disk_summary(self.pins, self.openings,
                                 self.opening_bytes, self.tuning)

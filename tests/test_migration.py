@@ -73,7 +73,8 @@ def pin(backend_name, slot=0, tokens=SANDBOX.tuning.reply_tokens + 8192,
     # so `parked=` alone means the copy is current; pass an earlier number for
     # a copy the slot has run past.
     return {"backend": backend_name, "slot": slot, "tokens": tokens,
-            "last": last, "inflight": inflight, "moved": moved, "parked": parked,
+            "last": last, "inflight": inflight, "parking": parking,
+            "moved": moved, "parked": parked,
             "turns": turns,
             "parked_turn": turns if parked and parked_turn is None else parked_turn}
 
@@ -795,6 +796,20 @@ class WhatAnImageCosts(unittest.TestCase):
         self.assertEqual(router.token_estimate(body),
                          int(len(body) / SANDBOX.tuning.chars_per_tok) + SANDBOX.tuning.reply_tokens)
 
+    def test_a_mixed_fleet_charges_the_dearest_geometry(self):
+        """Any backend may serve the request, so the dearest encoder's count
+        is the one that cannot refuse it."""
+        body = openai_body(png(240, 120))
+        picture = base64.b64encode(png(240, 120)).decode()
+        fine = dict(router.VISION)
+        dense = dict(router.VISION, patch_size=8)
+        self.assertEqual(router.image_tokens(picture, fine), 32)
+        self.assertEqual(router.image_tokens(picture, dense), 15 * 8)
+        self.assertEqual(router.request_cost(body, [fine, dense])[2], 15 * 8,
+                         "the fleet's dearest encoder, not the first one read")
+        self.assertEqual(router.request_cost(body, fine)[2], 32,
+                         "a lone geometry is still a geometry")
+
     def test_a_body_that_is_not_json_is_still_its_length(self):
         self.assertEqual(router.token_estimate(b"<not json>"),
                          int(10 / SANDBOX.tuning.chars_per_tok) + SANDBOX.tuning.reply_tokens)
@@ -831,6 +846,22 @@ class TheVisionGeometryComesFromTheBackend(unittest.TestCase):
 
     def test_half_a_log_says_nothing_rather_than_something_wrong(self):
         self.assertIsNone(router.read_vision(self.HPARAMS[:4]))
+
+    def test_a_mixed_fleet_names_every_geometry(self):
+        """Sizing an image by only the first backend's mmproj underweights
+        every picture the dearest of the rest would serve."""
+        pool = make_pool(
+            [{"name": "mix0", "url": "http://mix0", "pref": 0},
+             {"name": "mix1", "url": "http://mix1", "pref": 1}], watch=False)
+        coarse = dict(router.VISION, patch_size=32)
+        pool.backends[0]["vision"] = dict(router.VISION)
+        pool.backends[1]["vision"] = coarse
+        self.assertEqual(pool.vision(), [dict(router.VISION), coarse])
+
+    def test_a_fleet_with_no_mmproj_falls_back_to_the_shipped_one(self):
+        pool = make_pool([{"name": "mixnone", "url": "http://mixnone", "pref": 0}],
+                         watch=False)
+        self.assertEqual(pool.vision(), [router.VISION])
 
 
 class FakeLink:
@@ -1845,8 +1876,10 @@ class Recall(unittest.TestCase):
         self.assertEqual(record["slot"], 1)
 
     def test_does_nothing_when_the_backend_has_not_changed(self):
+        # The record still claims slot 0, and 0 is what is asked for, so the
+        # cache is already here. A different slot is a case of its own, below.
         post = linked(self.pool, FakeLink())
-        self.assertFalse(self.pool.recall("conv1", self.gpu, 1))
+        self.assertFalse(self.pool.recall("conv1", self.gpu, 0))
         self.assertEqual(post.calls, [])
 
     def test_does_nothing_without_a_parked_copy(self):
@@ -1854,6 +1887,18 @@ class Recall(unittest.TestCase):
         post = linked(self.pool, FakeLink())
         self.assertFalse(self.pool.recall("conv1", self.cpu, 1))
         self.assertEqual(post.calls, [])
+
+    def test_a_stale_slot_claim_restores_into_the_requested_slot(self):
+        """pick_slot hands a conversation a different slot when its own was
+        given to a carried turn, but leaves the old slot claim on the record.
+        recall read that claim as `already here` and refused, so the
+        conversation read cold until the carry's restore landed. The requested
+        slot, not the claim, decides."""
+        self.gpu["handed"] = {0}      # a carry holds the record's own slot
+        post = linked(self.pool, FakeLink())
+        self.assertTrue(self.pool.recall("conv1", self.gpu, 1))
+        self.assertEqual(post.ops(), ["restore"])
+        self.assertEqual(self.pool.pins["conv1"]["slot"], 1)
 
     def test_a_failed_restore_leaves_the_pin_alone(self):
         with_link(self.pool,
@@ -3316,6 +3361,68 @@ class DiskSummary(unittest.TestCase):
         self.assertEqual(got["deeps"], {"count": 1})
 
 
+class TheStripShowsTheRoutersSweep(unittest.TestCase):
+    """`doomed` on the dashboard is the router's own mark. The page used to
+    guess it by running the shares past 1, which never doomed index 0 and knew
+    nothing of a copy a save was still reading."""
+
+    def setUp(self):
+        self.pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                              watch=False)
+        self.cpu = self.pool.backends[0]
+        self.cpu.update(up=True, slots=1, n_ctx=150000)
+
+    def marks(self):
+        return {row["conv"]: row["doomed"]
+                for row in self.pool.status()["disk"]["files"]
+                if row["kind"] == "copy"}
+
+    def test_the_copies_past_the_budget_are_marked_in_sweep_order(self):
+        budget = SANDBOX.tuning.park_budget
+        self.pool.pins["old"] = pin("cpu", slot=0, parked="old.park", last=1.0)
+        self.pool.pins["old"]["bytes"] = budget
+        self.pool.pins["new"] = pin("cpu", slot=0, parked="new.park", last=2.0)
+        self.pool.pins["new"]["bytes"] = 1
+        self.assertEqual(self.marks(), {"new": False, "old": True})
+
+    def test_a_copy_being_written_is_not_marked(self):
+        budget = SANDBOX.tuning.park_budget
+        self.pool.pins["writing"] = pin("cpu", slot=0, parked="writing.park",
+                                        last=1.0, parking=True)
+        self.pool.pins["writing"]["bytes"] = budget * 2
+        self.assertFalse(self.marks()["writing"],
+                         "the copy a save is reading was marked to go")
+
+    def test_a_copy_being_written_is_not_swept(self):
+        """The mark is a promise about the sweep. `_trim_copies` exempted only
+        `keep`, so a concurrent park swept a `parking` record the dashboard had
+        painted safe and dropped its file mid-write."""
+        budget = SANDBOX.tuning.park_budget
+        self.pool.pins["writing"] = pin("cpu", slot=0, parked="writing.park",
+                                        last=1.0, parking=True)
+        self.pool.pins["writing"]["bytes"] = budget * 2
+        self.assertEqual(self.pool._trim_copies(), [],
+                         "a copy being written was swept")
+        self.assertEqual(self.pool.pins["writing"]["parked"], "writing.park")
+
+    def test_the_mark_is_what_a_sweep_over_the_same_budget_drops(self):
+        """`doomed` predicts the next sweep, so the two must read one rule.
+        Computed twice, the sweep dropped a `parking` record the mark had
+        painted safe, and the writer's file went with it."""
+        budget = SANDBOX.tuning.park_budget
+        for conv, size, last, parking in (("a", budget, 1.0, False),
+                                          ("b", 1, 2.0, False),
+                                          ("c", budget, 3.0, True)):
+            self.pool.pins[conv] = pin("cpu", slot=0, parked=conv + ".park",
+                                       last=last, parking=parking)
+            self.pool.pins[conv]["bytes"] = size
+        marked = {conv for conv, doomed in self.marks().items() if doomed}
+        by_file = {p["parked"]: conv for conv, p in self.pool.pins.items()}
+        dropped = {by_file[name] for name in self.pool._trim_copies()}
+        self.assertEqual(marked, dropped)
+        self.assertNotIn("c", marked, "a copy being written was marked to go")
+
+
 class WhoIsWaiting(unittest.TestCase):
     """The dashboard lists each waiter with what it waits for."""
 
@@ -3722,6 +3829,42 @@ class ThePinRecordSurvivesTheNextTurn(unittest.TestCase):
         self.pool.note_slot("a", 0)
         self.pool._take(self.cpu, "a", tokens=10)
         self.assertEqual(self.pool.pins["a"]["slot"], 0)
+
+
+class TheOldestPinThatCanGoIsEvicted(unittest.TestCase):
+    """MAX_PINS drops the least recently used record. One whose copy is being
+    written, or whose turn is still reading, must not be the one: its copy
+    loses its name and its slot loses its claim mid-use."""
+
+    def setUp(self):
+        self.was = SANDBOX.tuning
+        SANDBOX.tuning = replace(self.was, max_pins=2)
+        self.addCleanup(lambda: setattr(SANDBOX, "tuning", self.was))
+        self.pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                              watch=False)
+        self.cpu = self.pool.backends[0]
+        self.cpu.update(up=True, slots=1, n_ctx=150000)
+
+    def test_a_parking_record_is_not_evicted(self):
+        self.pool.pins["old"] = pin("cpu", slot=0, parking=True)
+        self.pool.pins["newer"] = pin("cpu", slot=0)
+        self.pool._take(self.cpu, "fresh", tokens=10)
+        self.assertIn("old", self.pool.pins, "a record being copied was evicted")
+        self.assertNotIn("newer", self.pool.pins)
+
+    def test_an_inflight_record_is_not_evicted(self):
+        self.pool.pins["reading"] = pin("cpu", slot=0, inflight=True)
+        self.pool.pins["newer"] = pin("cpu", slot=0)
+        self.pool._take(self.cpu, "fresh", tokens=10)
+        self.assertIn("reading", self.pool.pins, "a turn mid-read lost its pin")
+        self.assertNotIn("newer", self.pool.pins)
+
+    def test_eviction_gives_up_when_nothing_may_go(self):
+        self.pool.pins["reading"] = pin("cpu", slot=0, inflight=True)
+        self.pool.pins["writing"] = pin("cpu", slot=0, parking=True)
+        self.pool._take(self.cpu, "fresh", tokens=10)
+        self.assertEqual(set(self.pool.pins), {"reading", "writing", "fresh"},
+                         "max_pins must yield to a record in use")
 
 
 class ARefusedParkKeepsTheCopyItHad(unittest.TestCase):
@@ -4143,6 +4286,88 @@ class ParkAfterGenerating(unittest.TestCase):
         self.assertTrue(self.pool.drain_parks(10.0))
         self.assertEqual(len(slow.calls), 2)
 
+    def test_a_slot_that_changed_hands_while_the_job_waited_is_not_saved(self):
+        """park_later captures the slot under the lock, but the job runs
+        outside it. take_slot can hand that slot to another conversation
+        before the worker wakes, and the copy would land under A's name."""
+        self.gpu["slots"] = 2
+        self.gpu["slots_detail"] = [{"id": 0, "busy": False},
+                                    {"id": 1, "busy": False}]
+        self.pool.pins["other"] = pin("gpu", slot=0)
+        self.pool.pins["a"] = pin("gpu", slot=1)
+        slow = FakeLink(written=200_000_000, block=True)
+        self.pool.link = slow
+        self.assertTrue(self.pool.park_later(self.gpu, "other", "to"))
+        self.assertTrue(self.pool.park_later(self.gpu, "a", "ta"))
+        self.assertTrue(slow.started.wait(5.0), "the earlier copy never began")
+
+        # B takes A's slot while A's job waits behind the earlier save.
+        self.pool._take(self.gpu, "b", tokens=10)
+        self.pool.take_slot(self.gpu, 1, "b")
+        self.assertIsNone(self.pool.pins["a"]["slot"])
+
+        slow.release()
+        self.assertTrue(self.pool.drain_parks(10.0))
+        self.assertNotIn("a.park", slow.files("save"))
+        self.assertIsNone(self.pool.pins["a"]["parked"],
+                          "a cache that changed hands was written under A's name")
+
+    def test_a_job_queued_before_a_restart_is_not_saved(self):
+        """forget_slots skips a record being copied, so a queued job keeps its
+        slot claim across the backend's restart. The claim alone would save
+        whatever the fresh backend now holds in that slot under A's name. The
+        generation the job captured says the backend is not the one it queued
+        against."""
+        self.gpu["slots"] = 2
+        self.gpu["slots_detail"] = [{"id": 0, "busy": False},
+                                    {"id": 1, "busy": False}]
+        self.pool.pins["other"] = pin("gpu", slot=0)
+        self.pool.pins["a"] = pin("gpu", slot=1)
+        slow = FakeLink(written=200_000_000, block=True)
+        self.pool.link = slow
+        self.assertTrue(self.pool.park_later(self.gpu, "other", "to"))
+        self.assertTrue(self.pool.park_later(self.gpu, "a", "ta"))
+        self.assertTrue(slow.started.wait(5.0), "the earlier copy never began")
+
+        # B restarts while A's job waits behind the earlier save. Its
+        # `parking` record kept the slot claim; the generation did not.
+        with self.pool.cv:
+            self.pool.forget_slots("gpu")
+        slow.release()
+        self.assertTrue(self.pool.drain_parks(10.0))
+
+        self.assertNotIn("a.park", slow.files("save"))
+        self.assertIsNone(self.pool.pins["a"]["parked"],
+                          "a copy queued before the restart was written")
+        self.assertFalse(self.pool.pins["a"]["parking"],
+                         "a skipped job left the record reserved")
+
+    def test_a_skipped_job_still_frees_the_record_and_the_turn(self):
+        """A job refused because its slot moved must still clear `parking`
+        and end its turn. Left set, no later copy of A is ever taken; left
+        held, the conversation waits on a ticket no worker will finish."""
+        self.gpu["slots"] = 2
+        self.gpu["slots_detail"] = [{"id": 0, "busy": False},
+                                    {"id": 1, "busy": False}]
+        self.pool.pins["other"] = pin("gpu", slot=0)
+        self.pool.pins["a"] = pin("gpu", slot=1)
+        self.pool.claim_turn("a", "ta")
+        slow = FakeLink(written=200_000_000, block=True)
+        self.pool.link = slow
+        self.assertTrue(self.pool.park_later(self.gpu, "other", "to"))
+        self.assertTrue(self.pool.park_later(self.gpu, "a", "ta"))
+        self.assertTrue(slow.started.wait(5.0), "the earlier copy never began")
+
+        self.pool._take(self.gpu, "b", tokens=10)
+        self.pool.take_slot(self.gpu, 1, "b")
+
+        slow.release()
+        self.assertTrue(self.pool.drain_parks(10.0))
+        self.assertFalse(self.pool.pins["a"]["parking"],
+                         "a refused job left the record reserved")
+        self.assertNotIn("a", self.pool.turns,
+                         "the turn waited on a ticket the worker never finished")
+
 
 class MachineLoad(unittest.TestCase):
     """CPU by NUMA node, memory by node, and the gpu, read from the files and
@@ -4271,6 +4496,28 @@ class ReadOnly(unittest.TestCase):
             self.assertIsNone(router.conversation_id(body), body)
 
 
+class RestoreHangs(FakeLink):
+    """A link whose saves land but whose first restore waits inside the
+    backend: the carry that called it has not recorded its slot yet."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.entered = threading.Event()
+        self.go.clear()             # only the first restore waits below
+
+    def save(self, be, slot, name, timeout=None):
+        self.calls.append(("save", be["name"], slot, name))
+        return {"id_slot": slot, "n_written": self.written}
+
+    def restore(self, be, slot, name, timeout=None):
+        first = not any(call[0] == "restore" for call in self.calls)
+        self.calls.append(("restore", be["name"], slot, name))
+        if first:
+            self.entered.set()
+            self.go.wait(10.0)
+        return {"id_slot": slot, "n_written": self.written}
+
+
 class TwoCarriedTurnsNeverShareASlot(unittest.TestCase):
     """The generate side chooses a slot too, and it read only the poll, which
     is two seconds old. Two turns carried inside one window were told the same
@@ -4297,6 +4544,23 @@ class TwoCarriedTurnsNeverShareASlot(unittest.TestCase):
 
     def test_each_is_given_a_slot_of_its_own(self):
         self.assertNotEqual(self.carried("first"), self.carried("second"))
+
+    def test_a_second_carry_does_not_take_the_slot_the_last_was_handed(self):
+        """The first carry is inside its restore, so it has not set `using`.
+        Without a per-backend `handed`, the second is told the same slot and
+        its restore overwrites the first's cache."""
+        post = RestoreHangs(written=1 << 30)
+        self.pool.link = post
+        first = threading.Thread(target=self.carried, args=("first",),
+                                 daemon=True)
+        first.start()
+        self.assertTrue(post.entered.wait(5.0), "the first restore never began")
+        second = self.carried("second")
+        post.go.set()
+        first.join(10.0)
+        self.assertEqual(second, 1)
+        self.assertEqual(self.pool.pins["first"]["slot"], 0)
+        self.assertNotEqual(self.pool.pins["first"]["slot"], second)
 
 
 class HandOff(unittest.TestCase):
@@ -4463,6 +4727,27 @@ class HandOff(unittest.TestCase):
         self.assertIs(self.go(self.mover(fail_on="restore")), self.cpu)
         self.assertEqual(self.pool.pins["a"]["backend"], "cpu")
         self.assertEqual((self.cpu["busy"], self.gpu["busy"]), (1, 0))
+
+    def test_a_refused_restore_hands_the_generator_slot_back(self):
+        """The slot was handed before the restore. Left held, the next carry
+        into the generator finds no free slot and queues behind a turn that
+        never took it."""
+        self.assertIs(self.go(self.mover(fail_on="restore")), self.cpu)
+        self.assertEqual(self.gpu["handed"], set())
+        self.assertEqual((self.cpu["busy"], self.gpu["busy"]), (1, 0))
+
+    def test_ensure_parked_throwing_hands_the_slot_and_the_count_back(self):
+        """The save before the restore can throw too. Discharged nowhere, the
+        generator keeps a slot no turn holds: busy climbs and the next carry
+        is refused where it should queue."""
+        def explode(*args, **kwargs):
+            raise RuntimeError("the disk is gone")
+
+        self.pool.ensure_parked = explode
+        self.assertIs(self.go(self.mover()), self.cpu)
+        self.assertEqual(self.gpu["busy"], 0)
+        self.assertEqual(self.gpu["handed"], set())
+        self.assertEqual(self.cpu["busy"], 1)
 
     def test_a_failed_save_leaves_nothing_behind(self):
         """And leaves the reader holding it. A save the backend refused says
@@ -4801,6 +5086,15 @@ class AReadOnTheGeneratorEndsBeforeItIsNeeded(unittest.TestCase):
         self.reader("new", 100000)
         self.assertEqual([(row["backend"], row["reader"])
                           for row in self.said.of("keep")], [("gpu", "cpu2")])
+
+    def test_the_keep_events_are_written_though_the_print_moved_out(self):
+        """The line is printed with the lock let go now; the event that
+        accompanies it, and what it names, are unchanged."""
+        self.reading_on(self.cpu, "x", 500)
+        self.reader("new", 100000)
+        self.assertEqual(self.said.of("keep"),
+                         [{"conv": "new", "backend": "gpu", "reader": "cpu2",
+                           "event": "keep"}])
 
     def test_it_says_nothing_when_it_kept_nothing(self):
         self.reader("new", 100000)

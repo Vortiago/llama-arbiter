@@ -338,33 +338,35 @@ test("a copy is as wide as its real share of the budget", () => {
             bases: { count: 0 }, deeps: { count: 0 },
             files: [
               { name: "a", kind: "copy", conv: "one", backend: "gpu0_0", slot: 0, bytes: 25 },
-              { name: "b", kind: "copy", conv: "two", backend: "(before the restart)", bytes: 50 },
+              { name: "b", kind: "copy", conv: "two", backend: "(before the restart)", bytes: 50, doomed: true },
             ] },
   };
   const { blocks, used, live, kept } = blocksOf(status, 900);
   assert.deepEqual(blocks.map((b) => b.share), [0.25, 0.5], "linear in bytes, because the budget counts bytes");
   assert.deepEqual(blocks.map((b) => b.state), ["live", "kept"]);
-  assert.deepEqual(blocks.map((b) => b.doomed), [false, false], "nothing is past the budget yet");
+  assert.deepEqual(blocks.map((b) => b.doomed), [false, true], "the server's mark, painted as given");
   assert.equal(used, 0.75);
   assert.deepEqual([live, kept], [1, 1]);
   assert.match(blocks[1].where, /before the restart/);
 });
 
-test("the strip is ordered the way the budget sweeps, and marks what goes next", () => {
+test("the strip paints the router's mark and does not guess", () => {
   // The sweep keeps the copies used most recently and drops the rest, so the
-  // one touched last sits left and the tail of the filled run goes next.
-  const f = (conv, bytes, used) => ({ name: conv, kind: "copy", conv, bytes, used, backend: "x" });
-  const status = { backends: [], disk: { copies: { count: 3, bytes: 3, budget: 100 },
+  // one touched last sits left and the tail of the filled run goes next. Which
+  // of them is doomed is the router's word: it knows which copy a save is
+  // reading and must keep.
+  const f = (conv, bytes, used, doomed) => ({ name: conv, kind: "copy", conv, bytes, used, doomed, backend: "x" });
+  const status = { backends: [], disk: { copies: { count: 3, bytes: 120, budget: 100 },
     bases: { count: 0 }, deeps: { count: 0 },
-    files: [f("stale", 40, 1), f("just now", 40, 30), f("earlier", 40, 20)] } };
+    files: [f("stale", 40, 1, true), f("just now", 40, 30, false), f("earlier", 40, 20, false)] } };
   const { blocks } = blocksOf(status, 900);
   assert.deepEqual(blocks.map((b) => b.conv), ["just now", "earlier", "stale"], "used most recently first");
   assert.deepEqual(blocks.map((b) => b.doomed), [false, false, true],
-    "40 + 40 fits in 100, the third does not, so the one nobody came back to goes");
-  const huge = { ...status, disk: { ...status.disk,
-    files: [f("only", 400, 30)] } };
-  assert.deepEqual(blocksOf(huge, 900).blocks.map((b) => b.doomed), [false],
-    "the copy just written is never swept however large - dropping what was just written is the bug that wrote one file 1,456 times");
+    "40 + 40 fits in 100, the third does not, and the router marked it");
+  const lone = { ...status, disk: { ...status.disk,
+    files: [f("only", 400, 30, true)] } };
+  assert.deepEqual(blocksOf(lone, 900).blocks.map((b) => b.doomed), [true],
+    "the page must not clear index 0 by its own rule: the server marked it");
 });
 
 test("a name only goes inside a block that can hold it", () => {

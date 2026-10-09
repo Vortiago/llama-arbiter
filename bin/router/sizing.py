@@ -111,12 +111,16 @@ def images_in(body):
 def request_cost(body, vision=None, tuning=None):
     """(tokens this request needs, pictures it carries, what they cost).
 
-    Base64 is hundreds of times longer than what the vision encoder charges.
-    One walk for all three: it parses megabytes and decodes every picture."""
+    `vision` is one geometry, or every geometry the fleet printed. A picture
+    is charged the dearest of them: any backend may serve it, so counting the
+    first mmproj underweighted a mixed fleet. Base64 is hundreds of times
+    longer than what the vision encoder charges. One walk for all three: it
+    parses megabytes and decodes every picture."""
+    geoms = [vision] if isinstance(vision, dict) else (vision or [VISION])
     text, charged, count = len(body), 0, 0
     for payload in images_in(body):
         text -= len(payload)
-        charged += image_tokens(payload, vision)
+        charged += max(image_tokens(payload, g) for g in geoms)
         count += 1
     tuning = tuning or Tuning()
     return (int(max(0, text) / tuning.chars_per_tok) + charged
