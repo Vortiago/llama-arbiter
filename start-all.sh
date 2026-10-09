@@ -32,6 +32,10 @@ PYEOF
 echo "dropping stale page cache..."
 drop_cache "$MODELS/*/*.gguf" "$MODELS2/*/*.gguf"
 
+if [[ ${PLACE_COPIES:-1} == 1 ]]; then
+  place_copies
+fi
+
 # One at a time, in table order. Each backend reads about 124 GiB to warm its
 # page cache. A second instance on the same socket needs no prime: it maps the
 # file the first one has already read.
@@ -39,6 +43,12 @@ while read -r name port script rest; do
   [[ -n $name ]] || continue
   # shellcheck disable=SC2086  # rest is a list of VAR=value words, by design
   start_backend "$name" "$port" "$script" $rest
+  # A backend that turns the prefill split on pays a one-time expert pin on its
+  # first split. Do it now, before the readers start and take the memory bus.
+  # Set WARM_MOE_SPLIT=0 to skip it and let the first prompt pay instead.
+  if [[ ${WARM_MOE_SPLIT:-1} == 1 && $rest =~ LLAMA_MOE_SPLIT=([1-9][0-9]*) ]]; then
+    warm_moe_split "$port"
+  fi
 done < <(backend_rows)
 
 echo "starting router..."

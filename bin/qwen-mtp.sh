@@ -24,13 +24,6 @@ ARGS=(
   --n-cpu-moe "${N_CPU_MOE:-48}"
                        # Attention and KV on the card, experts in RAM. VRAM is
                        # the limit, not RAM. Raise it for a smaller card.
-  --cpu-moe-draft      # The draft's experts too, as the model's are: 2.5 GiB
-                       # of VRAM. The ggml-org draft adds a 644 MiB output
-                       # head, and with its experts on the card the draft
-                       # context did not fit at ctx 150000. It costs 4 to 5%
-                       # of generate speed: 14.4/19.0/17.0 against
-                       # 15.1/19.8/17.8 tok/s at ctx 130000 on koishi, the
-                       # same acceptance, two alternating rounds.
   --backend-sampling   # Sample on the card: +2 to +5% generate at temperature
                        # 1.0 on koishi, the same acceptance. llama.cpp turns it
                        # off for a request with a grammar, and the grammar
@@ -42,5 +35,13 @@ ARGS=(
   --batch-size "${BATCH:-2048}"
   --ubatch-size "${UBATCH:-512}"
 )
+
+# The draft's experts on the card unless CPU_MOE_DRAFT=0. Keeping them on the
+# CPU frees 2.5 GiB of VRAM (with them on the card the draft context did not fit
+# at ctx 150000) and costs 4 to 5% of generate speed: 14.4/19.0/17.0 against
+# 15.1/19.8/17.8 tok/s at ctx 130000, the same acceptance.
+if [[ ${CPU_MOE_DRAFT:-1} == 1 ]]; then
+  ARGS+=(--cpu-moe-draft)
+fi
 
 launch

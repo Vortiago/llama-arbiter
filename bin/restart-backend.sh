@@ -24,7 +24,7 @@ env=($rest)
 
 # A setting in the environment wins over the table: `env` takes the last
 # assignment of a name. A sweep restarts one backend with one knob moved.
-for name_of in BATCH UBATCH TB SLOTS PRIME CACHE_RAM CPUSET CKPT_STEP CKPT_N PRIO; do
+for name_of in BATCH UBATCH TB SLOTS PRIME CACHE_RAM CPUSET CKPT_STEP CKPT_N PRIO N_CPU_MOE CPU_MOE_DRAFT; do
   [[ -n ${!name_of:-} ]] && env+=("$name_of=${!name_of}")
 done
 # THREADS_ENV, not THREADS: common.sh fills THREADS with the core count, which
@@ -60,6 +60,15 @@ if [[ -n ${pid:-} ]] && kill -0 "$pid" 2>/dev/null; then
   # Check `ours` again before SIGKILL. Linux reuses pids while llama-server is
   # still releasing 124 GiB.
   kill -0 "$pid" 2>/dev/null && ours "$pid" && kill -9 "$pid" 2>/dev/null
+fi
+
+# Put the model pages on the node that will read them. The gpu backend's
+# --preferred=0 puts a page it faults in the mirrored copy on node 0, so a full
+# start-all places each copy first (place_copies). Do the same for the copy this
+# backend reads. Set PLACE_COPIES=0 to skip.
+if [[ ${PLACE_COPIES:-1} == 1 ]]; then
+  read -ra place_nodes <<<"$(printf '%s\n' $rest | sed -n 's/^NODE=//p' | tail -1 | tr ',' ' ')"
+  place_copies "${place_nodes[@]}"
 fi
 
 echo "starting $name..."

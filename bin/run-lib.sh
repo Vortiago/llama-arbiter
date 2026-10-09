@@ -63,3 +63,66 @@ start_router() {
   echo $! > "$RUN/router.pid"
   wait_for "$ROUTER_PORT" router 60 /router/json
 }
+
+# warm_moe_split <port>: make a backend pin its expert memory now, not on the
+# first real turn.
+#
+# The prefill split (LLAMA_MOE_SPLIT) only engages once one prompt reads that
+# many tokens or more, so this reads a prompt longer than the threshold. The
+# first split of a fresh process registers the model's expert pages as pinned
+# (cudaHostRegister through GGML_CUDA_REGISTER_HOST), which for this model takes
+# about a minute; paying it here keeps it off the first turn a client sends.
+# The slot is erased afterwards, so the router finds a backend with an empty
+# slot. Best effort: if the call fails, the first prefill pins instead.
+warm_moe_split() { # warm_moe_split <port>
+  local port=$1 began=$SECONDS
+  local body='{"prompt":"The router keeps every conversation warm, so the card computes the experts that many tokens route to while the sockets read and compute the rest. This line is deliberately long enough that the prefill engages the expert split, because the split only begins once one prompt reads at least as many tokens as the threshold names. The first split of a fresh process registers the host memory of the model as pinned once, and that registration takes about a minute for a model of this size, so paying it here at startup keeps it off the first real turn that a client sends.","n_predict":1,"cache_prompt":false,"temperature":0}'
+  echo "warming the experts on :$port (one-time pin; this can take a minute)..."
+  if ! curl -sf --max-time 300 -H 'Content-Type: application/json' -d "$body" \
+       "http://127.0.0.1:$port/completion" >/dev/null; then
+    echo "  :$port did not answer the warmup; the first prompt will pin instead" >&2
+    return 0
+  fi
+  # Leave the slot as the router expects to find a freshly started backend.
+  curl -sf --max-time 30 -X POST "http://127.0.0.1:$port/slots/0?action=erase" >/dev/null 2>&1 || true
+  echo "    took $((SECONDS - began))s"
+}
+
+# place_copies [node ...]: read each model copy once, bound to its own node, so
+# the kernel faults its pages there.
+#
+# A page lives on the node that faults it first, and the kernel never moves it.
+# The gpu backend maps the other node's copy (LLAMA_NUMA_MIRROR) so its node-1
+# threads read locally, but it runs with --preferred=0: a page it faults in that
+# copy lands on node 0, not node 1. Reading the copy here first puts the pages
+# where they belong; the backends' own prime then finds them. With no node
+# argument every node with a copy is read. Set PLACE_COPIES=0 to skip.
+place_copies() { # place_copies [node ...]
+  command -v numactl >/dev/null || return 0
+  local -a nodes=("$@")
+  (( ${#nodes[@]} )) || nodes=(0 1)
+  local node dir f pid
+  local -a pids=()
+  for node in "${nodes[@]}"; do
+    [[ -d /sys/devices/system/node/node$node ]] || continue
+    dir=$MODELS; [[ $node == 1 ]] && dir=$MODELS2
+    [[ -d $dir ]] || continue
+    [[ $node == 1 && $MODELS2 == $MODELS ]] && continue
+    local -a keep=()
+    shopt -s nullglob
+    for f in "$dir"/*/*.gguf; do
+      # shellcheck disable=SC2053  # PRIME_SKIP is a pattern, by design
+      [[ $f == ${PRIME_SKIP:-'*00003-of-00006.gguf'} ]] || keep+=("$f")
+    done
+    shopt -u nullglob
+    (( ${#keep[@]} )) || continue
+    echo "placing $dir on node $node (${#keep[@]} files)..."
+    # One reader per node, in parallel. The copies live in separate memory
+    # banks, so the placement is the same; they may share the disk, in which
+    # case the gain is only what a single reader leaves on the table.
+    numactl --cpunodebind="$node" --membind="$node" -- \
+      cat -- "${keep[@]}" >/dev/null &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+}
