@@ -1099,9 +1099,14 @@ class ClientConfig(unittest.TestCase):
         mid-prefill."""
         env = self.claude()["env"]
         floor_ms = 150000 // 15 * 1000
-        for name in ("API_TIMEOUT_MS", "CLAUDE_STREAM_IDLE_TIMEOUT_MS",
-                     "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"):
+        for name in ("API_TIMEOUT_MS", "CLAUDE_STREAM_IDLE_TIMEOUT_MS"):
             self.assertGreaterEqual(int(env[name]), floor_ms, name)
+
+    def test_claude_states_the_byte_watchdog_it_keeps(self):
+        """Claude Code clamps the byte watchdog to 10 s to 30 min, so a larger
+        value only claims a patience the client does not have."""
+        env = router.client_config("claude", "h:1", "m", 400000)["env"]
+        self.assertEqual(env["CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"], "1800000")
 
     def test_claude_turns_off_the_five_minute_idle_timeout(self):
         self.assertEqual(self.claude()["env"]["API_FORCE_IDLE_TIMEOUT"], "0")

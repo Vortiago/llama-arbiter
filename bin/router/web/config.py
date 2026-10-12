@@ -5,6 +5,9 @@ import os, re, socket
 # Client configs the dashboard offers, built for the address the reader used.
 CONFIG_FILES = {"opencode": "opencode.json", "claude": "settings.json"}
 
+# Claude Code clamps CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS to 10 s to 30 min.
+BYTE_WATCHDOG_MAX_MS = 1800000
+
 
 def default_provider(env=None):
     """Names the machine in an OpenCode config. PROVIDER overrides the
@@ -88,9 +91,11 @@ def client_config(kind, host, model, n_ctx, provider=None):
                 "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
                 "ANTHROPIC_SMALL_FAST_MODEL": model,
                 "API_TIMEOUT_MS": str(patience_ms),
-                # Both watchdogs give up after five minutes of quiet.
+                # Both watchdogs give up after five minutes of quiet. Claude
+                # Code clamps the byte watchdog to 30 min (2.1.296), so a cold
+                # read longer than that ends the request.
                 "CLAUDE_STREAM_IDLE_TIMEOUT_MS": str(patience_ms),
-                "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": str(patience_ms),
+                "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": str(BYTE_WATCHDOG_MAX_MS),
                 "API_FORCE_IDLE_TIMEOUT": "0",
                 # Nothing here needs the internet.
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
