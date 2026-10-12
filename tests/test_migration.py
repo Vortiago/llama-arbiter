@@ -1295,6 +1295,33 @@ class ClaudeGatewaySettings(unittest.TestCase):
         this model would never appear on its own."""
         self.assertEqual(self.env()["ANTHROPIC_CUSTOM_MODEL_OPTION"], "qwen-test")
 
+    def test_names_the_model_in_every_tier(self):
+        """A tier left unset names a Claude model this backend does not have."""
+        for tier in ("OPUS", "SONNET", "HAIKU", "FABLE"):
+            self.assertEqual(self.env()[f"ANTHROPIC_DEFAULT_{tier}_MODEL"], "qwen-test", tier)
+
+    def test_compacts_while_the_reply_still_fits(self):
+        """Compacting at the full window leaves no room for the reply, and
+        llama-server then shifts the context with no error."""
+        window = int(self.env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+        self.assertLessEqual(window + 32768, 150000)
+
+    def test_the_compact_window_follows_the_backend(self):
+        small = router.client_config("claude", "h:1", "m", 96000)["env"]
+        self.assertLess(int(small["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]), 96000)
+
+    def test_does_not_assume_a_1m_window(self):
+        self.assertEqual(self.env()["CLAUDE_CODE_DISABLE_1M_CONTEXT"], "1")
+
+    def test_sends_no_side_requests(self):
+        """Each side request takes a slot from the task the user is waiting for."""
+        env = self.env()
+        self.assertEqual(env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"], "0")
+        self.assertEqual(env["CLAUDE_CODE_ENABLE_AWAY_SUMMARY"], "0")
+
+    def test_runs_at_most_two_tools_at_a_time(self):
+        self.assertEqual(self.env()["CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY"], "2")
+
 
 class PromptKey(unittest.TestCase):
     """OpenCode names its session in the body, the way Claude Code names its
