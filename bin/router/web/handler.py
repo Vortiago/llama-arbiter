@@ -5,7 +5,8 @@ from pathlib import Path
 from ..identity import client_kind, session_key, short_key
 from ..pool.turn import Ask
 from ..protocol.body import request_shape
-from ..protocol.splice import AnthropicSplice, OaiUsageSplice, wants_usage, with_usage
+from ..protocol.splice import (AnthropicSplice, OaiUsageSplice, read_oai,
+                               wants_usage, with_usage)
 from ..protocol.sse import _say, anthropic, ping_for, sse_event, wants_ping
 from ..protocol.systemone import SYSTEMONE, Refused, systemone_body, systemone_plan
 from ..transport import said_in
@@ -348,6 +349,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.sending = threading.Lock()        # one writer at a time
         self.streaming = False
         self.stop_ping = None
+        self.timings = None
+        self.system_fingerprint = None
         self.went = "closed its end"
         self.kind = client_kind(self.headers)
 
@@ -397,6 +400,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     sending = None                             # set per request in _route
     streaming = False                          # a stream has already begun
     stop_ping = None                           # how to stop the keep-alive
+    timings = None                             # the reply's own timings, if any
+    system_fingerprint = None                  # what the backend says it is
     kind = None                                # which client program asked
     went = "closed its end"                    # why the client stopped waiting
 
@@ -603,6 +608,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             splice = (AnthropicSplice()
                       if opened and streamed and anthropic(path) else None)
 
+            # A non-streamed openai reply carries its usage and timings in the
+            # body, where a streamed one carries them in the last chunk. Keep
+            # the body only where it is small and known: an inference reply.
+            capture = (not opened and path in INFERENCE and not anthropic(path)
+                       and (upstream.headers.get("Content-Type")
+                            or "").startswith("application/json"))
+            captured = bytearray() if capture else None
+
             try:
                 while True:
                     try:
@@ -623,6 +636,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         chunk = oai_tee.feed(chunk)
                         if not chunk:
                             continue           # the chunk the router asked for
+                    if captured is not None:
+                        captured += chunk
                     with sending:
                         put(chunk)
                 left = (splice.tail() if splice
@@ -630,6 +645,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if left:
                     with sending:
                         put(left)
+                if oai_tee:
+                    # The reply's own per-request numbers, for the turn record.
+                    self.timings = oai_tee.timings or None
+                    self.system_fingerprint = oai_tee.system_fingerprint
+                if captured is not None:
+                    usage, timings, fingerprint = read_oai(bytes(captured))
+                    self.timings = timings or self.timings
+                    self.system_fingerprint = fingerprint or self.system_fingerprint
                 if splice and splice.reported:
                     names = {"input_tokens": "input", "output_tokens": "output",
                              "cache_read_input_tokens": "cache_read",

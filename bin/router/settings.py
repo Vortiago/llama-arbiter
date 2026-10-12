@@ -111,6 +111,8 @@ class Tuning:
 
     # -- telemetry
     cache_log: bool = True            # one JSON line per cache decision
+    sample_every: int = 30            # polls between `sample` events: one
+                                      # about every 60 s at poll=2.0
 
     @classmethod
     def from_env(cls, env=None):

@@ -246,14 +246,28 @@ class Machine:
         except (OSError, ValueError):
             self.gpu_ok, self.gpu = False, None
 
-    def gauges(self):
-        """The series the history keeps: one number per key, or None."""
+    def gauges(self, backends=None):
+        """The series the history keeps: one number per key, or None.
+        `short` is page cache a node is missing for the backends that live on
+        it: `resident_bytes` less what FilePages already holds. It needs the
+        backends, so a caller without them gets None there."""
+        need = {}
+        for be in backends or ():
+            node = be.get("node")
+            need[node] = max(need.get(node, 0), resident_bytes(be))
         out = {}
         for node in self.nodes:
             key, mem = f"node{node['id']}", self.mem.get(node["id"]) or {}
+            cache = mem.get("cache")
             out[f"{key}.cpu"] = self.cpu.get(node["id"])
-            out[f"{key}.cache"] = mem.get("cache")
+            out[f"{key}.cache"] = cache
             out[f"{key}.free"] = mem.get("free")
+            # A node the pager has not filled for its model yet. Without this
+            # the dashboard showed a node "free" while its first read was
+            # minutes of disk.
+            out[f"{key}.short"] = (max(0, need[node["id"]] - cache)
+                                   if node["id"] in need and cache is not None
+                                   else None)
         gpu = self.gpu if self.gpu_ok else None
         out["gpu.util"] = gpu["util"] if gpu else None
         out["gpu.vram"] = gpu["vram_used"] if gpu else None

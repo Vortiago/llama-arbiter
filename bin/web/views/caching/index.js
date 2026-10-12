@@ -45,8 +45,10 @@ function buildRam(status) {
     pick(row, "name").textContent = be.name;
     pick(row, "fill").style.width = `${Math.min(100, (100 * (c.used_mib || 0)) / c.limit_mib).toFixed(1)}%`;
     const prompts = c.prompts || 0;
+    const checkpoints = c.checkpoints || 0;
     pick(row, "held").textContent =
-      `${num(Math.round(c.used_mib || 0))} of ${num(c.limit_mib)} MiB, ${prompts} conversation${prompts === 1 ? "" : "s"}`;
+      `${num(Math.round(c.used_mib || 0))} of ${num(c.limit_mib)} MiB, ${prompts} conversation${prompts === 1 ? "" : "s"}`
+      + (checkpoints ? `, ${num(checkpoints)} checkpoint${checkpoints === 1 ? "" : "s"} restored` : "");
     const lost = [];
     if (c.evictions) lost.push(`${c.evictions} evicted, ${num(Math.round(c.evicted_mib || 0))} MiB`);
     if (c.skipped) lost.push(`${c.skipped} too big to cache`);

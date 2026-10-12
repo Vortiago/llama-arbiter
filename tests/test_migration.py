@@ -3501,9 +3501,18 @@ class WhoIsWaiting(unittest.TestCase):
         self.assertEqual(self.pool.status()["waiting_detail"][0]["waiting_on"], "big")
 
     def test_status_says_what_each_backend_may_do(self):
+        """The raw setting, not "generates anything": a list names the paths
+        a backend may serve, and a cpu that answers only /v1/systemone must
+        not read as one that answers every path."""
+        pool = make_pool(
+            [{"name": "gpu", "url": "http://gpu", "pref": 0,
+              "prefill": False, "generate": True},
+             {"name": "cpu", "url": "http://cpu", "pref": 1,
+              "generate": [router.SYSTEMONE]}], watch=False)
         can = {b["name"]: (b["prefill"], b["generate"])
-               for b in self.pool.status()["backends"]}
-        self.assertEqual(can, {"gpu": (False, True), "cpu": (True, True)})
+               for b in pool.status()["backends"]}
+        self.assertEqual(can, {"gpu": (False, True),
+                               "cpu": (True, [router.SYSTEMONE])})
 
 
 class TheBackendTableIsCheckedAtStartup(unittest.TestCase):
@@ -3516,14 +3525,15 @@ class TheBackendTableIsCheckedAtStartup(unittest.TestCase):
     This used to run in a subprocess, because the check was work done at
     import and there was no other way to reach it. It is a function now."""
 
-    def loading(self, table):
+    def loading(self, table, **env):
         """Read this table the way the router does. Returns (code, output)."""
         room = Path(tempfile.mkdtemp(prefix="router-table-"))
         self.addCleanup(shutil.rmtree, room, ignore_errors=True)
         path = room / "backends.json"
         path.write_text(json.dumps(table))
         try:
-            router.read_backend_table({"ROUTER_BACKENDS": str(path)})
+            router.read_backend_table(
+                {"ROUTER_BACKENDS": str(path), **env})
         except SystemExit as stop:
             return 1, str(stop)
         return 0, ""
@@ -3564,6 +3574,39 @@ class TheBackendTableIsCheckedAtStartup(unittest.TestCase):
         code, said = self.loading([self.row("pre", generate=False)])
         self.assertNotEqual(code, 0)
         self.assertIn("can generate", said)
+
+    def test_an_empty_generate_list_is_refused(self):
+        code, said = self.loading([self.row("solo", generate=[])])
+        self.assertNotEqual(code, 0)
+        self.assertIn("can generate", said)
+
+    def test_a_path_some_backend_reads_and_none_generates_is_refused(self):
+        """A `generate` list passes only when some backend answers every path
+        some backend reads. Here both read every path; /v1/messages is
+        answered by neither."""
+        code, said = self.loading(
+            [self.row("gpu", generate=[router.SYSTEMONE]),
+             self.row("cpu", pref=1, generate=["/v1/chat/completions"])])
+        self.assertNotEqual(code, 0)
+        self.assertIn("generates every path", said)
+
+    def test_the_handoff_off_refuses_a_generate_list(self):
+        """With no handoff a turn answers where it read, so every backend
+        must generate every path, not just name a few."""
+        code, said = self.loading(
+            [self.row("gpu", prefill=False),
+             self.row("cpu", pref=1, generate=[router.SYSTEMONE])],
+            HANDOFF="0")
+        self.assertNotEqual(code, 0)
+        self.assertIn("handoff is off", said)
+
+    def test_a_generate_list_passes_with_the_handoff_on(self):
+        """The same table loads when a turn may move to the one generator
+        that answers every path."""
+        code, said = self.loading(
+            [self.row("gpu", prefill=False),
+             self.row("cpu", pref=1, generate=[router.SYSTEMONE])])
+        self.assertEqual(code, 0, said)
 
     def test_an_old_table_is_told_what_the_fields_became(self):
         """`reads` was one flag where there are now two, and a plain missing
@@ -3677,6 +3720,204 @@ class RecentRequests(unittest.TestCase):
         self.assertEqual(rows[0]["conv"], f"conv{SANDBOX.tuning.recent_requests + 4:04d}"[:8])
         self.assertEqual(rows[0]["started"], "cold")
         self.assertEqual(rows[0]["took"], 12.3)
+
+    def test_the_decomposed_fields_ride_on_the_dashboard_row(self):
+        """The request event's numbers are the same ones the dashboard lists,
+        so a reader can open the log and match a row to it."""
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}], watch=False)
+        pool.note_request("c1", pool.backends[0], "/v1/chat/completions",
+                          5.0, 1.0, "cold", 100, serving="gpu", slot=2, node=1,
+                          build="b1", ctx=500, pre_ms=3.0, gen_ms=4.0, gen_n=7,
+                          tg=1750.0, draft_n=10, accept=60.0, recall_s=0.5,
+                          handoff_s=1.5, readers_on_node=1, waited_on="prefill",
+                          fingerprint="fp")
+        row = pool.status()["recent_requests"][0]
+        self.assertEqual(row["serving"], "gpu")
+        self.assertEqual((row["gen_n"], row["gen_ms"], row["tg"]), (7, 4.0, 1750.0))
+        self.assertEqual((row["draft_n"], row["accept"]), (10, 60.0))
+        self.assertEqual(row["waited_on"], "prefill")
+        self.assertEqual(row["fingerprint"], "fp")
+
+
+class TheSampleEventKeepsTheLongSeries(unittest.TestCase):
+    """The History drops everything past ten minutes. The sample event is the
+    long series: gauges, counter deltas, cache totals, disk and the
+    slot-seconds since the last one."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="router-sample-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.log = router.EventLog(directory=self.dir, on=True)
+
+    def samples(self):
+        self.log.flush()
+        rows = [json.loads(line)
+                for path in Path(self.dir).glob("cache-events-*.jsonl")
+                for line in path.read_text().splitlines()]
+        return [r for r in rows if r["event"] == "sample"]
+
+    def test_one_event_every_sample_every_polls(self):
+        tuning = replace(SANDBOX.tuning, sample_every=3)
+        pool = make_pool([backend("cpu", 0)], events=self.log, tuning=tuning,
+                         watch=False)
+        be = pool.backends[0]
+        be.update(up=True, counters={"tokens_predicted_total": 100.0},
+                  slots_detail=[{"phase": "generating", "tg_rate": 10.0}],
+                  cache={"evictions": 2, "checkpoints": 5})
+        for i in range(3):
+            be["counters"]["tokens_predicted_total"] += 5
+            pool._sample(100.0 + i)
+        got = self.samples()
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["counters"]["cpu"]["tokens_predicted_total"], 10.0)
+        self.assertEqual(got[0]["cache"]["cpu"]["checkpoints"], 5)
+        self.assertEqual(got[0]["slot_seconds"]["cpu"]["gen"], 2.0)
+        self.assertIn("machine", got[0])
+        self.assertIn("disk", got[0])
+
+    def test_nothing_before_the_cadence(self):
+        tuning = replace(SANDBOX.tuning, sample_every=30)
+        pool = make_pool([backend("cpu", 0)], events=self.log, tuning=tuning,
+                         watch=False)
+        pool.backends[0].update(up=True)
+        for i in range(5):
+            pool._sample(100.0 + i)
+        self.assertEqual(self.samples(), [])
+
+    def test_a_counter_that_went_backwards_is_a_restart_taken_as_it_stands(self):
+        """A backend restart zeroes its counters. The delta is the new value,
+        the same rule since_reset uses, not a negative or a skipped poll."""
+        tuning = replace(SANDBOX.tuning, sample_every=3)
+        pool = make_pool([backend("cpu", 0)], events=self.log, tuning=tuning,
+                         watch=False)
+        be = pool.backends[0]
+        be.update(up=True, counters={"tokens_predicted_total": 100.0})
+        pool._sample(100.0)
+        be["counters"]["tokens_predicted_total"] = 200.0
+        pool._sample(101.0)
+        be["counters"]["tokens_predicted_total"] = 5.0     # it restarted
+        pool._sample(102.0)
+        got = self.samples()
+        self.assertEqual(got[-1]["counters"]["cpu"]["tokens_predicted_total"],
+                         105.0)                            # 100 + 5
+
+    def test_a_phase_boundary_is_charged_the_same_way_as_history(self):
+        """History charges an interval to the phase the earlier poll saw. The
+        sample must agree, or the two series part at every boundary: a slot
+        that read for the interval then generated would be charged the wrong
+        way in one of them."""
+        pool = make_pool([backend("cpu", 0)], events=self.log, watch=False)
+        be = pool.backends[0]
+        be.update(up=True, slots_detail=[{"phase": "reading", "tg_rate": None}])
+        pool._sample(100.0)
+        pool.history.push(pool.backends, 100.0)
+        be["slots_detail"] = [{"phase": "generating", "tg_rate": 10.0}]
+        pool._sample(105.0)
+        pool.history.push(pool.backends, 105.0)
+        charge = pool.sample_charge["cpu"]
+        hist = pool.history.rows["cpu"]["cur"]
+        self.assertEqual((charge["read"], charge["gen"]), (5.0, 0.0))
+        self.assertEqual((hist["read"], hist["gen"]), (5.0, 0.0))
+
+
+class TheUpTransitionNamesTheBuild(unittest.TestCase):
+    """A backend that comes up writes one `up` event with the code and
+    settings it started with, read from its log. A crash gives the down
+    transition its reason."""
+
+    HEAD = ("0.00.028 I cmn common_param: build 11465 (971a0d3d1) with GNU 14\n"
+            "0.00.146 I cmn common_param: system_info: n_threads = 18 / 72\n"
+            "0.04.100 I llama_context: n_batch               = 2048\n")
+
+    def setUp(self):
+        self.where = tempfile.mkdtemp(prefix="router-up-")
+        self.addCleanup(shutil.rmtree, self.where, ignore_errors=True)
+        self.logdir = tempfile.mkdtemp(prefix="router-upev-")
+        self.addCleanup(shutil.rmtree, self.logdir, ignore_errors=True)
+        self.store = router.Store(self.where)
+        self.store.run.mkdir(parents=True, exist_ok=True)
+        self.log = router.EventLog(directory=self.logdir, on=True)
+
+    def rows(self):
+        self.log.flush()
+        return [json.loads(line)
+                for path in Path(self.logdir).glob("cache-events-*.jsonl")
+                for line in path.read_text().splitlines()]
+
+    def test_the_build_and_settings_ride_on_the_up_event(self):
+        self.store.log("cpu").write_text(self.HEAD)
+        pool = make_pool([backend("cpu", 0)], store=self.store,
+                         events=self.log, watch=False)
+        be = pool.backends[0]
+        be.update(n_ctx=150000, node=1)
+        pool._note_up(be)
+        up = [r for r in self.rows() if r["event"] == "up"][0]
+        self.assertEqual(up["backend"], "cpu")
+        self.assertEqual(up["build"], "11465 (971a0d3d1)")
+        self.assertEqual(up["ctx"], 150000)
+        self.assertEqual(up["node"], 1)
+        self.assertEqual(up["config"]["n_batch"], 2048)
+
+    def test_a_down_backend_keeps_the_last_error_from_its_log(self):
+        pool = make_pool([dict(backend("cpu", 0), url="http://cpu")],
+                         store=self.store, events=self.log, watch=False)
+        be = pool.backends[0]
+        be["cache"] = {"last_error": "CUDA error: out of memory"}
+        pool._note_down(be)
+        self.assertEqual(be["down_reason"], "CUDA error: out of memory")
+        row = next(r for r in pool.status()["backends"] if r["name"] == "cpu")
+        self.assertEqual(row["down_reason"], "CUDA error: out of memory")
+
+    def test_going_down_writes_one_event_with_the_reason_and_the_start(self):
+        pool = make_pool([dict(backend("cpu", 0), url="http://cpu")],
+                         store=self.store, events=self.log, watch=False)
+        be = pool.backends[0]
+        be.update(node=1, cache={"last_error": "CUDA error: out of memory"})
+        pool._note_down(be)
+        down = [r for r in self.rows() if r["event"] == "down"][0]
+        self.assertEqual(down["backend"], "cpu")
+        self.assertEqual(down["node"], 1)
+        self.assertEqual(down["reason"], "CUDA error: out of memory")
+        self.assertIsInstance(down["since"], float)
+        self.assertEqual(be["down_since"], down["since"])
+
+    def test_a_later_error_during_the_outage_replaces_the_reason(self):
+        pool = make_pool([dict(backend("cpu", 0), url="http://cpu")],
+                         store=self.store, events=self.log, watch=False)
+        be = pool.backends[0]
+        be["cache"] = {"last_error": "CUDA error: out of memory"}
+        pool._note_down(be)
+        be["cache"] = {"last_error": "failed to allocate a buffer"}
+        pool._note_down_reason(be)
+        self.assertEqual(be["down_reason"], "failed to allocate a buffer")
+        self.assertEqual([r for r in self.rows() if r["event"] == "down"][0]
+                         ["reason"], "CUDA error: out of memory")
+
+
+class TheCheckpointLineIsCountedNotLogged(unittest.TestCase):
+    """One checkpoint is printed per restored slot: 71,644 backend events
+    over nine days. Its count rides on the cache totals instead."""
+
+    def test_a_poll_counts_it_and_writes_no_backend_event(self):
+        where = tempfile.mkdtemp(prefix="router-cache-")
+        self.addCleanup(shutil.rmtree, where, ignore_errors=True)
+        logdir = tempfile.mkdtemp(prefix="router-cacheev-")
+        self.addCleanup(shutil.rmtree, logdir, ignore_errors=True)
+        store = router.Store(where)
+        store.run.mkdir(parents=True, exist_ok=True)
+        store.log("cpu").write_text(
+            "restored context checkpoint (pos_min = 9, pos_max = 9, "
+            "n_tokens = 10, n_past = 10, size = 1.0 MiB)\n")
+        events = router.EventLog(directory=logdir, on=True)
+        pool = make_pool([backend("cpu", 0)], store=store, events=events,
+                         watch=False)
+        pool._read_cache(pool.backends[0])
+        events.flush()
+        self.assertEqual(pool.backends[0]["cache"]["checkpoints"], 1)
+        rows = [json.loads(line)
+                for path in Path(logdir).glob("cache-events-*.jsonl")
+                for line in path.read_text().splitlines()]
+        self.assertEqual([r for r in rows if r.get("kind") == "checkpoint"], [])
 
 
 class ACopyIsNoUseWhenTheOpeningChanges(unittest.TestCase):
@@ -3858,6 +4099,19 @@ class TheOldestPinThatCanGoIsEvicted(unittest.TestCase):
         self.pool._take(self.cpu, "fresh", tokens=10)
         self.assertIn("reading", self.pool.pins, "a turn mid-read lost its pin")
         self.assertNotIn("newer", self.pool.pins)
+
+    def test_a_waiting_turns_record_is_not_evicted(self):
+        """A turn waiting for a generator parks its read and holds no slot,
+        but it keeps its claim until it finishes. Its parked copy is the whole
+        reply it is waiting to carry, so the record must outlive the wait:
+        evicting it would delete the copy and the carry would fail after it."""
+        self.pool.pins["waiting"] = pin("cpu", slot=None, parked="waiting.park")
+        self.pool.claim_turn("waiting", "t1")
+        self.pool.pins["idle"] = pin("cpu", slot=0)
+        self.pool._take(self.cpu, "fresh", tokens=10)
+        self.assertIn("waiting", self.pool.pins,
+                      "a waiting turn's parked copy was evicted")
+        self.assertNotIn("idle", self.pool.pins)
 
     def test_eviction_gives_up_when_nothing_may_go(self):
         self.pool.pins["reading"] = pin("cpu", slot=0, inflight=True)
@@ -4140,9 +4394,11 @@ class AnInstanceThatDoesNotGenerate(unittest.TestCase):
 
     def test_it_waits_rather_than_generate_where_it_is_set_not_to(self):
         """The old fallback was "answering slowly beats not answering", which
-        took the prefiller back. Where an operator said no, the turn waits: it
-        is parked on disk, so waiting there costs nothing but time."""
+        took the prefiller back. Where an operator said no, the turn waits:
+        the read is parked on disk and the slot given back, so waiting costs
+        nothing but time and the prefiller reads the next prompt meanwhile."""
         self.pool.pins["a"] = pin("pre", slot=0)
+        self.pre["busy"] = 1               # it holds the read to start with
         self.gen.update(up=False)          # no generator to carry it to
         gave_up = []
         # `alive` is what ends the wait, so answer False on the second ask.
@@ -4150,19 +4406,26 @@ class AnInstanceThatDoesNotGenerate(unittest.TestCase):
             asked.append(1)
             gave_up.append(len(asked))
             return len(asked) < 2
-        with self.assertRaises(router.Gone,
-                               msg="it generated on an instance set not to"):
+        # The read is parked before the second ask, so the ending is the None
+        # that says the source is already released - not the Gone of a turn
+        # that still holds its reader.
+        self.assertIsNone(
             with_link(self.pool, FakeLink(written=200_000_000)).hand_off(
-                "a", self.pre, 1000, alive=alive)
+                "a", self.pre, 1000, alive=alive),
+            "it generated on an instance set not to")
         self.assertTrue(gave_up, "it never waited at all")
+        self.assertEqual(self.pre["busy"], 0, "the reader was left holding")
+        self.assertEqual(self.pool.pins["a"]["parked"], "a.park",
+                         "the read was not kept while it waited")
 
-    def test_it_generates_in_place_only_when_the_carry_never_happened(self):
+    def test_it_refuses_rather_than_generate_where_it_is_set_not_to(self):
         """Nothing was carried, so there is no copy for a generator to take
-        and no prompt left to save. Breaking the preference beats throwing away
-        a prompt that took tens of minutes - and it says so in the log."""
+        and no prompt left to save. The prompt is still not worth answering on
+        an instance the operator said only reads: the turn fails, the caller's
+        ending releases the slot, and the log says why."""
         self.pool.pins["a"] = pin("pre", slot=None)     # nothing to carry
-        got = with_link(self.pool, FakeLink()).hand_off("a", self.pre, 1000)
-        self.assertIs(got, self.pre)
+        with self.assertRaises(router.Rejected):
+            with_link(self.pool, FakeLink()).hand_off("a", self.pre, 1000)
 
 
 class ParkAfterGenerating(unittest.TestCase):
@@ -4431,6 +4694,24 @@ class MachineLoad(unittest.TestCase):
             self.assertIsNone(report["gpu"])
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+    def test_the_page_cache_a_node_is_short_of_its_model(self):
+        """`nodeN.short` is the page cache the node still needs for its
+        backends: what they map less lazy, less what FilePages already
+        holds. A node the pager has not filled for its model is minutes of
+        disk on its first read."""
+        machine = router.Machine(nodes=[{"id": 0, "cpus": {0},
+                                         "path": Path("/nonexistent")}],
+                                 gpu_cmd=("/nonexistent/nvidia-smi",))
+        machine.mem = {0: {"cache": 3 * 1024 * 1024}}
+        be = {"name": "cpu0", "node": 0,
+              "cache": {"mapped_mib": 10.0, "lazy_mib": 2.0}}   # 8 MiB
+        self.assertEqual(machine.gauges([be])["node0.short"], 5 * 1024 * 1024)
+        machine.mem = {0: {}}
+        self.assertIsNone(machine.gauges([be])["node0.short"],
+                          "nothing known about the node's file pages")
+        self.assertIsNone(machine.gauges([])["node0.short"],
+                          "no backend on the node means no shortfall to show")
 
     def test_load_shares_the_history_buckets(self):
         h = router.History(keep=5, step=10.0)
@@ -5649,6 +5930,13 @@ class WhatEachBackendWasStartedWith(unittest.TestCase):
         """A restart appends to the same file, so later runs must not win."""
         lines = self.HEAD.splitlines() + ["I llama_context: n_batch = 512"]
         self.assertEqual(router.read_config(lines)["n_batch"], 2048)
+
+    def test_it_reads_the_build_and_the_system_info(self):
+        lines = ["I cmn common_param: build 11465 (971a0d3d1) with GNU 14",
+                 "I cmn common_param: system_info: n_threads = 18 / 72"]
+        seen = router.read_config(lines)
+        self.assertEqual(seen["build"], "11465 (971a0d3d1)")
+        self.assertEqual(seen["system_info"], "n_threads = 18 / 72")
 
     def test_it_reads_again_when_the_log_is_a_new_file(self):
         """restart-backend.sh moves the log aside; the backend makes its own.

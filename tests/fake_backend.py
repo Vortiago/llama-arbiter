@@ -89,6 +89,36 @@ def anthropic_stream(model, cached, read):
     ]
 
 
+def oai_stream(model, cached, read, include_usage):
+    """One turn as the openai protocol streams it.
+
+    A chunk per token, then, when the client asked (the router always asks
+    on the client's behalf), a final chunk with no choices carrying the
+    usage, the reply's `timings` and the fingerprint. The fingerprint rides
+    every chunk, as llama.cpp emits it."""
+    base = {"id": f"chatcmpl-{model}", "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model,
+            "system_fingerprint": "fp-fake"}
+    chunks = [
+        dict(base, choices=[{"index": 0, "finish_reason": None,
+                             "delta": {"role": "assistant", "content": ""}}]),
+        dict(base, choices=[{"index": 0, "finish_reason": None,
+                             "delta": {"content": "ok"}}]),
+        dict(base, choices=[{"index": 0, "finish_reason": "stop",
+                             "delta": {}}]),
+    ]
+    if include_usage:
+        chunks.append(dict(
+            base, choices=[],
+            usage={"prompt_tokens": cached + read, "completion_tokens": 1,
+                   "total_tokens": cached + read + 1,
+                   "prompt_tokens_details": {"cached_tokens": cached}},
+            timings={"prompt_n": read, "cache_n": cached,
+                     "predicted_n": 1, "predicted_ms": 100.0,
+                     "predicted_per_second": 10.0}))
+    return chunks
+
+
 def closes(message):
     """True when a template can end a prompt after this message.
 
@@ -534,6 +564,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                                 "at": time.time()})
         if path == "/v1/messages" and self._body(raw).get("stream"):
             return self._messages_stream(be, self._body(raw))
+        if path in ("/v1/chat/completions", "/chat/completions") \
+                and self._body(raw).get("stream"):
+            return self._chat_stream(be, self._body(raw))
         try:
             code, payload, kind = self._answer(be, path, query, raw)
         except Cancelled:
@@ -721,6 +754,47 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 frame = f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(frame), frame))
                 self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True   # the router hung up, as it does when
+                                           # its own client did
+
+    def _chat_stream(self, be, body):
+        """The openai endpoint, streamed.
+
+        The router asks for the usage chunk on the client's behalf when the
+        client did not, reads the timings and the fingerprint out of it, and
+        strips the chunk back out before the client sees it."""
+        slot = be.take_slot(body.get("id_slot"))
+        if slot is None:
+            payload = json.dumps({"error": {"message": "no slot"}}).encode()
+            self.send_response(503)
+            self.send_header("Content-Type", JSON)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            return self.wfile.write(payload)
+        prompt = render(body.get("messages") or [])
+        cached, read = be.run_turn(slot, prompt, want_tokens(body),
+                                   self._client_gone)
+        with be.lock:
+            be.chats.append({"slot": slot.id, "cached": cached, "read": read,
+                             "key": body.get("prompt_cache_key"),
+                             "named": body.get("id_slot") is not None,
+                             "probe": is_probe(body)})
+        include = bool((body.get("stream_options") or {}).get("include_usage"))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            for chunk in oai_stream(be.model, cached, read, include):
+                frame = b"data: " + json.dumps(chunk).encode() + b"\n\n"
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(frame), frame))
+                self.wfile.flush()
+            done = b"data: [DONE]\n\n"
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(done), done))
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

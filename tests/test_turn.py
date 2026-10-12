@@ -677,5 +677,364 @@ class AClaimIsNeverLeftBehind(unittest.TestCase):
                          "the board still shows a turn that is gone")
 
 
+class ARequestEventCarriesTheNumbers(unittest.TestCase):
+    """One decomposed line per turn: the reply's timings and the router's own
+    stages. The event log is what an offline report is built from, so every
+    field has a reader there."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="router-events-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.log = router.EventLog(directory=self.dir, on=True)
+
+    def turn(self, **on_client):
+        read = {"timings": {"prompt_n": 12, "cache_n": 4, "prompt_ms": 100.0,
+                            "predicted_n": 0}}
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0,
+                           "node": 1}], events=self.log, link=TurnLink(reading=read))
+        pool.backends[0].update(up=True, n_ctx=150000)
+        client = FakeClient()
+        for name, value in on_client.items():
+            setattr(client, name, value)
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"), client)
+        self.log.flush()
+        rows = []
+        for path in Path(self.dir).glob("cache-events-*.jsonl"):
+            rows += [json.loads(line) for line in path.read_text().splitlines()]
+        return [r for r in rows if r["event"] == "request"][-1]
+
+    def test_the_two_timings_are_decomposed(self):
+        row = self.turn(timings={"prompt_n": 2, "cache_n": 8,
+                                 "predicted_n": 40, "predicted_ms": 2000.0,
+                                 "predicted_per_second": 20.0,
+                                 "draft_n": 50, "draft_n_accepted": 25})
+        self.assertEqual(row["gen_n"], 40)
+        self.assertEqual(row["gen_ms"], 2000.0)
+        self.assertEqual(row["tg"], 20.0)
+        self.assertEqual(row["accept"], 50.0)      # 25 accepted of 50 drafts
+        self.assertEqual(row["pre_ms"], 100.0)     # the read pass wrote the prompt
+        self.assertEqual(row["ctx"], 56)           # 4 cached + 12 read + 40 written
+
+    def test_the_router_side_fields_are_named(self):
+        row = self.turn(timings={"predicted_n": 1},
+                        system_fingerprint="fp-1")
+        self.assertEqual(row["serving"], "cpu")       # the generator
+        self.assertEqual(row["backend"], "cpu")       # the reader
+        self.assertEqual(row["slot"], 0)
+        self.assertEqual(row["node"], 1)              # the reader's node
+        self.assertEqual(row["serving_node"], 1)      # the generator's node
+        self.assertEqual(row["fingerprint"], "fp-1")
+        # It never waited: the one slot was free when acquire asked, so no
+        # reason is recorded. Classified after the take, every served request
+        # with a conversation read "pinned".
+        self.assertIsNone(row.get("waited_on"))
+        self.assertEqual(row["readers_on_node"], 0)
+        self.assertEqual(row["recall_s"], 0.0)
+
+
+class TheWaitReasonIsSnapshotted(unittest.TestCase):
+    """A turn that had no slot says why, and one served at once says nothing.
+
+    The reason is taken while the turn is still in the queue. `_take` points
+    the record at the backend that just took the request, so classified after
+    acquire every served conversation reads `pinned` and `turn`/`big` are
+    unreachable."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="router-wait-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.log = router.EventLog(directory=self.dir, on=True)
+
+    def row(self):
+        self.log.flush()
+        rows = []
+        for path in Path(self.dir).glob("cache-events-*.jsonl"):
+            rows += [json.loads(line) for line in path.read_text().splitlines()]
+        return [r for r in rows if r["event"] == "request"][-1]
+
+    def test_a_turn_served_at_once_records_no_reason(self):
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                         events=self.log)
+        pool.backends[0].update(up=True, n_ctx=150000)
+
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient())
+
+        self.assertNotIn("waited_on", self.row())
+
+    def test_a_turn_that_waits_for_its_pin_records_pinned(self):
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                         events=self.log)
+        be = pool.backends[0]
+        be.update(up=True, n_ctx=150000, slots=1,
+                  slots_detail=[{"id": 0, "busy": True}], busy=1)
+        pool.pins["c1"] = parked_copy()          # c1 is pinned to cpu
+        client = FakeClient()
+
+        turn = threading.Thread(
+            target=pool.turn,
+            args=(router.Ask("/v1/chat/completions", prompt(10), "c1"), client),
+            daemon=True)
+        turn.start()
+        self.addCleanup(turn.join, 10)
+        self.assertTrue(client.asked.wait(10), "the turn never waited")
+
+        with pool.cv:                            # the pinned slot frees
+            be["busy"] = 0
+            be["slots_detail"] = [{"id": 0, "busy": False}]
+            pool.cv.notify_all()
+        turn.join(10)
+
+        self.assertEqual(client.relayed, [("cpu", "c1")])
+        self.assertEqual(self.row()["waited_on"], "pinned")
+
+    def test_a_turn_behind_another_of_its_conversation_records_turn(self):
+        pool = make_pool([{"name": "cpu", "url": "http://cpu", "pref": 0}],
+                         events=self.log)
+        pool.backends[0].update(up=True, n_ctx=150000)
+        ahead = pool.begin_wait("c1", 10)
+        pool.claim_turn("c1", ahead)             # the turn ahead holds it
+        pool.end_wait(ahead)
+        client = FakeClient()
+
+        turn = threading.Thread(
+            target=pool.turn,
+            args=(router.Ask("/v1/chat/completions", prompt(10), "c1"), client),
+            daemon=True)
+        turn.start()
+        self.addCleanup(turn.join, 10)
+        # claim_turn asks alive() once per pass of its wait.
+        self.assertTrue(client.asked.wait(10), "the turn never queued")
+
+        pool.finish_turn("c1", ahead)            # the turn ahead ends
+        turn.join(10)
+
+        self.assertEqual(client.relayed, [("cpu", "c1")])
+        self.assertEqual(self.row()["waited_on"], "turn")
+
+    def test_a_carried_turns_reason_is_the_wait_before_the_handoff(self):
+        """It waits for its pin on the reader, then hand_off carries it to
+        the generator. The reason reported is the wait before the carry."""
+        pool = make_pool([
+            {"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": False},
+            {"name": "cpu", "url": "http://cpu", "pref": 1}],
+            events=self.log)
+        gpu, cpu = pool.backends
+        gpu.update(up=True, n_ctx=150000)
+        cpu.update(up=True, n_ctx=150000, slots=1,
+                   slots_detail=[{"id": 0, "busy": True}], busy=1)
+        pool.pins["c1"] = parked_copy()          # c1 is pinned to cpu
+        client = FakeClient()
+
+        turn = threading.Thread(
+            target=pool.turn,
+            args=(router.Ask("/v1/chat/completions", prompt(10), "c1"), client),
+            daemon=True)
+        turn.start()
+        self.addCleanup(turn.join, 10)
+        self.assertTrue(client.asked.wait(10), "the turn never waited")
+
+        with pool.cv:                            # the reader's slot frees
+            cpu["busy"] = 0
+            cpu["slots_detail"] = [{"id": 0, "busy": False}]
+            pool.cv.notify_all()
+        turn.join(10)
+
+        row = self.row()
+        self.assertEqual(row["backend"], "cpu")  # the reader
+        self.assertEqual(row["serving"], "gpu")  # the generator it moved to
+        self.assertEqual(row["waited_on"], "pinned")
+
+
+class ANonDictTimingsObjectIsTolerated(unittest.TestCase):
+    """A malformed upstream can send `timings` as a list. The turn decomposes
+    it in its finally, so a non-dict there must not raise and lose the
+    request record."""
+
+    def test_timing_fields_drops_a_non_dict(self):
+        got = router.timing_fields(["not", "an", "object"], "nope")
+        self.assertIsNone(got["ctx"])
+        self.assertIsNone(got["gen_n"])
+        self.assertIsNone(got["pre_ms"])
+
+    def test_a_reply_with_non_dict_timings_still_writes_the_record(self):
+        pool = one_backend()
+        client = FakeClient()
+        client.timings = ["not", "an", "object"]
+
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"), client)
+
+        self.assertEqual(len(pool.recent_requests), 1)
+
+    def test_a_read_pass_with_non_dict_timings_still_serves(self):
+        pool = one_backend(link=TurnLink(reading={"timings": ["oops"]}))
+        client = FakeClient()
+
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"), client)
+
+        self.assertEqual(client.relayed, [("cpu", "c1")])
+        self.assertEqual(len(pool.recent_requests), 1)
+
+
+class ACpuGeneratesOnlyTypedTurns(unittest.TestCase):
+    """`generate` may name the paths a backend generates for.
+
+    A cpu that reads every prompt but answers only /v1/systemone must not
+    answer a chat turn read on it. A chat turn waits for a generator instead;
+    with none, the handoff waits and the client's leaving ends it. A typed
+    question still writes one token where it was read."""
+
+    def duo(self, draining=False):
+        pool = make_pool([
+            {"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": False},
+            {"name": "cpu", "url": "http://cpu", "pref": 1,
+             "generate": [router.SYSTEMONE]}])
+        gpu, cpu = pool.backends
+        gpu.update(up=True, n_ctx=150000, draining=draining)
+        cpu.update(up=True, n_ctx=150000)
+        return pool, gpu, cpu
+
+    def test_generates_honors_a_list(self):
+        be = {"generate": [router.SYSTEMONE]}
+        self.assertTrue(router.generates(be, router.SYSTEMONE))
+        self.assertFalse(router.generates(be, "/v1/chat/completions"))
+        self.assertTrue(router.generates(be))         # it generates something
+        self.assertTrue(router.generates({"generate": True},
+                                         "/v1/chat/completions"))
+        self.assertFalse(router.generates({"generate": False},
+                                          "/v1/chat/completions"))
+
+    def test_a_chat_turn_is_never_sent_to_the_cpu_to_generate(self):
+        pool, gpu, cpu = self.duo()
+        self.assertIs(pool.generator(10, cpu, "/v1/chat/completions"), gpu)
+
+    def test_a_draining_gpu_leaves_no_generator_at_all(self):
+        pool, gpu, cpu = self.duo(draining=True)
+        self.assertIsNone(pool.generator(10, cpu, "/v1/chat/completions"))
+
+    def test_a_chat_handoff_waits_rather_than_stay_on_the_cpu(self):
+        pool, gpu, cpu = self.duo(draining=True)
+
+        def alive():
+            return False                  # the client gives up at once
+
+        with self.assertRaises(router.Gone):
+            pool.hand_off("c1", cpu, 10, path="/v1/chat/completions",
+                          alive=alive)
+
+    def test_a_chat_handoff_that_loses_its_generator_answers_nowhere(self):
+        """The gpu is up when the carry starts, so the read is parked and the
+        turn waits in `_wait_to_generate`. The generator goes away and then
+        the client does. The turn must end with nothing to answer - not fall
+        back to the cpu, which generates no chat path at all."""
+        pool, gpu, cpu = self.duo()
+        pool.pins["c1"] = parked_copy()
+        pool.pins["c1"].update(backend="cpu", slot=0)
+        cpu["busy"] = 1
+        gpu["busy"] = 1                     # its one slot is taken
+        asked = []
+
+        def alive():
+            asked.append(None)
+            if len(asked) == 1:
+                gpu["up"] = False           # the generator goes away
+            return len(asked) < 3           # and then the client gives up
+
+        self.assertIsNone(pool.hand_off("c1", cpu, 10,
+                                        path="/v1/chat/completions",
+                                        alive=alive))
+        self.assertEqual(pool.generate_waits["gpu"], 0,
+                         "the wait outlived the handoff")
+        self.assertEqual(cpu["busy"], 0, "the cpu was left holding a slot")
+
+    def test_a_first_loop_wait_is_counted_and_keeps_its_generator_free(self):
+        """With no generator up at all, the cpu parks the read it took and
+        gives the slot back, then waits for one to appear. That wait is
+        counted against the generator it is headed for, so a read is kept off
+        it: the wait shields its future generator, and the dashboard says
+        so."""
+        pool, gpu, cpu = self.duo()
+        pool.pins["c1"] = parked_copy()
+        pool.pins["c1"].update(backend="cpu", slot=0)
+        cpu["busy"] = 1
+        gpu["up"] = False                    # no generator up at all
+        done = []
+
+        def wait():
+            try:
+                pool.hand_off("c1", cpu, 10, path="/v1/chat/completions",
+                              alive=lambda: not done)
+            except router.Gone:
+                pass
+
+        hand = threading.Thread(target=wait, daemon=True)
+        hand.start()
+        for _ in range(200):
+            if pool.status()["waiting_to_generate"] == 1:
+                break
+            time.sleep(0.01)
+        self.assertEqual(pool.status()["waiting_to_generate"], 1,
+                         "the wait was never counted")
+        with pool.cv:
+            owed = pool._owed(gpu, "new", 10, "/v1/chat/completions")
+        self.assertTrue(owed, "a read would land on the generator it waits for")
+        done.append(True)
+        with pool.cv:
+            pool.cv.notify_all()
+        hand.join(10)
+        self.assertEqual(pool.generate_waits["gpu"], 0,
+                         "the count outlived the wait")
+
+    def test_a_typed_turn_answers_where_it_was_read(self):
+        pool, gpu, cpu = self.duo(draining=True)
+        self.assertIs(pool.hand_off("c1", cpu, 10, migrate=False,
+                                    path=router.SYSTEMONE), cpu)
+
+    def test_a_wait_for_a_generator_gives_the_read_slot_back(self):
+        """No generator up: a chat turn parks its read and gives the cpu slot
+        back, so a typed turn that needs no gpu reads and answers on the same
+        cpu while the chat waits. When one appears the chat is carried there,
+        and the copy it parked is what travels - it is not read again."""
+        pool, gpu, cpu = self.duo(draining=True)
+        pool.pins["c1"] = parked_copy(name=None)      # not parked yet
+        pool.pins["c1"].update(backend="cpu", slot=0, using=0, inflight=True)
+        cpu["busy"] = 1
+        got = []
+
+        def wait():
+            try:
+                got.append(pool.hand_off("c1", cpu, 10, path="/v1/chat/completions",
+                                         alive=lambda: not got))
+            except router.Gone:
+                got.append(None)
+
+        hand = threading.Thread(target=wait, daemon=True)
+        hand.start()
+        for _ in range(300):
+            if pool.pins["c1"].get("parked") and cpu["busy"] == 0:
+                break
+            time.sleep(0.01)
+        self.assertEqual(cpu["busy"], 0, "the cpu slot was not given back")
+        self.assertFalse(pool.pins["c1"]["inflight"],
+                         "the pin still claims its read slot")
+        self.assertIsNotNone(pool.pick_slot(cpu, "asker"),
+                             "the freed cpu slot was not handed out")
+        typed = pool.acquire("asker", 10, path=router.SYSTEMONE)
+        self.assertTrue(typed, "a typed turn could not read on the cpu")
+        self.assertIs(typed[0], cpu, "the typed turn did not take the cpu")
+
+        gpu.update(up=True, draining=False)           # the generator appears
+        with pool.cv:
+            pool.cv.notify_all()
+        hand.join(10)
+        self.assertFalse(hand.is_alive(), "the handoff never finished")
+        self.assertTrue(got and got[0] is gpu, "the chat did not reach the gpu")
+        self.assertEqual(pool.pins["c1"]["backend"], "gpu")
+        self.assertIn(("restore", "gpu", "c1.park"), pool.link.calls,
+                      "the parked read was not restored onto the gpu")
+        self.assertEqual(pool.generate_waits["gpu"], 0,
+                         "the wait outlived the handoff")
+
+
 if __name__ == "__main__":
     unittest.main()

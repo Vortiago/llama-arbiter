@@ -37,7 +37,7 @@ def read_backend_table(env=None):
                     if "reads" in be else "")
             raise SystemExit(f"[router] backend {be.get('name', be)} has no "
                              f"{', '.join(sorted(short))}{hint}")
-        if not (be["prefill"] or be["generate"]):
+        if not (prefills(be) or generates(be)):
             raise SystemExit(f"[router] backend {be['name']} neither prefills "
                              f"nor generates, so nothing can be sent to it")
     for job in ("prefill", "generate"):
@@ -47,11 +47,17 @@ def read_backend_table(env=None):
     if not any(be["prefill"] is True for be in table):
         raise SystemExit(f"[router] no backend in {whence} reads every path, "
                          f"so some request could not be served")
+    # Every path is read somewhere, so every path needs a generator: a path
+    # read on a backend set not to answer it would otherwise wait for a
+    # generator that is not there, or answer on the reader.
+    if not any(be["generate"] is True for be in table):
+        raise SystemExit(f"[router] no backend in {whence} generates every "
+                         f"path, so some request could not be served")
     # A turn leaves its reader only through the handoff.
-    if not handoff_on(env) and not all(be["generate"] for be in table):
+    if not handoff_on(env) and not all(be["generate"] is True for be in table):
         raise SystemExit("[router] the handoff is off, which keeps every turn "
                          "on the backend that read it, so every backend has "
-                         "to generate")
+                         "to generate every path")
     return table, whence
 
 
@@ -66,9 +72,15 @@ def prefills(be, path=None):
     return bool(said)
 
 
-def generates(be):
-    """May a reply be generated on this backend."""
-    return be.get("generate", True)
+def generates(be, path=None):
+    """May a reply for this path be generated on this backend.
+
+    `generate` is true, false, or the paths the backend generates for. No
+    path asks whether it generates anything at all."""
+    said = be.get("generate", True)
+    if isinstance(said, list):
+        return bool(said) if path is None else path in said
+    return bool(said)
 
 
 PLACE_RE = re.compile(r"(\d+)_(\d+)$")

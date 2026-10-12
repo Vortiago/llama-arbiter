@@ -182,9 +182,10 @@ class EndToEnd(unittest.TestCase):
         return {"name": name, "url": backend.url, "pref": pref,
                 "prefill": prefill, "generate": generate}
 
-    def pool(self, specs, watch=True):
+    def pool(self, specs, watch=True, events=None):
         """Build a Pool and wait until it has seen every backend."""
-        made = make_pool(specs, watch=watch)
+        kw = {} if events is None else {"events": events}
+        made = make_pool(specs, watch=watch, **kw)
         self.pools.append(made)
         if watch:
             self.assertTrue(
@@ -799,6 +800,68 @@ class MissingBackendLog(EndToEnd):
         self.assertEqual(self.backend(pool, "cpu")["up"], True)
 
 
+class TheReplyTimingsReachTheTurnRecord(EndToEnd):
+    """A non-streamed openai reply carries its timings in the body, where a
+    streamed one carries them in the last chunk. The handler reads them and
+    the turn writes them, decomposed, into the one request event."""
+
+    def test_the_request_event_carries_the_replys_timings(self):
+        where = tempfile.mkdtemp(prefix="router-events-")
+        self.addCleanup(shutil.rmtree, where, ignore_errors=True)
+        events = router.EventLog(directory=where, on=True)
+        pool = self.pool([self.stub("cpu", 1)], events=events)
+        url = self.serve(pool)
+        self.turn(url, "timed")
+        # The client has the last byte, but the turn's thread still runs its
+        # finally, which notes the request and then writes the event. Wait for
+        # the note, which precedes the write.
+        self.assertTrue(wait_for(lambda: pool.recent_requests),
+                        "the turn never finished")
+        events.flush()
+        rows = [json.loads(line)
+                for path in Path(where).glob("cache-events-*.jsonl")
+                for line in path.read_text().splitlines()]
+        request = [r for r in rows if r["event"] == "request"][-1]
+        self.assertEqual(request["gen_n"], 1)        # the stub wrote one token
+        self.assertEqual(request["serving"], "cpu")
+        self.assertEqual(request["backend"], "cpu")
+        self.assertIsNotNone(request["ctx"])
+
+
+class TheStreamedReplyTimingsReachTheTurnRecord(EndToEnd):
+    """A streamed openai reply carries its usage, timings and fingerprint in
+    the final chunk. The router asks for that chunk on the client's behalf,
+    reads the numbers and removes it; the turn writes them into its one
+    request event."""
+
+    def test_the_request_event_carries_the_streamed_timings_and_fingerprint(self):
+        where = tempfile.mkdtemp(prefix="router-events-")
+        self.addCleanup(shutil.rmtree, where, ignore_errors=True)
+        events = router.EventLog(directory=where, on=True)
+        pool = self.pool([self.stub("cpu", 1)], events=events)
+        url = self.serve(pool)
+        request = urllib.request.Request(
+            url + "/v1/chat/completions",
+            data=json.dumps({"model": "fake-model", "stream": True,
+                             "prompt_cache_key": "streamy",
+                             "messages": [{"role": "user", "content": "hi"}]
+                             }).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=30) as reply:
+            reply.read()                      # read the stream to its end
+        self.assertTrue(wait_for(lambda: pool.recent_requests),
+                        "the turn never finished")
+        events.flush()
+        rows = [json.loads(line)
+                for path in Path(where).glob("cache-events-*.jsonl")
+                for line in path.read_text().splitlines()]
+        request = [r for r in rows if r["event"] == "request"][-1]
+        self.assertEqual(request["gen_n"], 1)        # the upstream's predicted_n
+        self.assertEqual(request["gen_ms"], 100.0)
+        self.assertEqual(request["fingerprint"], "fp-fake")
+        self.assertEqual(request["backend"], request["serving"])
+
+
 class TheHandoff(EndToEnd):
     """One client request, two calls to the backends.
 
@@ -844,6 +907,17 @@ class TheHandoff(EndToEnd):
         paths = [row["path"] + row["query"] for row in self.gpu.requests]
         self.assertLess(paths.index("/slots/0?action=restore"),
                         paths.index("/v1/chat/completions"))
+
+    def test_the_request_record_names_the_reader_and_the_generators_slot(self):
+        """A carried turn must not be filed under the reader with the
+        generator's build. `backend` is the reader, `serving` the generator,
+        and the slot is the one the generator answered in."""
+        self.assertTrue(wait_for(lambda: self.duo.recent_requests))
+        row = self.duo.recent_requests[0]
+        self.assertEqual(row["backend"], "cpu")     # the reader
+        self.assertEqual(row["serving"], "gpu")     # the generator
+        self.assertEqual(row["slot"], 0)            # from pin_slot, on the gpu
+        self.assertEqual(self.duo.pins["talker"]["slot"], 0)
 
 
 class ASubagentIsACaller_Too(EndToEnd):
@@ -923,6 +997,136 @@ class TheGeneratorIsBusy(EndToEnd):
         self.assertEqual([c["key"] for c in self.cpu.answers], [],
                          "the cpu generated after all")
         self.assertEqual(pool.pins["second"]["backend"], "gpu")
+
+
+class ANonTypedTurnNeverGeneratesOnACpu(EndToEnd):
+    """A cpu may read a chat prompt, but it may not answer one.
+
+    Both cpus here generate `/v1/systemone` and only that. While the gpu is
+    draining, a chat turn read on a cpu has to wait for the gpu rather than
+    spend a slot on a slow reply: the operator chose to wait while the gpu
+    restarts. A typed question still writes one token where it reads, because
+    carrying the state to write it costs a park and a recall."""
+
+    def setUp(self):
+        super().setUp()
+        self.duo = self.pool([
+            self.stub("gpu", 0, prefill=False),
+            self.stub("cpu", 1, generate=[router.SYSTEMONE])])
+        self.url = self.serve(self.duo)
+
+    def typed_call(self, conv="asker"):
+        """One typed question through the router. Returns the parsed reply."""
+        body = {"model": "fake-model", "prompt_cache_key": conv,
+                "state": "cpu1_0 read 150000 tokens",
+                "questions": {"ok": {"instructions": "Healthy?"}}}
+        request = urllib.request.Request(
+            self.url + router.SYSTEMONE, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=30) as reply:
+            return json.load(reply)
+
+    def test_a_chat_turn_waits_for_the_draining_gpu(self):
+        pool = self.duo
+        pool.drain("gpu", deadline=PATIENCE)
+        self.assertTrue(self.backend(pool, "gpu")["draining"])
+
+        box = self.start_turn(self.url, "waiter")
+        self.assertTrue(
+            wait_for(lambda: "waiter" in [c["key"] for c in self.cpu.probes]),
+            "the prompt was never read on the cpu")
+        # Read, and now waiting. A cpu answer is the thing being ruled out,
+        # so give it every chance to appear before saying it did not.
+        self.assertFalse(
+            wait_for(lambda: [c["key"] for c in self.cpu.answers] == ["waiter"],
+                     patience=2.0),
+            "it answered on the cpu instead of waiting for the gpu")
+
+        pool.resume("gpu")            # the gpu comes back, the turn is carried
+        self.assertTrue(wait_for(lambda: "reply" in box or "error" in box,
+                                 patience=30), f"it never finished: {box}")
+        self.assertNotIn("error", box, f"{box.get('error')}")
+        self.assertEqual([c["key"] for c in self.cpu.answers], [],
+                         "the cpu generated the answer")
+        self.assertIn("waiter", [c["key"] for c in self.gpu.answers],
+                      "it did not generate on the gpu once it was back")
+        self.assertEqual(pool.pins["waiter"]["backend"], "gpu")
+
+    def test_a_waiting_chat_gives_the_cpu_back_to_a_typed_turn(self):
+        """While the gpu is draining a chat read on a cpu parks and releases
+        its slot, so a second turn that needs no gpu - a typed question - reads
+        and answers on that same cpu. The chat still never answers on a cpu,
+        and on resume its parked read is restored onto the gpu and reused."""
+        pool = self.duo
+        pool.drain("gpu", deadline=PATIENCE)
+
+        box = self.start_turn(self.url, "waiter")
+        self.assertTrue(
+            wait_for(lambda: "waiter" in [c["key"] for c in self.cpu.probes]),
+            "the prompt was never read on the cpu")
+
+        # The cpu is free again: the typed turn reads and answers on it.
+        said = self.typed_call()
+        self.assertEqual(said["router"]["backend"], "cpu")
+        self.assertEqual([c["key"] for c in self.cpu.answers], ["asker"])
+        self.assertNotIn("waiter", [c["key"] for c in self.cpu.answers],
+                         "the chat answered on the cpu while it waited")
+
+        pool.resume("gpu")            # the gpu comes back, the turn is carried
+        self.assertTrue(wait_for(lambda: "reply" in box or "error" in box,
+                                 patience=30), f"it never finished: {box}")
+        self.assertNotIn("error", box, f"{box.get('error')}")
+        self.assertEqual([c["key"] for c in self.cpu.answers], ["asker"],
+                         "the cpu generated the chat answer")
+        self.assertIn("waiter", [c["key"] for c in self.gpu.answers],
+                      "it did not generate on the gpu once it was back")
+        self.assertEqual(pool.pins["waiter"]["backend"], "gpu")
+        # The copy parked on the way over is what the gpu generates from, so
+        # it did not read the prompt again.
+        self.assertEqual(self.gpu.restores, ["waiter.park"],
+                         "the parked read was not restored onto the gpu")
+        self.assertEqual(self.gpu.answers[-1]["read"], 0,
+                         "the gpu read the prompt again instead of reusing "
+                         "the parked read")
+
+    def test_a_conversation_less_chat_does_not_answer_on_the_cpu(self):
+        """A chat body with no conversation to name never gets a pin, so
+        `_take` records no slot and there is nothing to carry. The healthy
+        gpu is still the only place a chat reply may come from, so the turn
+        fails rather than answering on the cpu."""
+        request = urllib.request.Request(
+            self.url + "/v1/chat/completions",
+            data=json.dumps({"model": "fake-model", "messages": []}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=30).read()
+        self.assertEqual(raised.exception.code, 502)
+        self.assertEqual([c["key"] for c in self.cpu.answers], [],
+                         "the cpu answered a conversation-less chat turn")
+        self.assertEqual(self.gpu.answers, [],
+                         "the gpu answered without a cache")
+
+    def test_a_refused_carry_does_not_answer_chat_on_the_cpu(self):
+        """The save the carry needs is refused, so none of the read reaches
+        the gpu. The cpu must not answer the chat turn instead."""
+        self.cpu.fail_save = True
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.turn(self.url, "refused")
+        self.assertEqual(raised.exception.code, 502)
+        self.assertEqual([c["key"] for c in self.cpu.answers], [],
+                         "the cpu answered a chat turn")
+        self.assertEqual(self.gpu.answers, [],
+                         "the gpu answered without a cache")
+
+    def test_a_typed_turn_still_answers_on_the_cpu(self):
+        pool = self.duo
+        pool.drain("gpu", deadline=PATIENCE)
+        self.assertTrue(self.backend(pool, "gpu")["draining"])
+
+        said = self.typed_call()
+        self.assertEqual(said["router"]["backend"], "cpu")
+        self.assertEqual([c["key"] for c in self.cpu.answers], ["asker"])
+        self.assertEqual(self.gpu.chats, [], "the gpu served the typed turn")
 
 
 class TheNextTurnComesBack(EndToEnd):

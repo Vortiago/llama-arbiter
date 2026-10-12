@@ -165,5 +165,48 @@ class WhatIsLeftToReadIsWhatTheDashboardCountsDown(unittest.TestCase):
         self.assertEqual(detail[0]["decoded"], 4)
 
 
+class TheDraftPositionsSayHowLongDraftsRun(unittest.TestCase):
+    """One labelled counter: accepted draft tokens by position. Position i
+    counts the steps that accepted at least i+1, so the counts fall off and
+    their shape is how long a draft runs."""
+
+    METRICS = """\
+llamacpp:spec_decode_num_draft_tokens_total 1000
+llamacpp:spec_decode_num_accepted_tokens_total 400
+llamacpp:spec_decode_num_drafts_total 250
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="0"} 300
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="1"} 80
+llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position="2"} 20
+"""
+
+    def test_the_labelled_series_is_read_by_name(self):
+        self.assertEqual(router.accepted_positions(self.METRICS),
+                         {0: 300.0, 1: 80.0, 2: 20.0})
+
+    def test_the_bare_counters_still_skip_it(self):
+        self.assertNotIn("spec_decode_num_accepted_tokens_per_pos_total",
+                         router.counters(self.METRICS))
+
+    def test_the_mean_accepted_length_and_the_position_shares(self):
+        got = router.stats(router.counters(self.METRICS),
+                           router.accepted_positions(self.METRICS))
+        self.assertEqual(got["accept_mean"], 1.6)      # 400 accepted / 250 steps
+        self.assertEqual(got["accept_shares"], [75.0, 20.0, 5.0])
+
+    def test_the_mean_survives_a_reset_of_the_since_reset_counters(self):
+        """/router/reset-rates zeroes the since-reset steps while the labelled
+        positions stay lifetime. The mean must divide lifetime accepted by
+        LIFETIME drafts, or it reads 400/1 after a reset instead of 400/250."""
+        value = router.counters(self.METRICS)
+        reset = dict(value, spec_decode_num_drafts_total=1)   # one step since
+        got = router.stats(reset, router.accepted_positions(self.METRICS),
+                           value)
+        self.assertEqual(got["accept_mean"], 1.6)
+
+    def test_no_positions_no_shape(self):
+        got = router.stats(router.counters("prompt_tokens_total 5\n"))
+        self.assertEqual((got["accept_mean"], got["accept_shares"]), (0, []))
+
+
 if __name__ == "__main__":
     unittest.main()

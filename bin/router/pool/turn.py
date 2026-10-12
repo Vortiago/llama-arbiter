@@ -60,6 +60,30 @@ def how_started(warm, recalled, loaded):
     return "cold"
 
 
+def timing_fields(read, reply):
+    """What a turn's two timing objects say, decomposed for the request
+    event. `read` is the read pass's, `reply` the streamed answer's. `ctx` is
+    the slot after generation: cached, read and written, or None when neither
+    object carried a number. Either may be missing, or not an object at all
+    if an upstream sent something else, so a non-dict is dropped."""
+    read = read if isinstance(read, dict) else {}
+    reply = reply if isinstance(reply, dict) else {}
+    cache_n, prompt_n = read.get("cache_n"), read.get("prompt_n")
+    predicted, drafted = reply.get("predicted_n"), reply.get("draft_n")
+    accepted = reply.get("draft_n_accepted")
+    parts = [v for v in (cache_n, prompt_n, predicted) if v is not None]
+    return {
+        "ctx": sum(parts) if parts else None,
+        "pre_ms": read.get("prompt_ms"),
+        "gen_ms": reply.get("predicted_ms"),
+        "gen_n": predicted,
+        "tg": reply.get("predicted_per_second"),
+        "draft_n": drafted,
+        "accept": (round(100.0 * accepted / drafted, 1)
+                   if drafted and accepted is not None else None),
+    }
+
+
 def name_conversation(ask):
     """Which conversation this turn belongs to, and how the router knew it.
 
@@ -163,9 +187,11 @@ class Turn:
 
         ticket = pool.begin_wait(conv, tokens, images, image_charge)
         mine = False
+        waited_on = None
         try:
             mine = pool.claim_turn(conv, ticket, client.alive, work)
-            got = pool.acquire(conv, tokens, client.alive, ask.path) if mine else None
+            got = pool.acquire(conv, tokens, client.alive, ask.path,
+                               ticket) if mine else None
         except BaseException:
             # The same ending as the branch below, for a way out nobody
             # planned. finish_turn matches on the ticket, so it is a no-op
@@ -179,7 +205,9 @@ class Turn:
             client.settle()
             raise
         finally:
-            pool.end_wait(ticket)
+            # The reason acquire stopped waiting, kept before the waiter is
+            # dropped.
+            waited_on = pool.end_wait(ticket)
         waited = time.time() - start
         if not got:
             # Only if this turn held it: Flow is keyed by conversation,
@@ -191,9 +219,11 @@ class Turn:
             return client.fail(503, "no backend can serve this request")
         be, slot = got
         serving = be
+        answered = False                       # a body reached a generator
         left = False                           # the client gave up mid-read
         read_stats = {}
         recalled = loaded = warm = False
+        recall_s = handoff_s = readers = None
         # Held from here. Every way out runs the same ending: claim_turn
         # has no deadline, so a claim left behind stops the conversation.
         try:
@@ -207,7 +237,9 @@ class Turn:
             if pool.forget_stale_park(conv, cuts):
                 pool.events.write("start_over", conv=short, reason="stale_copy",
                                   client=client.kind, path=ask.path)
+            started_recall = time.time()
             recalled = pool.recall(conv, be, slot)
+            recall_s = time.time() - started_recall
             loaded = (not recalled
                       and pool.warm_prefix(conv, cuts, messages, system, tools,
                                            be, slot, ask.path,
@@ -222,19 +254,31 @@ class Turn:
                 answer = pool.link.work(be, up_path,
                                         dict(asked, id_slot=slot),
                                         client.alive, pool.tuning.read_timeout)
-                timing = (answer or {}).get("timings") or {}
+                timing = (answer or {}).get("timings")
+                if not isinstance(timing, dict):
+                    timing = {}          # a malformed read reply still records
                 read_stats = {"read_prompt_n": timing.get("prompt_n"),
-                              "read_cache_n": timing.get("cache_n")}
+                              "read_cache_n": timing.get("cache_n"),
+                              # The whole object, so the request record can
+                              # decompose it with the reply's.
+                              "read_timings": timing}
                 pool.note_slot(conv, slot)
+                started_handoff = time.time()
                 serving = pool.hand_off(conv, be, tokens,
                                         alive=client.alive,
-                                        migrate=not ask.plan)
+                                        migrate=not ask.plan,
+                                        path=ask.path)
+                handoff_s = time.time() - started_handoff
                 if serving is None:
                     raise Gone("after its prompt was parked")
             if serving is be:
                 # Nothing was carried. hand_off already noted a carried turn.
                 pool.note_stage(conv, "generate", be["name"], slot, work)
+            # Counted where the reply will be generated: a read landing there
+            # while it runs is what makes the first tokens late.
+            readers = pool.readers_on_node(serving.get("node"))
             client.settle()
+            answered = True
             if ask.plan:
                 self.say_answers(ask.plan, serving,
                                  slot if serving is be else None,
@@ -271,16 +315,43 @@ class Turn:
             pool.note_stage(conv, "done")
             if not parking:
                 pool.finish_turn(conv, ticket)
+            # One decomposed record of what this turn took. `backend` above is
+            # the reader and `serving` the generator. Each carries its own
+            # build and node: `build`/`node` describe the reader, so a carried
+            # turn is not filed under the reader with the generator's build.
+            settled = serving or be
+            record = timing_fields(read_stats.get("read_timings"),
+                                   getattr(client, "timings", None))
+            record.update(
+                serving=settled["name"],
+                slot=(slot if serving is be else pool.pin_slot(conv)),
+                node=be.get("node"),
+                build=pool.read_settings(be).get("build"),
+                serving_node=settled.get("node"),
+                serving_build=pool.read_settings(settled).get("build"),
+                fingerprint=getattr(client, "system_fingerprint", None),
+                recall_s=round(recall_s, 2) if recall_s is not None else None,
+                handoff_s=round(handoff_s, 2) if handoff_s is not None else None,
+                readers_on_node=readers,
+                waited_on=waited_on)
+            read = {"read_prompt_n": read_stats.get("read_prompt_n"),
+                    "read_cache_n": read_stats.get("read_cache_n")}
             pool.note_request(conv, be, ask.path, took, waited, started,
                               prompt_tokens, images=images,
-                              image_tokens_=image_charge, **read_stats)
+                              image_tokens_=image_charge, **read, **record)
             pool.events.write("request", conv=short, source=conv_source,
                               client=client.kind, path=ask.path,
                               est_tokens=tokens, n_cuts=len(cuts),
                               backend=be["name"], started=started,
                               took=round(took, 3), waited=round(waited, 3),
-                              left=left or None, **read_stats)
+                              left=left or None, **read, **record)
             # Only POST reaches a turn: the handler refuses every other method
-            # on an inference path.
-            print(f"[router] POST {ask.path} -> {be['name']} "
-                  f"{took:.1f}s", flush=True)
+            # on an inference path. The reader may not be the generator: a cpu
+            # reads a chat prompt and the gpu says the words. Naming both keeps
+            # an operator from reading the reader's name as where it answered.
+            if answered:
+                print(f"[router] POST {ask.path} read on {be['name']}, "
+                      f"generates on {settled['name']} {took:.1f}s", flush=True)
+            else:
+                print(f"[router] POST {ask.path} read on {be['name']}, "
+                      f"no reply {took:.1f}s", flush=True)

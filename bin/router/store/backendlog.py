@@ -44,6 +44,24 @@ CONFIG_RE = re.compile(r"(n_ctx|n_batch|n_ubatch|kv_unified|n_slots)\s*=\s*"
 CONFIG_KEYS = ("n_ctx", "n_batch", "n_ubatch", "kv_unified", "n_slots")
 
 
+# Printed once, at startup, under common_params_print_info. The version is
+# the one thing that says two instances are running different code.
+BUILD_RE = re.compile(r"\bbuild (\d+ \([\w]+\))")
+
+# The same line's neighbour, and the whole of what the box is.
+SYSTEM_RE = re.compile(r"\bsystem_info:\s*(.+?)\s*$")
+
+
+# The startup fit. A backend that projects past the card still starts and
+# falls back to the host, at a fraction of the speed.
+FIT_RE = re.compile(r"projected to use ([\d.]+) MiB of (?:device|host) memory "
+                    r"vs\. ([\d.]+) MiB of (?:free |total )?(?:device|host) memory")
+
+
+# A backend that dies says why here. It prints no other line the router reads.
+ERROR_RE = re.compile(r"CUDA error|failed to allocate")
+
+
 # Printed once under "vision hparams". The word break matters: the
 # tokenizer's n_merges is printed long before n_merge.
 VISION_RE = re.compile(r"\b(patch_size|n_merge|image_min_pixels|image_max_pixels)"
@@ -52,22 +70,28 @@ VISION_RE = re.compile(r"\b(patch_size|n_merge|image_min_pixels|image_max_pixels
 
 def read_config(lines):
     """The settings a backend started with, from its log. llama-server does
-    not report them on /props. A restart appends, so the first of each wins."""
+    not report them on /props. A restart appends, so the first of each wins.
+    `build` and `system_info` ride along: both are printed once at startup."""
     found = {}
     for line in lines:
         hit = CONFIG_RE.search(line)
-        if not hit:
-            continue
-        key, raw = hit.group(1), hit.group(2)
-        if key in found or key not in CONFIG_KEYS:
-            continue
-        if raw in ("true", "false"):
-            found[key] = raw == "true"
-        else:
-            try:
-                found[key] = int(raw)
-            except ValueError:
-                found[key] = raw
+        if hit:
+            key, raw = hit.group(1), hit.group(2)
+            if key in found or key not in CONFIG_KEYS:
+                continue
+            if raw in ("true", "false"):
+                found[key] = raw == "true"
+            else:
+                try:
+                    found[key] = int(raw)
+                except ValueError:
+                    found[key] = raw
+        hit = BUILD_RE.search(line)
+        if hit and "build" not in found:
+            found["build"] = hit.group(1)
+        hit = SYSTEM_RE.search(line)
+        if hit and "system_info" not in found:
+            found["system_info"] = hit.group(1)
     return found
 
 
@@ -88,13 +112,19 @@ def cache_event(line):
     """Classify one backend log line, or return None.
 
     Returns ("evicted", mib), ("skipped", mib), ("reread", 0.0),
-    ("checkpoint", tokens), ("mapped", mib), ("lazy", mib), ("limit", mib) or
+    ("checkpoint", tokens), ("mapped", mib), ("lazy", mib), ("limit", mib),
+    ("fit", (used_mib, free_mib)), ("error", text) or
     ("state", (prompts, used_mib, limit_mib))."""
     if not line:
         return None
     found = LIMIT_RE.search(line)
     if found:
         return "limit", float(found.group(1))
+    found = FIT_RE.search(line)
+    if found:
+        return "fit", (float(found.group(1)), float(found.group(2)))
+    if ERROR_RE.search(line):
+        return "error", line.strip()[:200]
     if REREAD_RE.search(line):
         return "reread", 0.0
     found = CHECKPOINT_RE.search(line)
@@ -122,9 +152,13 @@ def cache_event(line):
 class CacheWatch:
     """Follow one backend log and total what it says about the prompt cache.
     The totals cover the life of that backend. `sink(kind, value)` gets the
-    per-request events."""
+    per-request events.
 
-    SUNK = ("evicted", "skipped", "reread", "checkpoint")
+    `checkpoint` is counted and not sunk: one is printed for every restored
+    slot, and they were 71,644 of the log's lines over nine days. The count
+    is shown in the caching view's prompt-cache-in-RAM row."""
+
+    SUNK = ("evicted", "skipped", "reread")
 
     def __init__(self, path, sink=None):
         self.path = Path(path)
@@ -142,7 +176,11 @@ class CacheWatch:
         self.stats = {"evictions": 0, "evicted_mib": 0.0, "skipped": 0,
                       "rereads": 0, "checkpoints": 0,
                       "mapped_mib": 0.0, "lazy_mib": 0.0,
-                      "prompts": 0, "used_mib": 0.0, "limit_mib": 0.0}
+                      "prompts": 0, "used_mib": 0.0, "limit_mib": 0.0,
+                      # Why a backend that went down did, and what it said its
+                      # memory would be. Both read where no other line is.
+                      "fit_used_mib": 0.0, "fit_free_mib": 0.0,
+                      "last_error": None}
 
     def poll(self):
         """Read the lines added since the last call."""
@@ -158,7 +196,9 @@ class CacheWatch:
             self.replay_to = 0        # a new log: none of it predates this run
             self.stats.update(evictions=0, evicted_mib=0.0, skipped=0, rereads=0,
                               checkpoints=0, mapped_mib=0.0, lazy_mib=0.0,
-                              prompts=0, used_mib=0.0, limit_mib=0.0)
+                              prompts=0, used_mib=0.0, limit_mib=0.0,
+                              fit_used_mib=0.0, fit_free_mib=0.0,
+                              last_error=None)
         self.inode = inode
         try:
             with self.path.open("rb") as handle:
@@ -197,6 +237,11 @@ class CacheWatch:
                 self.stats["lazy_mib"] += value
             elif kind == "limit":
                 self.stats["limit_mib"] = value
+            elif kind == "fit":
+                used, free = value
+                self.stats["fit_used_mib"], self.stats["fit_free_mib"] = used, free
+            elif kind == "error":
+                self.stats["last_error"] = value
             else:
                 prompts, used, limit = value
                 self.stats.update(prompts=prompts, used_mib=used, limit_mib=limit)

@@ -211,13 +211,16 @@ For more than one instance, set two tables and keep them in step:
 To prefill is to read a prompt. That work is compute bound, and it runs for
 tens of minutes. To generate is to write the reply. That work is memory bound,
 and it runs for seconds. The two are separate settings, because an instance can
-be good at one, at the other, or at both:
+be good at one, at the other, or at both. Each is a boolean, or a list of
+request paths: a list means the instance reads, or generates, only those paths.
+No path asks whether the instance does that job at all.
 
 | `prefill` | `generate` | what the instance is |
 |---|---|---|
 | true | true | It reads and answers in the same slot. One instance wants this. |
 | false | true | A **generator**. Turns migrate here after another instance reads the prompt. |
 | true | false | It reads for the pool. It hands on every turn, and never spends a slot on a reply. |
+| true | `["/v1/systemone"]` | It reads every prompt, but answers only a typed question. A chat turn it reads waits for a generator rather than spending a slot on a slow reply. |
 
 Hardware does not decide this. For example, the machine these defaults came
 from sets `prefill: false` on the instance that holds the GPU. That card

@@ -249,5 +249,8 @@ def answers(link, be, slot, plan, timeout, alive):
         timing = (reply or {}).get("timings") or {}
         steps.append({"question": question["name"],
                       "read": timing.get("prompt_n"),
-                      "reused": timing.get("cache_n")})
+                      "reused": timing.get("cache_n"),
+                      # The whole object, so a slow question can be broken
+                      # down after the fact.
+                      "timings": timing})
     return said, wrote, steps

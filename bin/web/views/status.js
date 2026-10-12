@@ -16,7 +16,7 @@
 /** @typedef {{ n_ctx?: number, n_batch?: number, n_ubatch?: number, n_slots?: number,
  *              kv_unified?: boolean }} Config */
 /** @typedef {{ name: string, up: boolean, draining?: boolean,
- *              prefill?: boolean, generate?: boolean, slots: number,
+ *              prefill?: boolean | string[], generate?: boolean | string[], slots: number,
  *              busy: number, served: number, active: number, n_ctx: number, model?: string,
  *              node?: number | null, config?: Config,
  *              stats?: Stats, slots_detail?: Slot[], cache?: Cache }} Backend */

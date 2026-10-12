@@ -98,24 +98,58 @@ def with_usage(body):
         return None
 
 
+def read_oai(body):
+    """The usage, timings and fingerprint in a whole (unstreamed) openai
+    reply, or empty values when it is not one. A streamed reply is read by
+    OaiUsageSplice; a non-streamed one has no events to frame. `usage` and
+    `timings` are returned only when they are objects: a payload that sets
+    one to a list or a string must not carry it into the turn record."""
+    try:
+        obj = json.loads(body)
+    except (ValueError, TypeError):
+        return {}, {}, None
+    if not isinstance(obj, dict):
+        return {}, {}, None
+    usage, timings = obj.get("usage"), obj.get("timings")
+    return (usage if isinstance(usage, dict) else {},
+            timings if isinstance(timings, dict) else {},
+            obj.get("system_fingerprint"))
+
+
 class OaiUsageSplice(Splice):
     """Read the usage figures out of an openai stream as they pass. The
-    chunk carrying them has no choices, so it can be removed."""
+    chunk carrying them has no choices, so it can be removed.
+
+    The final chunk also carries `timings`, the reply's own per-request
+    numbers, and every chunk carries the backend's `system_fingerprint`. Both
+    are kept for the turn record."""
 
     def __init__(self, strip=False):
         super().__init__()
         self.strip = strip
         self.usage = {}
+        self.timings = {}
+        self.system_fingerprint = None
 
     def _one(self, raw):
         line = raw.strip()
-        if line.startswith(b"data:") and b'"usage"' in line:
+        if line.startswith(b"data:") and (b'"usage"' in line
+                                          or b'"system_fingerprint"' in line):
             try:
                 obj = json.loads(line[5:])
             except ValueError:
                 return raw
+            # A payload that parses to a list or a string has no .get. Pass
+            # it through rather than raising inside the stream.
+            if not isinstance(obj, dict):
+                return raw
+            if obj.get("system_fingerprint"):
+                self.system_fingerprint = obj["system_fingerprint"]
             if obj.get("choices") == [] and obj.get("usage"):
                 self.usage = obj["usage"]
+                timings = obj.get("timings")
+                if isinstance(timings, dict) and timings:
+                    self.timings = timings
                 if self.strip:
                     return b""
         return raw

@@ -68,9 +68,9 @@ function buildTotals(status) {
   add(`${busy} / ${slots}`, "slots busy", false, "");
   add(String(waiting), "waiting", waiting > 0, "Requests with no slot yet.");
   add(String(toGenerate), "queued to generate", toGenerate > 1,
-      "Turns whose prompt is read and parked, waiting for a slot on the "
-      + "instance that generates. They hold no backend while they wait, so a "
-      + "prefiller is free to take the next prompt.");
+      "Turns waiting for a slot on the instance that generates. A turn parks "
+      + "its read and gives the slot back while it waits, so a prefiller is "
+      + "free to take the next prompt; if it cannot park, it keeps the slot.");
   add(String(stalls), "slots stalled", stalls > 0,
       "Generating under 0.5 tokens a second while another slot on the same backend reads.");
   if (reused !== null) {
