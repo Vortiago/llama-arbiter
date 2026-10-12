@@ -5,6 +5,9 @@ import os, re, socket
 # Client configs the dashboard offers, built for the address the reader used.
 CONFIG_FILES = {"opencode": "opencode.json", "claude": "settings.json"}
 
+# Claude Code clamps CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS to 10 s to 30 min.
+BYTE_WATCHDOG_MAX_MS = 1800000
+
 
 def default_provider(env=None):
     """Names the machine in an OpenCode config. PROVIDER overrides the
@@ -80,13 +83,19 @@ def client_config(kind, host, model, n_ctx, provider=None):
                 # "anthropic".
                 "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
                 "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Qwen3.8 Flash Next (MTP)",
-                # Background work uses the haiku slot.
+                # A tier left unset names a Claude model this backend lacks.
+                # Background work uses the haiku tier.
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+                "ANTHROPIC_DEFAULT_FABLE_MODEL": model,
                 "ANTHROPIC_SMALL_FAST_MODEL": model,
                 "API_TIMEOUT_MS": str(patience_ms),
-                # Both watchdogs give up after five minutes of quiet.
+                # Both watchdogs give up after five minutes of quiet. Claude
+                # Code clamps the byte watchdog to 30 min (2.1.296), so a cold
+                # read longer than that ends the request.
                 "CLAUDE_STREAM_IDLE_TIMEOUT_MS": str(patience_ms),
-                "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": str(patience_ms),
+                "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": str(BYTE_WATCHDOG_MAX_MS),
                 "API_FORCE_IDLE_TIMEOUT": "0",
                 # Nothing here needs the internet.
                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
@@ -97,9 +106,18 @@ def client_config(kind, host, model, n_ctx, provider=None):
                 "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
                 # Pre-release body fields draw a 400 from the backend.
                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-                # Claude Code assumes a 200k window for an unknown model.
-                # The real size makes auto-compact run at the right point.
+                # Claude Code assumes a 200k window for an unknown model, or
+                # 1M for one it reads as large. State the real size.
                 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(n_ctx),
+                "CLAUDE_CODE_DISABLE_1M_CONTEXT": "1",
+                # Compacting at the full window leaves no room for the reply,
+                # and llama-server then shifts the context with no error
+                # (Verktoykasse PR 79). A quarter of the window stays free.
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(n_ctx * 3 // 4),
+                # Each side request takes a slot from the task in progress.
+                "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": "0",
+                "CLAUDE_CODE_ENABLE_AWAY_SUMMARY": "0",
+                "CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY": "2",
             }
         }
     return None
