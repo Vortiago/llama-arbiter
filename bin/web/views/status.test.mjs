@@ -178,6 +178,14 @@ test("a prompt almost entirely served from cache reads as almost done", () => {
   assert.equal(Math.round((100 * (bands.reused + bands.read)) / bands.total), 99);
 });
 
+test("the track is the whole the task arrived with, so it does not grow as the prompt is read", () => {
+  // The backend reports the whole prompt (patches/slots-report-the-prompt-size).
+  // Pinning the track to it stops the bar looking like the size was unknown.
+  // The three counters can overshoot the whole; the whole wins.
+  const pinned = slot({ phase: "reading", whole: 89848, cached: 88824, done: 600, prompt: 512 });
+  assert.deepEqual(promptBands(pinned), { total: 89848, reused: 88824, read: 600, left: 512 });
+});
+
 test("no bar for a slot that cannot show its reuse", () => {
   // Counters reset to zero when a turn ends, and /slots keeps a stale prompt.
   assert.equal(promptBands(slot({ busy: false, phase: "idle", prompt: 23225, done: 0, cached: 0 })), null);

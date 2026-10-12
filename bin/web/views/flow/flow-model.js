@@ -368,8 +368,9 @@ export function shelvesOf(status) {
 
 /** The copies as shares of PARK_BUDGET. The budget caps bytes, so width is
  * linear in bytes. Used most recently first, as the sweep orders them: the
- * right-hand end of the run goes next. A label goes only in a block wide
- * enough for it.
+ * right-hand end of the run goes next. `doomed` is the router's own mark, not
+ * guessed here: it knows which copy a save is reading and must keep. A label
+ * goes only in a block wide enough for it.
  * @param {Status} status @param {number} px strip width
  * @param {number} [minPx] pixels a name needs @param {number} [maxLabels]
  * @returns {{ blocks: Block[], used: number, count: number, live: number, kept: number }} */
@@ -391,18 +392,10 @@ export function blocksOf(status, px, minPx = 44, maxLabels = 6) {
         : kept ? "kept from before the restart"
         : `on disk, last ran on ${f.backend}`,
       label: false,
-      doomed: false,
+      doomed: Boolean(f.doomed),
     };
   });
   for (const i of widest(blocks.map((b) => b.share), px, minPx, maxLabels)) blocks[i].label = true;
-  // Mark everything past the budget: the next park sweeps it. The newest is
-  // never swept, however large: the router skips index 0. Otherwise one
-  // 9.45 GiB file was written 1,456 times in four hours.
-  let running = 0;
-  blocks.forEach((b, i) => {
-    running += b.share;
-    b.doomed = i > 0 && running > 1;
-  });
   return {
     blocks,
     used: blocks.reduce((t, b) => t + b.share, 0),

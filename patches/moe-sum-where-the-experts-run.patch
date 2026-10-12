@@ -1,0 +1,87 @@
+graph: weight and sum the MoE experts where the experts run
+
+The scheduler gives the MUL by the router weights and the ADDs over the
+used experts no backend in pass 1. With the experts on the CPU (weights
+in host memory, no op offload), the expand-gpu-up pass pulled them onto
+the card, so all n_expert_used rows per token ([n_embd, n_expert_used,
+n_tokens] f32) crossed to it each layer. They now run on the backend the
+scheduler gives the experts' matmul, and one row per token crosses.
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1112ad885..0ee6d9ecf 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1997,6 +1997,41 @@ ggml_tensor * llm_graph_context::build_ffn(
+     return cur;
+ }
+ 
++// The backend the scheduler gives op, an op on the weight w (pass 1 of ggml_backend_sched_split_graph):
++// the first backend that holds w's buffer type and supports op, unless a backend before the last one
++// takes over an op on weights in host memory (op offload).
++static ggml_backend_t weight_op_backend(ggml_backend_sched_t sched, bool op_offload, const ggml_tensor * w, const ggml_tensor * op) {
++    if (sched == nullptr || w->buffer == nullptr) {
++        return nullptr;
++    }
++    while (op->op != GGML_OP_MUL_MAT_ID && op->src[0] != nullptr) {
++        op = op->src[0];
++    }
++    const int n_backends = ggml_backend_sched_get_n_backends(sched);
++    for (int i = 0; i < n_backends; i++) {
++        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
++        if (!ggml_backend_supports_buft(backend, ggml_backend_buffer_get_type(w->buffer)) || !ggml_backend_supports_op(backend, op)) {
++            continue;
++        }
++        if (op_offload && i == n_backends - 1 && ggml_backend_buffer_is_host(w->buffer)) {
++            for (int j = 0; j < i; j++) {
++                ggml_backend_t other = ggml_backend_sched_get_backend(sched, j);
++                if (ggml_backend_supports_op(other, op) && ggml_backend_offload_op(other, op)) {
++                    return other;
++                }
++            }
++        }
++        return backend;
++    }
++    return nullptr;
++}
++
++static void set_backend(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_tensor * t) {
++    if (backend != nullptr && ggml_backend_supports_op(backend, t)) {
++        ggml_backend_sched_set_tensor_backend(sched, t, backend);
++    }
++}
++
+ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * cur,
+          ggml_tensor * gate_inp,
+@@ -2368,9 +2403,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(experts, "ffn_moe_down_biased", il);
+     }
+ 
++    // The scheduler gives the weighting and the sum no backend of their own, and can pull them onto
++    // the next backend; then all n_expert_used rows per token cross over, where one row would do.
++    // So they run where the experts run.
++    ggml_backend_t backend_exps = weight_op_backend(sched, cparams.op_offload, down_exps, experts);
++
+     if (!weight_before_ffn) {
+         experts = ggml_mul(ctx0, experts, weights);
+         cb(experts, "ffn_moe_weighted", il);
++        set_backend(sched, backend_exps, experts);
+     }
+ 
+     ggml_build_forward_expand(gf, experts);
+@@ -2395,6 +2436,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
++        set_backend(sched, backend_exps, moe_out);
+ 
+         ggml_build_forward_expand(gf, moe_out);
+     }
+@@ -2402,6 +2444,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     if (n_expert_used_il == 1) {
+         // avoid returning a non-contiguous tensor
+         moe_out = ggml_cont(ctx0, moe_out);
++        set_backend(sched, backend_exps, moe_out);
+     }
+ 
+     cb(moe_out, "ffn_moe_out", il);

@@ -1,6 +1,6 @@
 """The HTTP server, and stamped output."""
 
-import http.client, http.server, socket, sys, time
+import http.client, http.server, socket, sys, threading, time
 from .handler import PASSED
 
 class Server(http.server.ThreadingHTTPServer):
@@ -15,6 +15,17 @@ class Server(http.server.ThreadingHTTPServer):
     pool = None
     passed = PASSED
     provider = None
+    # The shared secret the control endpoints need, or None. None leaves them
+    # open: set it only where the router is reachable by others.
+    control_key = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Across every connection: _route holds here the sum of the request
+        # bodies it is reading at once, so one slow client cannot pin
+        # max_body on its own.
+        self.body_lock = threading.Lock()
+        self.body_held = 0
 
     def server_bind(self):
         # Accept IPv4 on the IPv6 socket. Tailscale gives a machine both,

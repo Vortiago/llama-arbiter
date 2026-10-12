@@ -66,7 +66,9 @@ THREADS_ENV=${THREADS:-}
 THREADS=${THREADS:-$(cores_on_node "$NODE")}
 
 # --preferred, not --membind: spill to the other node instead of failing.
-NUMACTL=(--cpunodebind="$NODE" --preferred="$NODE")
+# NODE may list nodes (0,1) for a backend that runs on both sockets with
+# --numa distribute; --preferred takes one, so the first.
+NUMACTL=(--cpunodebind="$NODE" --preferred="${NODE%%,*}")
 
 # NUMA_MODE=off on a single-node machine. There is no remote node to bind away
 # from, and `--numa` is not free: llama.cpp then sets MADV_RANDOM and skips

@@ -1,0 +1,122 @@
+From 5a88071e9ffd2ea414898f39ef19dfc1f6110090 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 13:02:35 +0200
+Subject: [PATCH] ggml-backend: queue split input copies between host memory
+ and a backend
+
+A CPU split read each input from the card with a stream synchronize plus
+a blocking copy on another stream, and a card split read the expert
+output from host memory the same way. In the gpu backend's layout a
+4-token verify step crosses card and host 96 times, so these waits sit
+on the critical path every layer.
+
+Now a copy between host memory and a backend's own buffer is queued on
+that backend's stream: host-to-card copies run ahead of the graph launch,
+and the card-to-host copies of one split share one synchronize before the
+CPU compute. An event after each host-to-card copy lets the call return
+only when the host memory it reads is free again, without waiting for the
+last graph.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-backend.cpp | 44 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5bdade6de..f2885fb31 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -957,6 +957,8 @@ struct ggml_backend_sched {
+     int cur_copy;
+     int next_copy;
+     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
++    // marks the end of the copies a backend reads from host memory, created on first use
++    ggml_backend_event_t host_read_events[GGML_SCHED_MAX_BACKENDS];
+     struct ggml_tensor ** graph_inputs;
+     int n_graph_inputs;
+     int graph_inputs_capacity;
+@@ -1809,6 +1811,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+     int prev_backend_id = -1;
+ 
++    // backends that read host memory in a queued copy during this call
++    bool reads_host[GGML_SCHED_MAX_BACKENDS] = { false };
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+@@ -1824,6 +1829,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // backends with queued copies into host memory that this split reads
++        bool writes_host[GGML_SCHED_MAX_BACKENDS] = { false };
++
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+@@ -1935,6 +1943,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         last_id = id;
+                     }
+                     copy_experts(first_id, last_id);
++                } else if (ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_async &&
++                           input_cpy->buffer->buft == ggml_backend_get_default_buffer_type(split_backend)) {
++                    // host memory to the split backend's own buffer: queue the copy on the split backend
++                    ggml_backend_synchronize(input_backend);
++                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++                    reads_host[split_backend_id] = true;
++                    if (sched->host_read_events[split_backend_id] == NULL) {
++                        sched->host_read_events[split_backend_id] = ggml_backend_event_new(ggml_backend_get_device(split_backend));
++                    }
++                    if (sched->host_read_events[split_backend_id] != NULL) {
++                        ggml_backend_event_record(sched->host_read_events[split_backend_id], split_backend);
++                    }
++                } else if (ggml_backend_buffer_is_host(input_cpy->buffer) && input_backend->iface.get_tensor_async &&
++                           input->buffer->buft == ggml_backend_get_default_buffer_type(input_backend)) {
++                    // the input backend's own buffer to host memory: queue the copy, wait once before the compute
++                    ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
++                    writes_host[ggml_backend_sched_backend_id(sched, input_backend)] = true;
+                 } else {
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+@@ -1951,6 +1976,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        for (int b = 0; b < sched->n_backends; b++) {
++            if (writes_host[b]) {
++                ggml_backend_synchronize(sched->backends[b]);
++            }
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+@@ -1998,6 +2029,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
++    // the caller may write host memory as soon as this returns: wait for the queued reads of it
++    for (int b = 0; b < sched->n_backends; b++) {
++        if (!reads_host[b]) {
++            continue;
++        }
++        if (sched->host_read_events[b] != NULL) {
++            ggml_backend_event_synchronize(sched->host_read_events[b]);
++        } else {
++            ggml_backend_synchronize(sched->backends[b]);
++        }
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -2081,6 +2124,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+         for (int c = 0; c < sched->n_copies; c++) {
+             ggml_backend_event_free(sched->events[b][c]);
+         }
++        ggml_backend_event_free(sched->host_read_events[b]);
+     }
+     ggml_gallocr_free(sched->galloc);
+     ggml_free(sched->ctx);

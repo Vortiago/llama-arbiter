@@ -1,0 +1,62 @@
+From 5b258a6ceb2deff29713c24825040461b7c262ad Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 12:22:46 +0200
+Subject: [PATCH] tests: set_sampler_same_graph picks with the chain
+
+dist has no backend implementation on this branch, so the context sets no
+backend token. The test now picks each token with llama_sampler_sample(), as
+the other tests do since the Gumbel-max pick. The backend graph is the top_k
+prefix of the chain: top_k 20 with another seed keeps the reserve, top_k 40
+does not.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ tests/test-backend-sampler.cpp | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/tests/test-backend-sampler.cpp b/tests/test-backend-sampler.cpp
+index 529ca8bdf..207cf07fe 100644
+--- a/tests/test-backend-sampler.cpp
++++ b/tests/test-backend-sampler.cpp
+@@ -1566,11 +1566,11 @@ static void test_backend_set_sampler_same_graph(const test_params & params) {
+     test_context test_ctx(params, configs);
+ 
+     GGML_ASSERT(test_ctx.decode({{seq_id, "Hello"}}));
+-    const llama_token tok0 = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    const llama_token tok0 = llama_sampler_sample(chain_a.get(), test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+     GGML_ASSERT(tok0 >= 0 && tok0 < test_ctx.n_vocab);
+ 
+     GGML_ASSERT(test_ctx.decode_tokens({{seq_id, tok0}}));
+-    const llama_token tok1 = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    const llama_token tok1 = llama_sampler_sample(chain_a.get(), test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+     GGML_ASSERT(tok1 >= 0 && tok1 < test_ctx.n_vocab);
+ 
+     // the next request: same graph, other seed
+@@ -1580,7 +1580,7 @@ static void test_backend_set_sampler_same_graph(const test_params & params) {
+     g_n_reserve = 0;
+     GGML_ASSERT(test_ctx.decode_tokens({{seq_id, tok1}}));
+     const int n_reserve_same = g_n_reserve;
+-    const llama_token tok_b = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    const llama_token tok_b = llama_sampler_sample(chain_b.get(), test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+     printf("same graph: reserves = %d, token = %d\n", n_reserve_same, tok_b);
+     GGML_ASSERT(tok_b >= 0 && tok_b < test_ctx.n_vocab);
+ 
+@@ -1591,7 +1591,7 @@ static void test_backend_set_sampler_same_graph(const test_params & params) {
+     g_n_reserve = 0;
+     GGML_ASSERT(test_ctx.decode_tokens({{seq_id, tok_b}}));
+     const int n_reserve_other = g_n_reserve;
+-    const llama_token tok_c = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    const llama_token tok_c = llama_sampler_sample(chain_c.get(), test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
+     printf("other graph: reserves = %d, token = %d\n", n_reserve_other, tok_c);
+     GGML_ASSERT(tok_c >= 0 && tok_c < test_ctx.n_vocab);
+ 
+@@ -1602,7 +1602,7 @@ static void test_backend_set_sampler_same_graph(const test_params & params) {
+     GGML_ASSERT(ref_ctx.decode_tokens({{seq_id, tok0}}));
+     llama_set_sampler(ref_ctx.ctx.get(), seq_id, chain_ref.get());
+     GGML_ASSERT(ref_ctx.decode_tokens({{seq_id, tok1}}));
+-    const llama_token tok_ref = llama_get_sampled_token_ith(ref_ctx.ctx.get(), ref_ctx.idx_for_seq(seq_id));
++    const llama_token tok_ref = llama_sampler_sample(chain_ref.get(), ref_ctx.ctx.get(), ref_ctx.idx_for_seq(seq_id));
+     printf("reference token = %d\n", tok_ref);
+ 
+     llama_log_set(nullptr, nullptr);

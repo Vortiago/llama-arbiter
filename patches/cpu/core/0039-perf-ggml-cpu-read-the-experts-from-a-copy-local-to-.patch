@@ -1,0 +1,499 @@
+From e524349cc85e7db026680a247cd5f734e6a088ea Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 08:23:41 +0200
+Subject: [PATCH] perf(ggml-cpu): read the experts from a copy local to each
+ node
+
+The gpu backend binds to node 0, and its CPU expert reads (74% of a
+4-token verify step) use one socket's memory bandwidth. koishi has a
+second copy of the model files whose page cache is mostly on node 1.
+
+- LLAMA_NUMA_MIRROR=node:from=to[,...] maps the copy of each model file
+  (the same path under `to`) a second time, and registers the still
+  mapped fragments with the CPU backend (ggml_numa_mirror_set / clear,
+  through the CPU backend's proc address table). No new memory: the
+  copy is the page cache another process already holds.
+- A thread whose CPUs are all on one node (--numa distribute, isolate,
+  or numactl bound to one node) records that node. MUL_MAT_ID (vec_dot,
+  sgemm and the fused small-batch MoE op) reads an expert's rows from
+  the copy of that node.
+- With --numa distribute (thread ith on node ith % n_nodes) the fused
+  MoE op splits its units into one contiguous part per node, each with
+  its own counter, so no counter moves between sockets.
+
+Each output is the same vec_dot over the same bytes, by another thread,
+so the result is exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/include/ggml-cpu.h        |   6 ++
+ ggml/src/ggml-cpu/ggml-cpu.c   | 140 +++++++++++++++++++++++++++++----
+ ggml/src/ggml-cpu/ggml-cpu.cpp |   6 ++
+ src/llama-mmap.cpp             | 122 ++++++++++++++++++++++++++++
+ 4 files changed, 257 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index dc6453c6e..1f238e562 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -37,6 +37,12 @@ extern "C" {
+     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
+     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+ 
++    // [base, base + size) has a copy at copy whose pages are on node: a thread whose CPUs are all
++    // on that node reads the weights of MUL_MAT_ID there. clear forgets the copies of the ranges
++    // that start in [base, base + size).
++    GGML_BACKEND_API void    ggml_numa_mirror_set(const void * base, size_t size, int node, const void * copy);
++    GGML_BACKEND_API void    ggml_numa_mirror_clear(const void * base, size_t size);
++
+     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
+     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 0eb43bc84..6524be075 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -555,6 +555,7 @@ struct ggml_numa_nodes {
+     struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
+     uint32_t n_nodes;
+     uint32_t n_nodes_used; // nodes with a CPU in cpuset, the CPUs this process may use
++    int32_t  used_node;    // the node of cpuset when n_nodes_used is 1, else -1
+     uint32_t total_cpus; // hardware threads on system
+     uint32_t current_node; // node on which main process is execting
+ #if defined(__gnu_linux__)
+@@ -708,15 +709,20 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
+     }
+ 
+     g_state.numa.n_nodes_used = 0;
++    g_state.numa.used_node    = -1;
+     for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+         const struct ggml_numa_node * node = &g_state.numa.nodes[n];
+         for (uint32_t i = 0; i < node->n_cpus; ++i) {
+             if (CPU_ISSET(node->cpus[i], &g_state.numa.cpuset)) {
+                 g_state.numa.n_nodes_used++;
++                g_state.numa.used_node = (int32_t) n;
+                 break;
+             }
+         }
+     }
++    if (g_state.numa.n_nodes_used != 1) {
++        g_state.numa.used_node = -1;
++    }
+ 
+     if (ggml_is_numa()) {
+         FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
+@@ -750,6 +756,84 @@ bool ggml_numa_spans_nodes(void) {
+ #endif
+ }
+ 
++// NUMA mirrors. A mirror is a second copy of a range of memory whose pages are on one node,
++// for example a model file mapped again from a copy of the file that node's page cache holds.
++// A thread whose CPUs are all on one node reads the weights of MUL_MAT_ID from the copy of its
++// node (ggml_numa_local). The copy has the same bytes, so the results do not change.
++
++#define GGML_NUMA_MAX_MIRRORS 64
++
++struct ggml_numa_mirror {
++    const char * base;
++    size_t       size; // 0: a free slot
++    int          node;
++    const char * copy;
++};
++
++static struct ggml_numa_mirror g_numa_mirrors[GGML_NUMA_MAX_MIRRORS];
++static atomic_int              g_numa_n_mirrors; // slots in use or freed, a prefix of g_numa_mirrors
++
++#if defined(__gnu_linux__)
++// the node of this thread's CPUs, or -1 when they are on several nodes or it is not known
++static __thread int ggml_numa_thread_node = -1;
++#endif
++
++void ggml_numa_mirror_set(const void * base, size_t size, int node, const void * copy) {
++    GGML_ASSERT(node >= 0 && node < GGML_NUMA_MAX_NODES && size > 0);
++    ggml_critical_section_start();
++    int n = atomic_load_explicit(&g_numa_n_mirrors, memory_order_relaxed);
++    int i = 0;
++    while (i < n && g_numa_mirrors[i].size != 0) {
++        i++;
++    }
++    GGML_ASSERT(i < GGML_NUMA_MAX_MIRRORS);
++    g_numa_mirrors[i] = (struct ggml_numa_mirror) { (const char *) base, size, node, (const char *) copy };
++    if (i == n) {
++        atomic_store_explicit(&g_numa_n_mirrors, n + 1, memory_order_release);
++    }
++    ggml_critical_section_end();
++}
++
++// forget the mirrors of every range that starts in [base, base + size)
++void ggml_numa_mirror_clear(const void * base, size_t size) {
++    ggml_critical_section_start();
++    const int n = atomic_load_explicit(&g_numa_n_mirrors, memory_order_relaxed);
++    for (int i = 0; i < n; ++i) {
++        struct ggml_numa_mirror * m = &g_numa_mirrors[i];
++        if (m->size != 0 && m->base >= (const char *) base && m->base < (const char *) base + size) {
++            m->size = 0;
++        }
++    }
++    ggml_critical_section_end();
++}
++
++// p, or the address of the same byte in the copy local to this thread's node
++static inline const char * ggml_numa_local(const char * p) {
++#if defined(__gnu_linux__)
++    const int node = ggml_numa_thread_node;
++    if (node < 0) {
++        return p;
++    }
++    const int n = atomic_load_explicit(&g_numa_n_mirrors, memory_order_acquire);
++    for (int i = 0; i < n; ++i) {
++        const struct ggml_numa_mirror * m = &g_numa_mirrors[i];
++        if (m->node == node && p >= m->base && p < m->base + m->size) {
++            return m->copy + (p - m->base);
++        }
++    }
++#endif
++    return p;
++}
++
++// The threads of a graph as groups, one per node: GGML_NUMA_STRATEGY_DISTRIBUTE puts thread
++// ith on node ith % n_nodes. One group otherwise.
++static int ggml_numa_n_groups(int nth) {
++    if (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DISTRIBUTE && g_state.numa.n_nodes > 1) {
++        return MIN((int) g_state.numa.n_nodes, nth);
++    }
++    return 1;
++}
++
+ #if defined(__ARM_ARCH)
+ #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+ #include <arm_sve.h>
+@@ -1790,7 +1874,7 @@ static bool ggml_compute_forward_mul_mat_id_sgemm(
+         const int64_t ir0_start = (item % n_blck0)*MMID_SGEMM_BLCK_0;
+         const int64_t ir0_end   = MIN(ir0_start + MMID_SGEMM_BLCK_0, ne01);
+ 
+-        const char * src0_cur = (const char *) src0->data + cur_a*nb02;
++        const char * src0_cur = ggml_numa_local((const char *) src0->data + cur_a*nb02);
+ 
+         // Even column blocks: each holds cne1 rows, or 32 to 64 when there are several, so no
+         // block is a single row that llamafile_sgemm refuses.
+@@ -2062,7 +2146,7 @@ static void ggml_compute_forward_mul_mat_id(
+             continue;
+         }
+ 
+-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++        const char * src0_cur = ggml_numa_local((const char *) src0->data + cur_a * nb02);
+ 
+         const int64_t nr1 = cne1;
+ 
+@@ -2157,7 +2241,7 @@ static size_t ggml_moe_ffn_wsize(const struct ggml_tensor * gate, const struct g
+            n_as*sizeof(int64_t) + CACHE_LINE_SIZE +
+            n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + CACHE_LINE_SIZE +
+            (n_as + 1)*sizeof(int32_t) + CACHE_LINE_SIZE +
+-           2*CACHE_LINE_SIZE + CACHE_LINE_SIZE;
++           2*GGML_NUMA_MAX_NODES*CACHE_LINE_SIZE + CACHE_LINE_SIZE;
+ }
+ 
+ // unit u of n_active experts with nb blocks of blk rows each: the rows of that block for all
+@@ -2172,7 +2256,7 @@ static void ggml_moe_ffn_run_unit(
+     const int64_t r1    = MIN(r0 + blk, src0->ne[1]);
+ 
+     ggml_compute_forward_mul_mat_id_one_chunk(dst, src0, dst->src[1], dst->src[2], cur_a,
+-        r0, r1, 0, counts[cur_a], (const char *) src0->data + cur_a*src0->nb[2],
++        r0, r1, 0, counts[cur_a], ggml_numa_local((const char *) src0->data + cur_a*src0->nb[2]),
+         matrix_rows, row_size, true, wdata);
+ }
+ 
+@@ -2207,8 +2291,19 @@ static void ggml_compute_forward_moe_ffn(
+     struct mmid_row_mapping * matrix_rows =
+         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), CACHE_LINE_SIZE);
+     int32_t * active = incr_ptr_aligned(&wdata_cur, (n_as + 1)*sizeof(int32_t), CACHE_LINE_SIZE);
+-    // the next unit of steps 2 and 3, one cache line each
+-    char (*next_unit)[CACHE_LINE_SIZE] = incr_ptr_aligned(&wdata_cur, 2*CACHE_LINE_SIZE, CACHE_LINE_SIZE);
++    // the next unit of steps 2 and 3 for each group of threads, one cache line each
++    char (*next_unit)[CACHE_LINE_SIZE] = incr_ptr_aligned(&wdata_cur, 2*GGML_NUMA_MAX_NODES*CACHE_LINE_SIZE, CACHE_LINE_SIZE);
++
++    // The threads work in groups, one per node (ggml_numa_n_groups). Group grp takes the units
++    // [n*grp/ng, n*(grp+1)/ng) of a step from its own counter, so no counter moves between nodes.
++    const int ng   = ggml_numa_n_groups(nth);
++    const int grp  = ith % ng;
++    const int ig   = ith / ng;
++
++    const int64_t blk_ug = ggml_moe_ffn_block_rows(down);
++    const int64_t nb_ug  = (gate->ne[0] + blk_ug - 1)/blk_ug;
++    const int64_t blk_dn = 256;
++    const int64_t nb_dn  = (down->src[0]->ne[1] + blk_dn - 1)/blk_dn;
+ 
+     GGML_ASSERT(params->wsize >= (size_t) ((char *) wdata_cur - (char *) params->wdata));
+ 
+@@ -2248,9 +2343,12 @@ static void ggml_compute_forward_moe_ffn(
+         }
+         active[n_as] = n;
+ 
+-        // every thread starts at unit ith
+-        atomic_store_explicit((atomic_int *) next_unit[0], nth, memory_order_relaxed);
+-        atomic_store_explicit((atomic_int *) next_unit[1], nth, memory_order_relaxed);
++        // every thread starts at unit ig of its group
++        for (int k = 0; k < ng; ++k) {
++            const int nthk = (nth - k + ng - 1)/ng;
++            atomic_store_explicit((atomic_int *) next_unit[k],                       (int) (n*nb_ug*k/ng) + nthk, memory_order_relaxed);
++            atomic_store_explicit((atomic_int *) next_unit[GGML_NUMA_MAX_NODES + k], (int) (n*nb_dn*k/ng) + nthk, memory_order_relaxed);
++        }
+     }
+ 
+     ggml_barrier(params->threadpool);
+@@ -2260,14 +2358,14 @@ static void ggml_compute_forward_moe_ffn(
+     // 2. gate, up, SWIGLU and down's quantization. The units are (expert, block of rows) in
+     // expert order, taken from a counter, so a thread that runs late hands its share to the others.
+     {
+-        const int64_t blk = ggml_moe_ffn_block_rows(down);
++        const int64_t blk = blk_ug;
+         const int64_t nc  = gate->ne[0];
+-        const int64_t nb  = (nc + blk - 1)/blk;
++        const int64_t nb  = nb_ug;
+         const size_t  bsz = ggml_type_size(vdt_dn);
+         const int64_t bln = ggml_blck_size(vdt_dn);
+ 
+-        for (int64_t u = ith; u < n_active*nb;
+-                u = atomic_fetch_add_explicit((atomic_int *) next_unit[0], 1, memory_order_relaxed)) {
++        for (int64_t u = n_active*nb*grp/ng + ig; u < n_active*nb*(grp + 1)/ng;
++                u = atomic_fetch_add_explicit((atomic_int *) next_unit[grp], 1, memory_order_relaxed)) {
+             ggml_moe_ffn_run_unit(gate, active, nb, blk, u, counts, matrix_rows, wx, row_ug);
+             ggml_moe_ffn_run_unit(up,   active, nb, blk, u, counts, matrix_rows, wx, row_ug);
+ 
+@@ -2291,11 +2389,11 @@ static void ggml_compute_forward_moe_ffn(
+ 
+     // 3. down, in units of 256 rows of one expert, taken the same way
+     {
+-        const int64_t blk = 256;
+-        const int64_t nb  = (down->src[0]->ne[1] + blk - 1)/blk;
++        const int64_t blk = blk_dn;
++        const int64_t nb  = nb_dn;
+ 
+-        for (int64_t u = ith; u < n_active*nb;
+-                u = atomic_fetch_add_explicit((atomic_int *) next_unit[1], 1, memory_order_relaxed)) {
++        for (int64_t u = n_active*nb*grp/ng + ig; u < n_active*nb*(grp + 1)/ng;
++                u = atomic_fetch_add_explicit((atomic_int *) next_unit[GGML_NUMA_MAX_NODES + grp], 1, memory_order_relaxed)) {
+             ggml_moe_ffn_run_unit(down, active, nb, blk, u, counts, matrix_rows, wg, row_dn);
+         }
+     }
+@@ -2741,6 +2839,8 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+ // Android's libc implementation "bionic" does not support setting affinity
+ #if defined(__gnu_linux__)
+ static void set_numa_thread_affinity(int thread_n) {
++    ggml_numa_thread_node = -1;
++
+     if (!ggml_is_numa()) {
+         return;
+     }
+@@ -2763,6 +2863,8 @@ static void set_numa_thread_affinity(int thread_n) {
+             rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
+             if (rv) {
+                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
++            } else {
++                ggml_numa_thread_node = g_state.numa.used_node;
+             }
+             return;
+         default:
+@@ -2780,12 +2882,16 @@ static void set_numa_thread_affinity(int thread_n) {
+     rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
+     if (rv) {
+             fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
++    } else {
++        ggml_numa_thread_node = node_num;
+     }
+ 
+     CPU_FREE(cpus);
+ }
+ 
+ static void clear_numa_thread_affinity(void) {
++    ggml_numa_thread_node = -1;
++
+     if (!ggml_is_numa()) {
+         return;
+     }
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 81ff5d79f..d4f79a1ab 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -676,6 +676,12 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
+     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
+         return (void *)ggml_is_numa;
+     }
++    if (strcmp(name, "ggml_backend_cpu_numa_mirror_set") == 0) {
++        return (void *)ggml_numa_mirror_set;
++    }
++    if (strcmp(name, "ggml_backend_cpu_numa_mirror_clear") == 0) {
++        return (void *)ggml_numa_mirror_clear;
++    }
+     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
+         return (void *)ggml_backend_cpu_set_use_ref;
+     }
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 045489df7..2a19e3261 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -3,6 +3,8 @@
+ #include "llama-impl.h"
+ 
+ #include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
+ 
+ #include <cstring>
+ #include <climits>
+@@ -10,6 +12,8 @@
+ #include <stdexcept>
+ #include <cerrno>
+ #include <algorithm>
++#include <string>
++#include <vector>
+ 
+ #ifdef __has_include
+     #if __has_include(<unistd.h>)
+@@ -475,10 +479,123 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
+ }
+ #endif
+ 
++#if defined(_POSIX_MAPPED_FILES) && defined(__linux__)
++static void * llama_cpu_proc_address(const char * name) {
++    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    return dev ? ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), name) : nullptr;
++}
++#endif
++
+ struct llama_mmap::impl {
+ #ifdef _POSIX_MAPPED_FILES
+     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+ 
++    // Copies of the file whose pages are on other nodes, mapped whole: (node, address).
++    // LLAMA_NUMA_MIRROR lists them as node:from=to entries separated by commas. A file whose
++    // path starts with from has its copy for that node at the same path under to, for example
++    // LLAMA_NUMA_MIRROR=1:/mnt/nvme/models/=/mnt/nvme/models-node1/
++    std::vector<std::pair<int, void *>> mirrors;
++
++#ifdef __linux__
++    void mirrors_init(int fd) {
++        const char * env = getenv("LLAMA_NUMA_MIRROR");
++        if (env == nullptr || *env == '\0') {
++            return;
++        }
++        char path[4096];
++        const ssize_t n = readlink(format("/proc/self/fd/%d", fd).c_str(), path, sizeof(path) - 1);
++        if (n <= 0) {
++            return;
++        }
++        path[n] = '\0';
++        const std::string fname = path;
++
++        std::string list = env;
++        size_t pos = 0;
++        while (pos <= list.size()) {
++            size_t end = list.find(',', pos);
++            if (end == std::string::npos) {
++                end = list.size();
++            }
++            const std::string entry = list.substr(pos, end - pos);
++            pos = end + 1;
++
++            const size_t colon = entry.find(':');
++            const size_t eq    = entry.find('=');
++            if (colon == std::string::npos || eq == std::string::npos || eq < colon) {
++                LLAMA_LOG_WARN("%s: LLAMA_NUMA_MIRROR entry '%s' is not node:from=to\n", __func__, entry.c_str());
++                continue;
++            }
++            const int         node = atoi(entry.substr(0, colon).c_str());
++            const std::string from = entry.substr(colon + 1, eq - colon - 1);
++            const std::string to   = entry.substr(eq + 1);
++            if (from.empty() || fname.compare(0, from.size(), from) != 0) {
++                continue;
++            }
++            const std::string copy = to + fname.substr(from.size());
++
++            const int cfd = open(copy.c_str(), O_RDONLY);
++            if (cfd < 0) {
++                LLAMA_LOG_WARN("%s: cannot open %s: %s\n", __func__, copy.c_str(), strerror(errno));
++                continue;
++            }
++            struct stat st;
++            if (fstat(cfd, &st) != 0 || (size_t) st.st_size != size) {
++                LLAMA_LOG_WARN("%s: %s is not the size of %s\n", __func__, copy.c_str(), fname.c_str());
++                close(cfd);
++                continue;
++            }
++            void * caddr = mmap(NULL, size, PROT_READ, MAP_SHARED, cfd, 0);
++            close(cfd);
++            if (caddr == MAP_FAILED) {
++                LLAMA_LOG_WARN("%s: mmap of %s failed: %s\n", __func__, copy.c_str(), strerror(errno));
++                continue;
++            }
++            // no readahead: a fault reads one page
++            posix_madvise(caddr, size, POSIX_MADV_RANDOM);
++            LLAMA_LOG_INFO("%s: node %d reads %s for %s\n", __func__, node, copy.c_str(), fname.c_str());
++            mirrors.emplace_back(node, caddr);
++        }
++        mirrors_publish();
++    }
++
++    // tell the CPU backend about the copies of the fragments still mapped
++    void mirrors_publish() {
++        if (mirrors.empty()) {
++            return;
++        }
++        auto * mirror_set   = (decltype(ggml_numa_mirror_set)   *) llama_cpu_proc_address("ggml_backend_cpu_numa_mirror_set");
++        auto * mirror_clear = (decltype(ggml_numa_mirror_clear) *) llama_cpu_proc_address("ggml_backend_cpu_numa_mirror_clear");
++        if (mirror_set == nullptr || mirror_clear == nullptr) {
++            return;
++        }
++        mirror_clear(addr, size);
++        for (const auto & frag : mapped_fragments) {
++            for (const auto & [node, caddr] : mirrors) {
++                mirror_set((char *) addr + frag.first, frag.second - frag.first, node, (char *) caddr + frag.first);
++            }
++        }
++    }
++
++    void mirrors_free() {
++        if (mirrors.empty()) {
++            return;
++        }
++        auto * mirror_clear = (decltype(ggml_numa_mirror_clear) *) llama_cpu_proc_address("ggml_backend_cpu_numa_mirror_clear");
++        if (mirror_clear != nullptr) {
++            mirror_clear(addr, size);
++        }
++        for (const auto & [node, caddr] : mirrors) {
++            munmap(caddr, size);
++        }
++        mirrors.clear();
++    }
++#else
++    void mirrors_init(int) {}
++    void mirrors_publish() {}
++    void mirrors_free() {}
++#endif
++
+     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+         size = file->size();
+         int fd = file->file_id();
+@@ -526,6 +643,8 @@ struct llama_mmap::impl {
+         }
+ 
+         mapped_fragments.emplace_back(0, file->size());
++
++        mirrors_init(fd);
+     }
+ 
+     static void align_range(size_t * first, size_t * last, size_t page_size) {
+@@ -574,9 +693,12 @@ struct llama_mmap::impl {
+             }
+         }
+         mapped_fragments = std::move(new_mapped_fragments);
++
++        mirrors_publish();
+     }
+ 
+     ~impl() {
++        mirrors_free();
+         for (const auto & frag : mapped_fragments) {
+             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
+                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));

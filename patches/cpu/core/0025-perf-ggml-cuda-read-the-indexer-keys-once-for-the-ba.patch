@@ -1,0 +1,239 @@
+From c0a38b6fddaed458336929253bfa8a03acee4889 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 17:51:14 +0200
+Subject: [PATCH] perf(ggml-cuda): read the indexer keys once for the batches
+ of a block
+
+The vector lightning indexer kernel ran one block per (key range, batch),
+so a 4-token verify read every pooled key four times. A block now holds its
+keys in registers and scores several batches: the grid has only as many
+batch blocks per key range as it takes for about 4 blocks per SM. At a long
+context that is one, and each key is read once, as in Strata #187 (QSA
+scores read once). Per batch the arithmetic is unchanged: exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-cuda/lightning-indexer.cu | 135 +++++++++++++-----------
+ 1 file changed, 73 insertions(+), 62 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index 90c06a1cf..2275e4c08 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -3,6 +3,8 @@
+ #include "fattn-common.cuh"
+ #include "convert.cuh"
+ 
++#include <algorithm>
++
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ #if defined(TURING_MMA_AVAILABLE)
+ 
+@@ -258,7 +260,6 @@ static __global__ void lightning_indexer_kernel_vec(
+     constexpr int K_VECS_PER_WARP = K_VECS_PER_BLOCK / WARPS_PER_BLOCK;
+     constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * WARP_SIZE;
+ 
+-    const int i_batch  = blockIdx.y;
+     const int i_stream = blockIdx.z;
+     const int i_warp   = threadIdx.y;
+     const int i_lane   = threadIdx.x;
+@@ -268,10 +269,7 @@ static __global__ void lightning_indexer_kernel_vec(
+     const int start_kv_block = blockIdx.x * K_VECS_PER_BLOCK;
+     const int start_kv = start_kv_block + i_warp * K_VECS_PER_WARP;
+ 
+-    const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
+-    const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
+-
+-    // phase 1 - load (and dequantize if needed) K to registers
++    // phase 1 - load (and dequantize if needed) K to registers, once for all the batches of this block
+ 
+     float4 k_reg_f[K_VECS_PER_WARP];
+ 
+@@ -302,85 +300,91 @@ static __global__ void lightning_indexer_kernel_vec(
+         }
+     }
+ 
+-    float score_k[K_VECS_PER_WARP] = { 0.0f };
++    // batches blockIdx.y, blockIdx.y + gridDim.y, ...
++    for (int i_batch = blockIdx.y; i_batch < n_batch; i_batch += gridDim.y) {
++        const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
++        const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
+ 
+-    // load weights and Q only for N_HEAD_INNER heads at once to reduce shared memory usage
+-    constexpr int N_HEAD_INNER = N_HEAD / 4;
++        float score_k[K_VECS_PER_WARP] = { 0.0f };
+ 
+-    for (int i_head_0 = 0; i_head_0 < N_HEAD; i_head_0 += N_HEAD_INNER) {
+-        // phase 2 - load weights and Q to shared memory
++        // load weights and Q only for N_HEAD_INNER heads at once to reduce shared memory usage
++        constexpr int N_HEAD_INNER = N_HEAD / 4;
+ 
+-        __shared__ float  w_shared[N_HEAD_INNER];
+-        __shared__ float4 q_shared_f[N_HEAD_INNER][N_EMBD / 4];
++        for (int i_head_0 = 0; i_head_0 < N_HEAD; i_head_0 += N_HEAD_INNER) {
++            // phase 2 - load weights and Q to shared memory
+ 
+-        if (tid < N_HEAD_INNER) {
+-            w_shared[tid] = w_base[i_head_0 + tid];
+-        }
++            __shared__ float  w_shared[N_HEAD_INNER];
++            __shared__ float4 q_shared_f[N_HEAD_INNER][N_EMBD / 4];
++
++            if (tid < N_HEAD_INNER) {
++                w_shared[tid] = w_base[i_head_0 + tid];
++            }
+ 
+-        constexpr int n_q = N_HEAD_INNER * (N_EMBD / 4);
++            constexpr int n_q = N_HEAD_INNER * (N_EMBD / 4);
+ #pragma unroll
+-        for (int i_q = tid; i_q < n_q; i_q += THREADS_PER_BLOCK) {
+-            const int i_head_inner = i_q / (N_EMBD / 4);
+-            const int i_head = i_head_0 + i_head_inner;
+-            const int i_embd = i_q % (N_EMBD / 4);
+-            q_shared_f[i_head_inner][i_embd] = *(const float4 *) (q_base + i_head*nbq1 + i_embd*sizeof(float4));
+-        }
++            for (int i_q = tid; i_q < n_q; i_q += THREADS_PER_BLOCK) {
++                const int i_head_inner = i_q / (N_EMBD / 4);
++                const int i_head = i_head_0 + i_head_inner;
++                const int i_embd = i_q % (N_EMBD / 4);
++                q_shared_f[i_head_inner][i_embd] = *(const float4 *) (q_base + i_head*nbq1 + i_embd*sizeof(float4));
++            }
+ 
+-        __syncthreads();
++            __syncthreads();
+ 
+-        // phase 3 - calculate lightning indexer scores
++            // phase 3 - calculate lightning indexer scores
+ 
+-        for (int i_head_inner = 0; i_head_inner < N_HEAD_INNER; ++i_head_inner) {
+-            const float w_val = w_shared[i_head_inner];
+-            float qk[K_VECS_PER_WARP] = { 0.0f };
++            for (int i_head_inner = 0; i_head_inner < N_HEAD_INNER; ++i_head_inner) {
++                const float w_val = w_shared[i_head_inner];
++                float qk[K_VECS_PER_WARP] = { 0.0f };
+ 
+-            // dot product of floats
+-            const float4 q_vec = q_shared_f[i_head_inner][i_lane];
++                // dot product of floats
++                const float4 q_vec = q_shared_f[i_head_inner][i_lane];
+ 
+ #pragma unroll
+-            for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+-                ggml_cuda_mad(qk[k], q_vec.x, k_reg_f[k].x);
+-                ggml_cuda_mad(qk[k], q_vec.y, k_reg_f[k].y);
+-                ggml_cuda_mad(qk[k], q_vec.z, k_reg_f[k].z);
+-                ggml_cuda_mad(qk[k], q_vec.w, k_reg_f[k].w);
+-            }
++                for (int k = 0; k < K_VECS_PER_WARP; ++k) {
++                    ggml_cuda_mad(qk[k], q_vec.x, k_reg_f[k].x);
++                    ggml_cuda_mad(qk[k], q_vec.y, k_reg_f[k].y);
++                    ggml_cuda_mad(qk[k], q_vec.z, k_reg_f[k].z);
++                    ggml_cuda_mad(qk[k], q_vec.w, k_reg_f[k].w);
++                }
+ 
+ #pragma unroll
+-            for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+-                float sum = warp_reduce_sum(qk[k]);
+-
+-                // ReLU, weight
+-                if (i_lane == 0) {
+-                    sum = (sum > 0.0f) ? sum : 0.0f;
+-                    score_k[k] += sum * w_val;
++                for (int k = 0; k < K_VECS_PER_WARP; ++k) {
++                    float sum = warp_reduce_sum(qk[k]);
++
++                    // ReLU, weight
++                    if (i_lane == 0) {
++                        sum = (sum > 0.0f) ? sum : 0.0f;
++                        score_k[k] += sum * w_val;
++                    }
+                 }
+             }
+-        }
+ 
+-        __syncthreads();
+-    }
++            __syncthreads();
++        }
+ 
+-    // phase 4 - store outputs to shared memory
++        // phase 4 - store outputs to shared memory
+ 
+-    __shared__ float dst_shared[K_VECS_PER_BLOCK];
++        __shared__ float dst_shared[K_VECS_PER_BLOCK];
+ 
+-    if (i_lane == 0) {
++        if (i_lane == 0) {
+ #pragma unroll
+-        for (int k = 0; k < K_VECS_PER_WARP; ++k) {
+-            dst_shared[i_warp * K_VECS_PER_WARP + k] = score_k[k];
++            for (int k = 0; k < K_VECS_PER_WARP; ++k) {
++                dst_shared[i_warp * K_VECS_PER_WARP + k] = score_k[k];
++            }
+         }
+-    }
+ 
+-    __syncthreads();
++        __syncthreads();
+ 
+-    // phase 5 - write from shared memory to VRAM in coalesced manner
++        // phase 5 - write from shared memory to VRAM in coalesced manner
+ 
+-    if (tid < K_VECS_PER_BLOCK) {
+-        int i_kv = start_kv_block + tid;
+-        if (i_kv < n_kv) {
+-            const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+-            float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+-            dst_base[i_kv] = dst_shared[tid] + __half2float(m_base[i_kv]);
++        if (tid < K_VECS_PER_BLOCK) {
++            int i_kv = start_kv_block + tid;
++            if (i_kv < n_kv) {
++                const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
++                float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
++                dst_base[i_kv] = dst_shared[tid] + __half2float(m_base[i_kv]);
++            }
+         }
+     }
+ }
+@@ -595,6 +599,13 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const int device = ggml_cuda_get_device();
+     const int cc     = ggml_cuda_info().devices[device].cc;
+ 
++    // the vector kernel reads its keys once for all the batches of a block: use only as many
++    // blocks per key range as it takes for about 4 blocks per SM
++    const int nsm = ggml_cuda_info().devices[device].nsm;
++    auto vec_batch_blocks = [&](int num_kv_blocks) {
++        return std::max(1, std::min(n_batch, (4*nsm + num_kv_blocks - 1) / num_kv_blocks));
++    };
++
+     if (n_embd == 128 && n_head == 64) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+         if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+@@ -624,7 +635,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+             dim3 block(32, WARPS_PER_BLOCK);
+             int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+-            dim3 grid(num_kv_blocks, n_batch, n_stream);
++            dim3 grid(num_kv_blocks, vec_batch_blocks(num_kv_blocks), n_stream);
+ 
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_F16)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 64, k, GGML_TYPE_Q4_0)
+@@ -665,7 +676,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+             dim3 block(32, WARPS_PER_BLOCK);
+             int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+-            dim3 grid(num_kv_blocks, n_batch, n_stream);
++            dim3 grid(num_kv_blocks, vec_batch_blocks(num_kv_blocks), n_stream);
+ 
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F16)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_Q4_0)
+@@ -704,7 +715,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+         dim3 block(32, WARPS_PER_BLOCK);
+         int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+-        dim3 grid(num_kv_blocks, n_batch, n_stream);
++        dim3 grid(num_kv_blocks, vec_batch_blocks(num_kv_blocks), n_stream);
+ 
+         LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
+         LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)

@@ -87,11 +87,12 @@ function buildAnswer(answer, cost) {
   }
   mount(probs, rows);
 
-  const whole = cost.read + cost.reused;
-  const share = whole ? Math.round((100 * cost.reused) / whole) : 0;
+  const read = cost.read ?? 0, reused = cost.reused ?? 0;
+  const whole = read + reused;
+  const share = whole ? Math.round((100 * reused) / whole) : 0;
   pick(frag, "cost").textContent =
-    `${cost.backend} · ${cost.took.toFixed(1)} s · `
-    + `${cost.reused} of ${whole} prompt tokens reused (${share}%)`;
+    `${cost.backend ?? ""} · ${(cost.took ?? 0).toFixed(1)} s · `
+    + `${reused} of ${whole} prompt tokens reused (${share}%)`;
 
   // How much of the model's own next token the answers held. Low means it
   // wanted to write something else, and the bars above are what was left.
@@ -111,6 +112,21 @@ function buildNote(text) {
   const frag = tpl("tpl-tryitout-empty");
   pick(frag, "text").textContent = text;
   return frag;
+}
+
+/** What to paint for one reply. A proxy in front of a backend answers 200
+ *  with a foreign body, and mounting `said.answers.it` out of it threw before
+ *  any note was shown. `{ note }` means show that note; `{ answer, cost }`
+ *  means mount the answer. @param {boolean} ok @param {number} status
+ *  @param {any} said @returns {{ note: string } | { answer: Answer, cost: any }} */
+export function replyShape(ok, status, said) {
+  if (!ok) {
+    return { note: said?.error?.message ?? `the router said ${status}` };
+  }
+  if (!said?.answers?.it || !said?.router) {
+    return { note: "the reply had no answer in it" };
+  }
+  return { answer: said.answers.it, cost: said.router };
 }
 
 export default {
@@ -167,12 +183,15 @@ export default {
           body: JSON.stringify(body),
           signal,
         }));
-        const said = await reply.json();
-        if (!reply.ok) {
-          mount(result, buildNote(said?.error?.message ?? `the router said ${reply.status}`));
+        // A proxy in front of a backend answers 200 with a foreign body, so
+        // parse defensively and check the shape before mounting anything.
+        const said = await reply.json().catch(() => null);
+        const shaped = replyShape(reply.ok, reply.status, said);
+        if ("note" in shaped) {
+          mount(result, buildNote(shaped.note));
           return;
         }
-        mount(result, buildAnswer(said.answers.it, said.router));
+        mount(result, buildAnswer(shaped.answer, shaped.cost));
       } catch (err) {
         if (signal.aborted) return;        // the view was left, not a failure
         mount(result, buildNote(String(err)));

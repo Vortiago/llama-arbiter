@@ -53,6 +53,29 @@ class TheCountersAreTheBareOnes(unittest.TestCase):
         self.assertEqual(router.counters("a lots\nb 2\n"), {"b": 2.0})
 
 
+class HowFastABackendReads(unittest.TestCase):
+    """The lifetime prompt rate, from the bare counters. The router ranks
+    readers by it, so a reset of the dashboard's averages must not move it."""
+
+    def test_tokens_read_over_the_seconds_spent_reading(self):
+        self.assertEqual(router.read_rate(router.counters(METRICS)), 100.0)
+
+    def test_nothing_before_a_second_of_reading(self):
+        self.assertIsNone(router.read_rate({"prompt_tokens_total": 12,
+                                            "prompt_seconds_total": 0.5}))
+
+    def test_nothing_from_a_backend_that_has_not_answered(self):
+        self.assertIsNone(router.read_rate({}))
+
+    def test_nothing_from_a_few_short_prompts(self):
+        """Per-request overhead dominates a short prompt. koishi's gpu read
+        46 tokens of smoke tests in 1.5 s, 30 tokens/s, and ranked below the
+        cpus (35) it reads three times as fast as; never chosen, it never
+        read enough to be measured again."""
+        self.assertIsNone(router.read_rate({"prompt_tokens_total": 46,
+                                            "prompt_seconds_total": 1.5}))
+
+
 class TheStatsAreWhatTheDashboardShows(unittest.TestCase):
     """The counters are lifetime totals. These are the figures a reader
     compares two backends with."""
@@ -115,6 +138,7 @@ class WhatIsLeftToReadIsWhatTheDashboardCountsDown(unittest.TestCase):
             [slot(n_prompt_tokens_total=1000, n_prompt_tokens_cache=600,
                   n_prompt_tokens_processed=100)], {}, 10.0, 100.0)
         self.assertEqual(detail[0]["prompt"], 300)
+        self.assertEqual(detail[0]["whole"], 1000)
 
     def test_an_unpatched_backend_falls_back_to_what_it_does_report(self):
         """n_prompt_tokens grows with every token generated, so the generated
@@ -124,6 +148,7 @@ class WhatIsLeftToReadIsWhatTheDashboardCountsDown(unittest.TestCase):
         row["n_prompt_tokens"] = 1000
         _, detail = router.slot_state([row], {}, 10.0, 100.0)
         self.assertEqual(detail[0]["prompt"], 350)     # 1000 - 50 - 600
+        self.assertIsNone(detail[0]["whole"], "the fallback is not the prompt's size")
 
     def test_a_slot_says_which_of_the_three_things_it_is_doing(self):
         idle = router.slot_state([slot(is_processing=False)], {}, 10.0, 1.0)[1]

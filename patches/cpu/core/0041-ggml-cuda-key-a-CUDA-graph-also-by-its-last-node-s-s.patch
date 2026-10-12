@@ -1,0 +1,76 @@
+From 6d4e62bdb514c12059711633783ffb518732c264 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 11:12:44 +0200
+Subject: [PATCH] ggml-cuda: key a CUDA graph also by its last node's shape
+
+One split of 49 still shared its entry between the prompt and the
+verify shapes: its first node clears the recurrent rows of new
+sequences (a SCALE on a view of cache_ple_r_l1). The view has 0
+elements in every batch but the first ubatch of a sequence, so a second
+prompt ubatch and a verify batch had the same key, and that split ran
+directly after every prompt and captured on the next step. The last
+node of a split carries the batch size, so the key now holds the shapes
+of the first and the last node.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-cuda/common.cuh   | 14 +++++++-------
+ ggml/src/ggml-cuda/ggml-cuda.cu |  3 ++-
+ 2 files changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 269d275b0..1b516b8e8 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1292,12 +1292,12 @@ struct ggml_cuda_graph {
+ #endif
+ };
+ 
+-// A graph is keyed by its first node and that node's shape. The first node of a split is the
+-// same tensor for a prompt batch and a generate batch, but its shape differs, so the two
+-// shapes keep separate CUDA graphs and a prompt does not overwrite the generate graphs.
++// A graph is keyed by its first node and the shapes of its first and last nodes. The first node
++// of a split is the same tensor for a prompt batch and a generate batch, but the shapes differ,
++// so the two keep separate CUDA graphs and a prompt does not overwrite the generate graphs.
+ struct ggml_cuda_graph_key {
+     const void * node = nullptr;
+-    int64_t      ne[GGML_MAX_DIMS] = {};
++    int64_t      ne[2][GGML_MAX_DIMS] = {};
+ 
+     bool operator==(const ggml_cuda_graph_key & other) const {
+         return node == other.node && memcmp(ne, other.ne, sizeof(ne)) == 0;
+@@ -1307,8 +1307,8 @@ struct ggml_cuda_graph_key {
+ struct ggml_cuda_graph_key_hash {
+     size_t operator()(const ggml_cuda_graph_key & key) const {
+         size_t h = std::hash<const void *>()(key.node);
+-        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+-            h ^= std::hash<int64_t>()(key.ne[i]) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
++        for (int i = 0; i < 2*GGML_MAX_DIMS; ++i) {
++            h ^= std::hash<int64_t>()(key.ne[i/GGML_MAX_DIMS][i%GGML_MAX_DIMS]) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+         }
+         return h;
+     }
+@@ -1482,7 +1482,7 @@ public:
+     int curr_stream_no = 0;
+ 
+ #ifdef USE_CUDA_GRAPH
+-    // Map from the first node and its shape to cuda_graph - allows multiple graphs per context
++    // Map from the first node and the first and last shapes to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+     std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index af0792de2..d55041b08 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2689,7 +2689,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+ static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+     ggml_cuda_graph_key key;
+     key.node = cgraph->nodes[0];
+-    memcpy(key.ne, cgraph->nodes[0]->ne, sizeof(key.ne));
++    memcpy(key.ne[0], cgraph->nodes[0]->ne, sizeof(key.ne[0]));
++    memcpy(key.ne[1], cgraph->nodes[cgraph->n_nodes - 1]->ne, sizeof(key.ne[1]));
+     return key;
+ }
+ 

@@ -1,0 +1,272 @@
+server: a slot file carries the draft context's KV, and checkpoints keep the MTP head's h
+
+A slot file held only the target context's state. The MTP draft keeps its
+own KV over the prompt, so a slot restored on another server drafted over an
+empty or another conversation's draft KV, and fewer drafts were accepted.
+The save now appends the draft's sequence state after the checkpoints (magic
+"QDFT"), and the restore loads it; a file without the block restores with
+the draft KV cleared. A context checkpoint also keeps the MTP head's pending
+hidden state, so the token re-read after a checkpoint restore is paired with
+the right one. scripts/server-test-restore-draft.py checks that a restored
+slot drafts exactly as the server that saved it.
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index a7f095a12..5ccef258b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1501,6 +1501,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         verify_h_rows.assign(n_seq, 0);
+     }
+ 
++    // A context checkpoint keeps the target's h for its last position. The next
++    // process() pairs its first token with it. Without this, a restored
++    // checkpoint paired that token with the h of whatever ran last.
++    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
++            return false;
++        }
++        data.resize((size_t) n_embd * sizeof(float));
++        std::memcpy(data.data(), pending_h[seq_id].data(), data.size());
++        return true;
++    }
++
++    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
++        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.size() != (size_t) n_embd * sizeof(float)) {
++            return;
++        }
++        std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
++    }
++
+     ~common_speculative_impl_draft_mtp() override {
+         auto * ctx_dft = this->params.ctx_dft;
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+diff --git a/scripts/server-test-restore-draft.py b/scripts/server-test-restore-draft.py
+new file mode 100755
+index 000000000..dcb6f4763
+--- /dev/null
++++ b/scripts/server-test-restore-draft.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""A slot restored from a file must draft as well as the server that saved it.
++
++Server A reads a long prompt and answers it twice. The second answer starts
++from a context checkpoint, the way a warm slot does. A saves the slot to a
++file and stops. A fresh server B restores that file and answers the same
++prompt. At temperature 0 the target writes the same text in both cases, so
++the draft must be accepted the same number of times. Before the fix, B's draft
++context held no KV for the restored prompt, and B accepted fewer drafts.
++
++    scripts/server-test-restore-draft.py --server build/bin/llama-server \
++        --model M.gguf --model-draft MTP.gguf --prompt-file text.txt -- <server args>
++
++Exit 0 when B drafts like A, 1 when it does not.
++"""
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import tempfile
++import time
++import urllib.request
++
++
++def call(port, path, body, timeout=900):
++    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(),
++                                 {"Content-Type": "application/json"})
++    with urllib.request.urlopen(req, timeout=timeout) as r:
++        return json.load(r)
++
++
++def start(args, slot_dir, log_path):
++    cmd = [args.server, "--model", args.model, "--model-draft", args.model_draft,
++           "--spec-type", "draft-mtp", "--spec-draft-n-max", "3",
++           "--parallel", "1", "--cache-ram", "0", "--slot-save-path", slot_dir + "/",
++           "--host", "127.0.0.1", "--port", str(args.port)] + args.extra
++    log = open(log_path, "w")
++    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
++    for _ in range(1200):
++        if proc.poll() is not None:
++            sys.exit(f"server exited, see {log_path}")
++        try:
++            with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/health", timeout=2):
++                return proc
++        except Exception:
++            time.sleep(0.5)
++    proc.kill()
++    sys.exit(f"server did not come up, see {log_path}")
++
++
++def stop(proc):
++    proc.terminate()
++    proc.wait(timeout=120)
++
++
++def ask(args, text, tag):
++    d = call(args.port, "/v1/chat/completions", {
++        "messages": [{"role": "user", "content": text}],
++        "max_tokens": args.n_predict, "temperature": 0,
++        "chat_template_kwargs": {"enable_thinking": False}})
++    t = d["timings"]
++    steps = max(1, t["draft_n"] / 3)
++    print(f"{tag:12s} cache {t['cache_n']:5d} read {t['prompt_n']:5d}, gen {t['predicted_n']}, "
++          f"{t['predicted_per_second']:.2f} tok/s, {t['predicted_ms'] / steps:.1f} ms/step, "
++          f"accepted {t['draft_n_accepted']}/{t['draft_n']}", flush=True)
++    return d["choices"][0]["message"]["content"], t["draft_n_accepted"], t["draft_n"]
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--server", required=True)
++    ap.add_argument("--model", required=True)
++    ap.add_argument("--model-draft", required=True)
++    ap.add_argument("--prompt-file", required=True)
++    ap.add_argument("--prompt-chars", type=int, default=6000)
++    ap.add_argument("--n-predict", type=int, default=128)
++    ap.add_argument("--port", type=int, default=8097)
++    ap.add_argument("--work-dir", default=None)
++    ap.add_argument("extra", nargs="*")
++    args = ap.parse_args()
++
++    work = args.work_dir or tempfile.mkdtemp(prefix="restore-draft-")
++    slot_dir = os.path.join(work, "slots")
++    os.makedirs(slot_dir, exist_ok=True)
++    text = open(args.prompt_file).read()[:args.prompt_chars] + \
++        "\n\nSummarize the text above in about 120 words."
++
++    a = start(args, slot_dir, os.path.join(work, "server-a.log"))
++    try:
++        ask(args, text, "A read")
++        want = ask(args, text, "A warm")
++        saved = call(args.port, "/slots/0?action=save", {"filename": "p.bin"})
++        print(f"saved {saved.get('n_saved')} tokens, {saved.get('n_written')} bytes")
++    finally:
++        stop(a)
++
++    b = start(args, slot_dir, os.path.join(work, "server-b.log"))
++    try:
++        got = call(args.port, "/slots/0?action=restore", {"filename": "p.bin"})
++        print(f"restored {got.get('n_restored')} tokens, {got.get('n_read')} bytes")
++        have = ask(args, text, "B restored")
++    finally:
++        stop(b)
++
++    if have[0] != want[0]:
++        print("FAIL: the target wrote different text after the restore")
++        return 1
++    if have[1:] != want[1:]:
++        print(f"FAIL: drafts accepted {have[1]}/{have[2]} after the restore, "
++              f"{want[1]}/{want[2]} on the server that read the prompt")
++        return 1
++    print("PASS: the restored slot drafts like the server that read the prompt")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a293beff0..cf739cb23 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -969,6 +969,58 @@ static size_t ckpt_load(const std::string & path, size_t offset,
+     return after > (long) offset ? (size_t) (after - offset) : 0;
+ }
+ 
++// The draft context holds its own KV for the prompt (an MTP head attends over
++// it). The state file above carries only the target's, so a slot restored on
++// another server drafted over an empty or foreign draft KV, and fewer drafts
++// were accepted. This block carries the draft's sequence state after the
++// checkpoints, the way the in-memory prompt cache carries it.
++static const uint32_t DRAFT_MAGIC = 0x54464451; // "QDFT"
++
++// Returns the bytes appended.
++static size_t draft_save(const std::string & path, llama_context * ctx_dft, llama_seq_id seq_id) {
++    if (ctx_dft == nullptr) {
++        return 0;
++    }
++    std::vector<uint8_t> blob(llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE));
++    blob.resize(llama_state_seq_get_data_ext(ctx_dft, blob.data(), blob.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE));
++    FILE * f = fopen(path.c_str(), "ab");
++    if (!f) {
++        return 0;
++    }
++    const long before = ftell(f);
++    fwrite(&DRAFT_MAGIC, sizeof(DRAFT_MAGIC), 1, f);
++    ckpt_write_blob(f, blob);
++    const long after = ftell(f);
++    fclose(f);
++    return after > before ? (size_t) (after - before) : 0;
++}
++
++// Loads the draft block at `offset` into `ctx_dft`, and returns its bytes. A
++// file without one leaves the draft with no KV for this sequence: KV from an
++// earlier conversation is not this prompt's.
++static size_t draft_load(const std::string & path, size_t offset, llama_context * ctx_dft, llama_seq_id seq_id) {
++    if (ctx_dft == nullptr) {
++        return 0;
++    }
++    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
++    FILE * f = fopen(path.c_str(), "rb");
++    if (!f) {
++        return 0;
++    }
++    uint32_t magic = 0;
++    std::vector<uint8_t> blob;
++    const bool ok = fseek(f, (long) offset, SEEK_SET) == 0 &&
++                    fread(&magic, sizeof(magic), 1, f) == 1 && magic == DRAFT_MAGIC &&
++                    ckpt_read_blob(f, blob);
++    const long after = ftell(f);
++    fclose(f);
++    if (!ok || llama_state_seq_set_data_ext(ctx_dft, blob.data(), blob.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) != blob.size()) {
++        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
++        return 0;
++    }
++    return after > (long) offset ? (size_t) (after - offset) : 0;
++}
++
+ struct server_context_impl {
+     friend struct server_context;
+ 
+@@ -2880,6 +2932,7 @@ private:
+                     // cannot step back, and a restored slot must step back to
+                     // process even one token.
+                     const size_t nckpt = ckpt_save(filepath, slot->prompt.checkpoints);
++                    const size_t ndft  = nckpt ? draft_save(filepath, ctx_dft, slot->id) : 0;
+ 
+                     const int64_t t_end = ggml_time_us();
+                     const double t_save_ms = (t_end - t_start) / 1000.0;
+@@ -2892,7 +2945,7 @@ private:
+                     res->n_tokens = slot->prompt.tokens.size();
+                     // The trailer is part of the file, so report it. The
+                     // caller budgets disk against this number.
+-                    res->n_bytes  = nwrite + nckpt;
++                    res->n_bytes  = nwrite + nckpt + ndft;
+                     res->t_ms     = t_save_ms;
+                     queue_results.send(std::move(res));
+                 } break;
+@@ -2918,6 +2971,7 @@ private:
+ 
+                     size_t nread = 0;
+                     size_t nckpt = 0;
++                    size_t ndft  = 0;
+                     try {
+                         size_t n_packed = 0;
+                         llama_tokens packed;
+@@ -2944,6 +2998,7 @@ private:
+                         slot->prompt.clear();
+                         slot->prompt.tokens = std::move(restored);
+                         nckpt = ckpt_load(filepath, nread, slot->prompt.checkpoints);
++                        ndft  = draft_load(filepath, nread + nckpt, ctx_dft, slot->id);
+                     } catch (const std::exception & err) {
+                         slot->prompt_clear();
+                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
+@@ -2962,7 +3017,7 @@ private:
+                     // The trailer is part of the file, as it is on the save
+                     // side. Reporting only the state made a restore look
+                     // smaller than the save it came from.
+-                    res->n_bytes  = nread + nckpt;
++                    res->n_bytes  = nread + nckpt + ndft;
+                     res->t_ms     = t_restore_ms;
+                     queue_results.send(std::move(res));
+                 } break;

@@ -243,6 +243,36 @@ class SeveralQuestionsOneState(TypedCall):
                                f"{step['question']} read the state again")
 
 
+class TheSameCaseAskedAgain(TypedCall):
+    """A typed call's conversation is its rubric and its state, so a repeat of
+    the same case is the same conversation, and its copy saves the read.
+
+    The client never continues it, but it asks the same state again. On
+    koishi, 7 October 09:30 to 8 October 08:00: 278 of 440 typed-question
+    copies were recalled, and a recalled call kept a cpu1 backend 47 s against
+    94 s for a cold one. A park cost 1 s. The copy is kept on that evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self.ask(CHOICE, state="case one")
+        self.ask(CHOICE, state="case two")      # takes case one's only slot
+        self.reply = self.ask(CHOICE, state="case one")
+
+    def test_the_first_case_was_parked_before_the_second_took_its_slot(self):
+        self.assertEqual(len(self.solo.saves), 2,
+                         "a case was not copied out before the next one")
+
+    def test_the_repeat_restores_its_copy(self):
+        self.assertEqual(len(self.solo.saves), 2)
+        self.assertEqual(self.solo.restores, [self.solo.saves[0]],
+                         "the repeat did not come back from its copy")
+
+    def test_the_repeat_reads_none_of_its_state_again(self):
+        first, repeat = self.solo.probes[0], self.solo.probes[-1]
+        self.assertEqual(repeat["cached"], first["read"] + first["cached"],
+                         "the repeat read part of its state again")
+
+
 class ItStaysWhereItRead(EndToEnd):
     """A gpu that only generates, and a cpu that only reads.
 
@@ -277,6 +307,44 @@ class ItStaysWhereItRead(EndToEnd):
         """The same pool and the same router, on the chat endpoint."""
         self.turn(self.url, "talker")
         self.assertEqual([c["key"] for c in self.gpu.answers], ["talker"])
+
+
+class AReaderForSomePathsOnly(EndToEnd):
+    """`prefill` may name the paths a backend reads for.
+
+    A gpu that reads only typed questions is still where a chat turn read
+    on a cpu generates. A typed question writes one token, so it answers
+    where it was read."""
+
+    def setUp(self):
+        super().setUp()
+        self.duo = self.pool([self.stub("gpu", 0, prefill=[router.SYSTEMONE]),
+                              self.stub("cpu", 1)])
+        self.url = self.serve(self.duo)
+
+    def test_a_typed_question_reads_and_answers_there(self):
+        """Here the cpu is busy reading a chat turn. Neither has a measured
+        rate, so nothing holds the gpu back for that turn."""
+        self.cpu.hold()
+        self.start_turn(self.url, "talker")
+        self.assertTrue(wait_for(lambda: self.backend(self.duo, "cpu")["busy"] == 1),
+                        "the chat turn never reached the cpu")
+        try:
+            said = typed_call(self.url, {
+                "model": "fake-model", "prompt_cache_key": "asker",
+                "state": "cpu1_0 read 150000 tokens",
+                "questions": {"ok": {"instructions": "Healthy?"}}})
+        finally:
+            self.cpu.release()
+        self.assertEqual(said["router"]["backend"], "gpu")
+        self.assertEqual([c["key"] for c in self.gpu.probes], ["asker"])
+
+    def test_a_chat_turn_reads_elsewhere_and_still_generates_there(self):
+        self.turn(self.url, "talker")
+        self.assertEqual([c["key"] for c in self.cpu.probes], ["talker"])
+        self.assertEqual(self.gpu.probes, [], "the gpu read a chat prompt")
+        self.assertEqual([c["key"] for c in self.gpu.answers], ["talker"],
+                         "the gpu is no longer the chat generator")
 
 
 class UnlessTheReaderMayNotAnswer(EndToEnd):

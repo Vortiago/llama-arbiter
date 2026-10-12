@@ -1,0 +1,664 @@
+From 25504e6aa82717a687f9c36fcf0ec26da60e17fa Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 05:31:16 +0200
+Subject: [PATCH] ggml-backend: compute a CPU split after the next GPU split is
+ queued behind a host gate
+
+The host-function version (previous commit) ran the CPU split on CUDA's
+callback thread: the gap before each graph went, but the split computed
+slower there and the callback added latency.
+
+Now the scheduler's thread keeps the CPU split. When a CPU split reads
+only copies from the GPU split before it, and the GPU split after it
+reads only copies from pinned host memory, the thread queues on the GPU:
+the input copies, an event, a host gate (cuStreamWaitValue32 on a mapped
+host word), the next split's input copies and its CUDA graph. Then it
+waits for the event, computes the CPU split and opens the gate. The card
+starts the next graph a few us after the host is done, with no launch in
+between.
+
+The thread must not wait for the stream while the gate is closed. A
+first kernel launch can load its module and wait for the device: the
+warm-up decode of llama-perplexity hung in cudaFuncGetAttributes
+(sum_rows) behind the gate. So the CUDA backend gates only a graph that
+will launch as its instantiated CUDA graph, unchanged and used in the
+last 5 s; host functions are no longer used.
+
+Exact: perplexity identical, test-backend-sched-host same bits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-backend-impl.h             |   8 +-
+ ggml/src/ggml-backend-meta.cpp           |   3 +-
+ ggml/src/ggml-backend.cpp                | 153 ++++++++++-------------
+ ggml/src/ggml-blas/ggml-blas.cpp         |   3 +-
+ ggml/src/ggml-cann/ggml-cann.cpp         |   3 +-
+ ggml/src/ggml-cpu/ggml-cpu.cpp           |   3 +-
+ ggml/src/ggml-cuda/common.cuh            |   5 +
+ ggml/src/ggml-cuda/ggml-cuda.cu          |  77 +++++++++++-
+ ggml/src/ggml-et/ggml-et.cpp             |   3 +-
+ ggml/src/ggml-hexagon/ggml-hexagon.cpp   |   3 +-
+ ggml/src/ggml-metal/ggml-metal.cpp       |   3 +-
+ ggml/src/ggml-opencl/ggml-opencl.cpp     |   3 +-
+ ggml/src/ggml-openvino/ggml-openvino.cpp |   3 +-
+ ggml/src/ggml-rpc/ggml-rpc.cpp           |   3 +-
+ ggml/src/ggml-sycl/ggml-sycl.cpp         |   3 +-
+ ggml/src/ggml-virtgpu/ggml-backend.cpp   |   3 +-
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp     |   3 +-
+ ggml/src/ggml-webgpu/ggml-webgpu.cpp     |   3 +-
+ ggml/src/ggml-zdnn/ggml-zdnn.cpp         |   3 +-
+ ggml/src/ggml-zendnn/ggml-zendnn.cpp     |   3 +-
+ 20 files changed, 184 insertions(+), 107 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 33921ac1e..46b29e04a 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -155,9 +155,11 @@ extern "C" {
+         // (optional) sort/optimize the nodes in the graph
+         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+ 
+-        // (optional) queue a call of func(data) on the host: it runs after the work queued before it,
+-        // and the work queued after it waits for it to return; func must not call this backend
+-        void (*launch_host_func)(ggml_backend_t backend, void (*func)(void * data), void * data);
++        // (optional) hold the work queued after this call until the host calls host_gate_open, so the
++        // host can queue the graph `next` before it computes the inputs of `next`; returns false and
++        // queues nothing if queueing `next` could make the host wait for this backend
++        bool (*host_gate_wait)(ggml_backend_t backend, const struct ggml_cgraph * next);
++        void (*host_gate_open)(ggml_backend_t backend);
+     };
+ 
+     struct ggml_backend {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 706169daa..cb7db3534 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2494,7 +2494,8 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .event_record            = */ nullptr,
+     /* .event_wait              = */ nullptr,
+     /* .graph_optimize          = */ nullptr,
+-    /* .launch_host_func        = */ nullptr,
++    /* .host_gate_wait          = */ nullptr,
++    /* .host_gate_open          = */ nullptr,
+ };
+ 
+ bool ggml_backend_is_meta(ggml_backend_t backend) {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 8be13c18f..ef3b055b8 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,8 +20,6 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
+-#include <condition_variable>
+-#include <mutex>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -923,17 +921,8 @@ struct ggml_backend_sched_split {
+     int inputs_capacity;
+     // graph view of this split
+     struct ggml_cgraph graph;
+-    // a split queued to run on the host from another backend's queue: its backend and its result
+-    ggml_backend_t       host_backend;
+-    enum ggml_status     host_status;
+ };
+ 
+-// runs a split queued with launch_host_func
+-static void ggml_backend_sched_host_split(void * data) {
+-    struct ggml_backend_sched_split * split = (struct ggml_backend_sched_split *) data;
+-    split->host_status = ggml_backend_graph_compute_async(split->host_backend, &split->graph);
+-}
+-
+ struct ggml_backend_sched {
+     bool is_reset; // true if the scheduler has been reset since the last graph split
+     bool is_alloc;
+@@ -970,6 +959,8 @@ struct ggml_backend_sched {
+     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+     // marks the end of the copies a backend reads from host memory, created on first use
+     ggml_backend_event_t host_read_events[GGML_SCHED_MAX_BACKENDS];
++    // marks the end of the copies a host split reads from a backend, created on first use
++    ggml_backend_event_t host_ready_events[GGML_SCHED_MAX_BACKENDS];
+     struct ggml_tensor ** graph_inputs;
+     int n_graph_inputs;
+     int graph_inputs_capacity;
+@@ -1822,24 +1813,6 @@ static bool ggml_backend_sched_queued_host_copy(ggml_backend_t split_backend, co
+         input_cpy->buffer->buft == ggml_backend_get_default_buffer_type(split_backend);
+ }
+ 
+-// wait for a backend with queued host splits: asleep, so that the host splits keep every core
+-static void ggml_backend_sched_wait_host_queue(ggml_backend_t backend) {
+-    struct waiter {
+-        std::mutex              mutex;
+-        std::condition_variable cv;
+-        bool                    done = false;
+-    } w;
+-    backend->iface.launch_host_func(backend, [](void * data) {
+-        waiter * w = (waiter *) data;
+-        std::lock_guard<std::mutex> lock(w->mutex);
+-        w->done = true;
+-        w->cv.notify_one();
+-    }, &w);
+-    std::unique_lock<std::mutex> lock(w.mutex);
+-    w.cv.wait(lock, [&] { return w.done; });
+-    ggml_backend_synchronize(backend);
+-}
+-
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1853,53 +1826,61 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     // backends that read host memory in a queued copy during this call
+     bool reads_host[GGML_SCHED_MAX_BACKENDS] = { false };
+ 
+-    // A host split that only reads the outputs of the split before it, from a backend that can queue
+-    // a host function, is queued there behind the copies of its inputs; the split after it then reads
+-    // its outputs in copies queued behind it. The calling thread does not wait for the backend between
+-    // the splits, and so queues the next splits while the host computes.
+-    // host_queue is the backend with queued host splits that the calling thread has not waited for.
+-    int host_queue = -1;
+-    bool host_splits = false;
++    // A host split that only reads the outputs of the split before it, on a backend with a host gate,
++    // and whose next split runs on that backend again and reads only copies from host memory, is
++    // computed late. The calling thread queues the copies of its inputs, then the gate, then the next
++    // split behind the gate. Then it waits for the input copies, computes the host split and opens the
++    // gate, and the backend starts the next split without waiting for the host to queue it.
++    // late_split is that host split while its gate is closed.
++    int late_split = -1;
+ 
+-    auto queue_on_host = [&](int split_id) -> int {
++    auto can_compute_late = [&](int split_id) -> bool {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+-        if (sched->callback_eval || split_id == 0 || split->n_inputs == 0 ||
++        if (sched->callback_eval || split_id == 0 || split_id + 1 >= sched->n_splits || split->n_inputs == 0 ||
+             ggml_backend_dev_type(ggml_backend_get_device(sched->backends[split->backend_id])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+-            return -1;
++            return false;
+         }
+         const int q = splits[split_id - 1].backend_id;
+         ggml_backend_t qb = sched->backends[q];
+-        if (q == split->backend_id || (host_queue >= 0 && host_queue != q) ||
+-            qb->iface.launch_host_func == NULL || qb->iface.get_tensor_async == NULL) {
+-            return -1;
++        struct ggml_backend_sched_split * next = &splits[split_id + 1];
++        if (q == split->backend_id || next->backend_id != q || next->n_inputs == 0 ||
++            qb->iface.host_gate_wait == NULL || qb->iface.get_tensor_async == NULL) {
++            return false;
+         }
+-        // every input is a queued copy from the queue's own buffer to host memory
++        // every input is a queued copy from the backend's own buffer to host memory
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+             if ((input->flags & GGML_TENSOR_FLAG_INPUT) || ggml_backend_sched_get_tensor_backend(sched, input) != qb ||
+                 ggml_backend_buffer_is_host(input->buffer) || !ggml_backend_buffer_is_host(input_cpy->buffer) ||
+                 input->buffer->buft != ggml_backend_get_default_buffer_type(qb)) {
+-                return -1;
++                return false;
+             }
+         }
+-        return q;
+-    };
+-
+-    // a split on the queue whose inputs from host memory are all queued copies needs no wait
+-    auto reads_after_host = [&](int split_id) -> bool {
+-        struct ggml_backend_sched_split * split = &splits[split_id];
+-        if (split->backend_id != host_queue || split->n_inputs == 0) {
+-            return false;
+-        }
+-        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+-            struct ggml_tensor * input = split->inputs[input_id];
+-            if (!ggml_backend_sched_queued_host_copy(sched->backends[host_queue], input,
+-                    tensor_copy(input, split->backend_id, sched->cur_copy))) {
++        // every input of the next split is a queued copy from host memory
++        for (int input_id = 0; input_id < next->n_inputs; input_id++) {
++            struct ggml_tensor * input = next->inputs[input_id];
++            if (!ggml_backend_sched_queued_host_copy(qb, input, tensor_copy(input, q, sched->cur_copy))) {
+                 return false;
+             }
+         }
+-        return true;
++        if (sched->host_ready_events[q] == NULL) {
++            sched->host_ready_events[q] = ggml_backend_event_new(ggml_backend_get_device(qb));
++        }
++        return sched->host_ready_events[q] != NULL;
++    };
++
++    auto compute_late = [&]() -> enum ggml_status {
++        if (late_split < 0) {
++            return GGML_STATUS_SUCCESS;
++        }
++        struct ggml_backend_sched_split * split = &splits[late_split];
++        ggml_backend_t qb = sched->backends[splits[late_split - 1].backend_id];
++        late_split = -1;
++        ggml_backend_event_synchronize(sched->host_ready_events[ggml_backend_sched_backend_id(sched, qb)]);
++        enum ggml_status ec = ggml_backend_graph_compute_async(sched->backends[split->backend_id], &split->graph);
++        qb->iface.host_gate_open(qb);
++        return ec;
+     };
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+@@ -1907,12 +1888,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
+-        const int queue_id = queue_on_host(split_id);
+-        if (host_queue >= 0 && queue_id < 0 && !reads_after_host(split_id)) {
+-            ggml_backend_sched_wait_host_queue(sched->backends[host_queue]);
+-            host_queue = -1;
++        if (late_split >= 0 && split_id != late_split + 1) {
++            enum ggml_status ec = compute_late();
++            if (ec != GGML_STATUS_SUCCESS) {
++                return ec;
++            }
+         }
+-        split->host_backend = NULL;
++        const bool late = can_compute_late(split_id);
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+@@ -2072,26 +2054,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
+-        for (int b = 0; b < sched->n_backends && queue_id < 0; b++) {
+-            if (writes_host[b]) {
+-                ggml_backend_synchronize(sched->backends[b]);
++        if (late) {
++            // the input copies above are queued on the previous split's backend
++            const int q = splits[split_id - 1].backend_id;
++            ggml_backend_t qb = sched->backends[q];
++            ggml_backend_event_record(sched->host_ready_events[q], qb);
++            if (qb->iface.host_gate_wait(qb, &splits[split_id + 1].graph)) {
++                late_split = split_id;
+             }
+         }
+ 
+-        if (queue_id >= 0) {
+-            // the input copies above are queued on queue_id: the split runs behind them
+-            ggml_backend_t qb = sched->backends[queue_id];
+-            split->host_backend = split_backend;
+-            split->host_status  = GGML_STATUS_SUCCESS;
+-            qb->iface.launch_host_func(qb, ggml_backend_sched_host_split, split);
+-            host_queue  = queue_id;
+-            host_splits = true;
++        if (late_split != split_id) {
++            for (int b = 0; b < sched->n_backends; b++) {
++                if (writes_host[b]) {
++                    ggml_backend_synchronize(sched->backends[b]);
++                }
++            }
++        }
++
++        if (late_split == split_id) {
++            // computed after the next split is queued
+         } else if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+-                if (host_queue >= 0) {
+-                    ggml_backend_sched_wait_host_queue(sched->backends[host_queue]);
+-                }
++                compute_late();
+                 return ec;
+             }
+         } else {
+@@ -2136,14 +2122,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
+-    if (host_queue >= 0) {
+-        ggml_backend_sched_wait_host_queue(sched->backends[host_queue]);
+-    }
+-    if (host_splits) {
+-        for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+-            if (splits[split_id].host_backend != NULL && splits[split_id].host_status != GGML_STATUS_SUCCESS) {
+-                return splits[split_id].host_status;
+-            }
++    {
++        enum ggml_status ec = compute_late();
++        if (ec != GGML_STATUS_SUCCESS) {
++            return ec;
+         }
+     }
+ 
+@@ -2243,6 +2225,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+             ggml_backend_event_free(sched->events[b][c]);
+         }
+         ggml_backend_event_free(sched->host_read_events[b]);
++        ggml_backend_event_free(sched->host_ready_events[b]);
+     }
+     ggml_gallocr_free(sched->galloc);
+     ggml_free(sched->ctx);
+diff --git a/ggml/src/ggml-blas/ggml-blas.cpp b/ggml/src/ggml-blas/ggml-blas.cpp
+index 8f1efc70f..f2e7e0fd8 100644
+--- a/ggml/src/ggml-blas/ggml-blas.cpp
++++ b/ggml/src/ggml-blas/ggml-blas.cpp
+@@ -276,7 +276,8 @@ static struct ggml_backend_i blas_backend_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_blas_guid(void) {
+diff --git a/ggml/src/ggml-cann/ggml-cann.cpp b/ggml/src/ggml-cann/ggml-cann.cpp
+index 363e71341..84401dc7d 100644
+--- a/ggml/src/ggml-cann/ggml-cann.cpp
++++ b/ggml/src/ggml-cann/ggml-cann.cpp
+@@ -2769,7 +2769,8 @@ static const ggml_backend_i ggml_backend_cann_interface = {
+     /* .event_record            = */ ggml_backend_cann_event_record,
+     /* .event_wait              = */ ggml_backend_cann_event_wait,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ /**
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index badaf8bae..d19c88eee 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -207,7 +207,8 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_cpu_guid(void) {
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 1b516b8e8..64a45ea86 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1470,6 +1470,11 @@ struct ggml_backend_cuda_context {
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
+ 
++    // host gate: a word in mapped host memory that the stream waits on (see host_gate_wait)
++    uint32_t * gate_host  = nullptr;
++    void     * gate_dev   = nullptr;
++    uint32_t   gate_waits = 0;
++
+ private:
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+     bool stream_used[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a9c87b10d..554d93bdf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -700,6 +700,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    if (gate_host != nullptr) {
++        CUDA_CHECK(cudaFreeHost(gate_host));
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -5064,11 +5067,78 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     }
+ }
+ 
+-static void ggml_backend_cuda_launch_host_func(ggml_backend_t backend, void (*func)(void * data), void * data) {
++// true if computing cgraph would only launch its CUDA graph, unchanged: that calls nothing that can
++// wait for the stream (a first kernel launch, for example, can load a module and wait for the device)
++static bool ggml_cuda_graph_ready(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
++#ifdef USE_CUDA_GRAPH
++    auto it = cuda_ctx->cuda_graphs.find(ggml_cuda_graph_get_key(cgraph));
++    if (it == cuda_ctx->cuda_graphs.end()) {
++        return false;
++    }
++    const ggml_cuda_graph * graph = it->second.get();
++    // cuda_graph() evicts a graph unused for 10 s: one used in the last 5 s stays
++    if (!graph->is_enabled() || !graph->warmup_complete || graph->instance == nullptr ||
++        ggml_time_us() - graph->last_used_time >= 5'000'000 || !ggml_cuda_graph_check_compability(cgraph)) {
++        return false;
++    }
++    if (cgraph->uid != 0 && cgraph->uid == graph->uid) {
++        return true;
++    }
++    if ((int) graph->node_props.size() != cgraph->n_nodes) {
++        return false;
++    }
++    // the same test as ggml_cuda_graph_update_required, without the update
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        ggml_cuda_graph::node_properties prop = {};
++        memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
++        for (int j = 0; j < GGML_MAX_SRC; ++j) {
++            if (cgraph->nodes[i]->src[j]) {
++                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
++                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
++                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
++            }
++        }
++        if (memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
++            return false;
++        }
++    }
++    return true;
++#else
++    GGML_UNUSED(cuda_ctx);
++    GGML_UNUSED(cgraph);
++    return false;
++#endif // USE_CUDA_GRAPH
++}
++
++static bool ggml_backend_cuda_host_gate_wait(ggml_backend_t backend, const ggml_cgraph * next) {
++#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++    GGML_UNUSED(backend);
++    GGML_UNUSED(next);
++    return false;
++#else
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+-    CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), func, data));
++    // the host queues next behind the gate before it opens the gate: queueing next must not wait for the stream
++    if (!ggml_cuda_graph_ready(cuda_ctx, const_cast<ggml_cgraph *>(next))) {
++        return false;
++    }
++    if (cuda_ctx->gate_host == nullptr) {
++        CUDA_CHECK(cudaHostAlloc(&cuda_ctx->gate_host, sizeof(uint32_t), cudaHostAllocMapped));
++        *cuda_ctx->gate_host = 0;
++        CUDA_CHECK(cudaHostGetDevicePointer(&cuda_ctx->gate_dev, cuda_ctx->gate_host, 0));
++    }
++    // the n-th wait holds the stream until the n-th open writes n
++    cuda_ctx->gate_waits++;
++    CU_CHECK(cuStreamWaitValue32(cuda_ctx->stream(), (CUdeviceptr) cuda_ctx->gate_dev, cuda_ctx->gate_waits, CU_STREAM_WAIT_VALUE_GEQ));
++    return true;
++#endif
++}
++
++static void ggml_backend_cuda_host_gate_open(ggml_backend_t backend) {
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++
++    __atomic_store_n(cuda_ctx->gate_host, cuda_ctx->gate_waits, __ATOMIC_RELEASE);
+ }
+ 
+ static const ggml_backend_i ggml_backend_cuda_interface = {
+@@ -5088,7 +5158,8 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .event_record            = */ ggml_backend_cuda_event_record,
+     /* .event_wait              = */ ggml_backend_cuda_event_wait,
+     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+-    /* .launch_host_func        = */ ggml_backend_cuda_launch_host_func,
++    /* .host_gate_wait          = */ ggml_backend_cuda_host_gate_wait,
++    /* .host_gate_open          = */ ggml_backend_cuda_host_gate_open,
+ };
+ 
+ static ggml_guid_t ggml_backend_cuda_guid() {
+diff --git a/ggml/src/ggml-et/ggml-et.cpp b/ggml/src/ggml-et/ggml-et.cpp
+index ce004d273..e190804d5 100644
+--- a/ggml/src/ggml-et/ggml-et.cpp
++++ b/ggml/src/ggml-et/ggml-et.cpp
+@@ -1613,7 +1613,8 @@ static const struct ggml_backend_i ggml_backend_et_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static const char * ggml_backend_et_device_get_name(ggml_backend_dev_t dev) {
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 4c68d6d38..47efa098e 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -7887,7 +7887,8 @@ static struct ggml_backend_i hexagon_backend_i = {
+     /* .event_record            = */ ggml_backend_hexagon_event_record,
+     /* .event_wait              = */ ggml_backend_hexagon_event_wait,
+     /* .graph_optimize          = */ ggml_backend_hexagon_graph_optimize,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_hexagon_guid() {
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 84baae044..acc61051f 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -604,7 +604,8 @@ static ggml_backend_i ggml_backend_metal_i = {
+     /* .event_record            = */ ggml_backend_metal_event_record,
+     /* .event_wait              = */ ggml_backend_metal_event_wait,
+     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_metal_guid(void) {
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index a468ee28d..52a04f23b 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -9320,7 +9320,8 @@ static ggml_backend_i ggml_backend_opencl_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ ggml_backend_t ggml_backend_opencl_init(void) {
+diff --git a/ggml/src/ggml-openvino/ggml-openvino.cpp b/ggml/src/ggml-openvino/ggml-openvino.cpp
+index 1d7faa077..dc81f3ad0 100644
+--- a/ggml/src/ggml-openvino/ggml-openvino.cpp
++++ b/ggml/src/ggml-openvino/ggml-openvino.cpp
+@@ -896,7 +896,8 @@ static const ggml_backend_i ggml_backend_openvino_interface = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ int ggml_backend_openvino_get_device_count() {
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 3d6c102b8..0d993728f 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1086,7 +1086,8 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .event_record            = */ ggml_backend_rpc_event_record,
+     /* .event_wait              = */ ggml_backend_rpc_event_wait,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 43692964a..fb3f73155 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6360,7 +6360,8 @@ static ggml_backend_i ggml_backend_sycl_interface = {
+     /* .event_record            = */ ggml_backend_sycl_event_record,
+     /* .event_wait              = */ ggml_backend_sycl_event_wait,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_sycl_guid() {
+diff --git a/ggml/src/ggml-virtgpu/ggml-backend.cpp b/ggml/src/ggml-virtgpu/ggml-backend.cpp
+index b5456a52e..64f379155 100644
+--- a/ggml/src/ggml-virtgpu/ggml-backend.cpp
++++ b/ggml/src/ggml-virtgpu/ggml-backend.cpp
+@@ -47,7 +47,8 @@ static ggml_backend_i ggml_backend_remoting_interface = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ ggml_backend_remoting_graph_optimize,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_remoting_guid() {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 9d8488537..905e4099e 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15145,7 +15145,8 @@ static ggml_backend_i ggml_backend_vk_interface = {
+     /* .event_record            = */ ggml_backend_vk_event_record,
+     /* .event_wait              = */ ggml_backend_vk_event_wait,
+     /* .graph_optimize          = */ ggml_vk_graph_optimize,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_vk_guid() {
+diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+index b2e19750c..81bfa539f 100644
+--- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -3707,7 +3707,8 @@ static ggml_backend_i ggml_backend_webgpu_i = {
+     /* .event_record            = */ ggml_backend_webgpu_event_record,
+     /* .event_wait              = */ ggml_backend_webgpu_event_wait,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ /* End GGML Backend Interface */
+diff --git a/ggml/src/ggml-zdnn/ggml-zdnn.cpp b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
+index 1004f1eda..5230aec8a 100644
+--- a/ggml/src/ggml-zdnn/ggml-zdnn.cpp
++++ b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
+@@ -468,7 +468,8 @@ static ggml_backend_i ggml_backend_zdnn_i = {
+     /* .event_record           = */ NULL,
+     /* .event_wait             = */ NULL,
+     /* .graph_optimize         = */ NULL,
+-    /* .launch_host_func       = */ NULL,
++    /* .host_gate_wait         = */ NULL,
++    /* .host_gate_open         = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_zdnn_guid(void) {
+diff --git a/ggml/src/ggml-zendnn/ggml-zendnn.cpp b/ggml/src/ggml-zendnn/ggml-zendnn.cpp
+index c5c5607af..9ceb376b3 100644
+--- a/ggml/src/ggml-zendnn/ggml-zendnn.cpp
++++ b/ggml/src/ggml-zendnn/ggml-zendnn.cpp
+@@ -583,7 +583,8 @@ static struct ggml_backend_i ggml_backend_zendnn_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
+-    /* .launch_host_func        = */ NULL,
++    /* .host_gate_wait          = */ NULL,
++    /* .host_gate_open          = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_zendnn_guid(void) {

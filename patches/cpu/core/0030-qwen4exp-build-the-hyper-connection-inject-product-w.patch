@@ -1,0 +1,33 @@
+From 17ad8e0dcb730e80471d424cc02d58afa11de205 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 20:55:41 +0200
+Subject: [PATCH] qwen4exp: build the hyper-connection inject product with its
+ input
+
+The FFN mix's inject product is first read by the combine after the
+experts, so it landed in the next GPU split, after the CPU expert phase.
+There it quantized xn again and ran as its own 2-block launch. Put in the
+graph when it is made, it sits in the split of the down product of the
+same xn, and the CUDA backend runs both in one launch. Only the node
+order changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ src/models/qwen4exp.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 250eb74da..aa331db2e 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -362,6 +362,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     if (inject) {
+         *inject = build_lora_mm(w_inject, xn);
+         cb(*inject, "hc_inject", il);
++        // put it in the graph now, in the same GPU split as the down product of xn: its first reader
++        // comes after the experts, in the next split, where it would need its own quantized xn
++        ggml_build_forward_expand(gf, *inject);
+     }
+ 
+     return mixed;

@@ -46,8 +46,9 @@ One `llama-server` process. Each one prefills, generates, or does both.
 _Avoid_: instance, server, worker, node
 
 **Generator**:
-A backend that generates but never prefills. Turns move to it after another
-backend reads the prompt.
+The backend a turn moves to after another backend reads its prompt: the
+first in pref order that generates and comes before the reader. It may
+prefill as well.
 _Avoid_: writer, responder
 
 **Slot**:

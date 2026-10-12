@@ -1,0 +1,197 @@
+From 66e9e425adb495682046f7076b0dcb50e6a70480 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 10:43:52 +0200
+Subject: [PATCH] llama: re-reserve only when the backend sampling graph
+ changes
+
+llama-server detaches the sampler when a request ends and attaches a new
+chain for the next request. set_sampler() set sched_need_reserve for both, so
+every request with backend sampling paid a sched_reserve (about 37 ms on the
+gpu backend) and the scheduler re-plans after it.
+
+set_sampler() now stores a key per sequence: the bytes of the graph the chain
+builds on one row of n_vocab logits (ops, types, shapes, op params, flags and
+sources). sched_reserve() reserves when the keys differ from the keys at the
+last reserve. A new chain with the same graph (another seed, the same
+top_k/top_p/min_p/temp) keeps the reserve.
+
+set_sampler() also drops the active previous graph: it holds the old
+sampler's tensors, and a new chain can get the freed chain's address, so the
+pointer check in llm_graph_input_sampling::can_reuse() is not enough.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ src/llama-context.cpp | 22 +++++++++-----------
+ src/llama-context.h   |  4 ++++
+ src/llama-sampler.cpp | 47 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-sampler.h   |  5 +++++
+ 4 files changed, 66 insertions(+), 12 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1a444c9e5..5fd08c423 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -615,11 +615,13 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
+ }
+ 
+ void llama_context::sched_reserve() {
+-    if (!sched_need_reserve) {
++    // the samplers change with every request; reserve only when their graphs change
++    if (!sched_need_reserve && sampling.graph_keys == sampling.graph_keys_reserved) {
+         return;
+     }
+ 
+     sched_need_reserve = false;
++    sampling.graph_keys_reserved = sampling.graph_keys;
+ 
+     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+ 
+@@ -1293,16 +1295,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+ 
+     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
+ 
++    // a previous graph holds the old sampler's tensors, and a new sampler can get the old one's address
++    gf_res_prev_active = nullptr;
++
+     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+         static bool warned = false;
+         if (!warned) {
+             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
+             warned = true;
+         }
+-        if (sampling.samplers.count(seq_id) > 0) {
+-            sched_need_reserve = true;
+-        }
+         sampling.samplers.erase(seq_id);
++        sampling.graph_keys.erase(seq_id);
+         return false;
+     }
+ 
+@@ -1318,8 +1321,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+ 
+         sampling.samplers[seq_id] = sampler;
+-
+-        sched_need_reserve = true;
++        sampling.graph_keys[seq_id] = llama_sampler_backend_graph_key(sampler, model.vocab.n_tokens());
+ 
+         return true;
+     }
+@@ -1327,18 +1329,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+     if (sampler && !can_offload) {
+         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
+ 
+-        if (sampling.samplers.count(seq_id) > 0) {
+-            sched_need_reserve = true;
+-        }
+-
+         sampling.samplers.erase(seq_id);
++        sampling.graph_keys.erase(seq_id);
+ 
+         return false;
+     }
+ 
+     sampling.samplers.erase(seq_id);
+-
+-    sched_need_reserve = true;
++    sampling.graph_keys.erase(seq_id);
+ 
+     return true;
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 95b722628..c674d5627 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -318,6 +318,10 @@ private:
+         // !samplers.empty() to check if any samplers are active
+         std::map<llama_seq_id, llama_sampler *> samplers;
+ 
++        // the backend graph key of each sampler, now and at the last reserve
++        std::map<llama_seq_id, std::string> graph_keys;
++        std::map<llama_seq_id, std::string> graph_keys_reserved;
++
+         buffer_view<float>       logits     = {nullptr, 0};
+         buffer_view<llama_token> sampled    = {nullptr, 0};
+         buffer_view<float>       probs      = {nullptr, 0};
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 4c3eaafbf..b05f32848 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -634,6 +634,53 @@ static uint32_t llama_sampler_backend_probe_n_nodes(const llama_sampler_backend_
+     return std::max<uint32_t>(ggml_graph_n_nodes(probe.gf), n_tensors);
+ }
+ 
++std::string llama_sampler_backend_graph_key(llama_sampler * sampler, int64_t n_vocab) {
++    auto probe = llama_sampler_backend_probe_graph(sampler, n_vocab, GGML_DEFAULT_GRAPH_SIZE, false);
++
++    // the tensors of the probe context, in the order the sampler made them
++    std::unordered_map<const ggml_tensor *, int32_t> ids;
++    for (auto * t = ggml_get_first_tensor(probe.ctx.get()); t; t = ggml_get_next_tensor(probe.ctx.get(), t)) {
++        ids.emplace(t, (int32_t) ids.size());
++    }
++
++    std::string key;
++    const auto put = [&](const void * p, size_t n) { key.append((const char *) p, n); };
++
++    // a reference to a probe tensor is its index; a tensor the sampler owns is its layout and buffer type
++    const auto put_ref = [&](const ggml_tensor * t) {
++        const auto it = t ? ids.find(t) : ids.end();
++        const int32_t id = !t ? -1 : it != ids.end() ? it->second : -2;
++        put(&id, sizeof(id));
++        if (id == -2) {
++            ggml_backend_buffer_type_t buft = t->buffer ? ggml_backend_buffer_get_type(t->buffer) : nullptr;
++            put(&t->type, sizeof(t->type));
++            put(t->ne, sizeof(t->ne));
++            put(t->nb, sizeof(t->nb));
++            put(&buft, sizeof(buft));
++        }
++    };
++
++    for (auto * t = ggml_get_first_tensor(probe.ctx.get()); t; t = ggml_get_next_tensor(probe.ctx.get(), t)) {
++        put(&t->op,        sizeof(t->op));
++        put(&t->type,      sizeof(t->type));
++        put(t->ne,         sizeof(t->ne));
++        put(t->nb,         sizeof(t->nb));
++        put(t->op_params,  sizeof(t->op_params));
++        put(&t->flags,     sizeof(t->flags));
++        put(&t->view_offs, sizeof(t->view_offs));
++        put_ref(t->view_src);
++        for (int j = 0; j < GGML_MAX_SRC; ++j) {
++            put_ref(t->src[j]);
++        }
++    }
++
++    for (int i = 0; i < ggml_graph_n_nodes(probe.gf); ++i) {
++        put_ref(ggml_graph_node(probe.gf, i));
++    }
++
++    return key;
++}
++
+ // check if all ggml ops used by the sampler are supported by the backend
+ static bool llama_sampler_backend_support(
+         llama_sampler              * smpl,
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+index 9cd84dccb..d68837258 100644
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -2,6 +2,7 @@
+ 
+ #include "llama.h"
+ 
++#include <string>
+ #include <vector>
+ 
+ struct llama_vocab;
+@@ -37,6 +38,10 @@ struct llama_sampler_chain {
+ 
+ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+ 
++// the backend graph the sampler builds on one row of n_vocab logits, as bytes:
++// two samplers with the same key build the same graph
++std::string llama_sampler_backend_graph_key(llama_sampler * sampler, int64_t n_vocab);
++
+ struct llama_sampler * llama_sampler_init_dry_testing(
+         float   dry_multiplier,
+         float   dry_base,

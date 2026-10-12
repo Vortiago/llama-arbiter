@@ -1,0 +1,168 @@
+From ca0525c94bfe130c5f818d798f7da65445073992 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 11:54:58 +0200
+Subject: [PATCH] perf(ggml-cpu): chunk the work when the process runs on one
+ NUMA node
+
+ggml_is_numa() is true on any machine with two or more nodes, and the
+mul_mat, mul_mat_id, repack and two ops paths then split their work in
+fixed slices per thread instead of a shared chunk counter. That avoids a
+counter that moves between nodes. A process that numactl binds to one node
+has no such counter to move, and the fixed slices cost it the balance:
+the flat shared work list of MUL_MAT_ID (X3) never ran there at all.
+
+ggml_numa_init now counts the nodes that hold a CPU of the process's
+affinity, and ggml_numa_spans_nodes() is true only when that is more than
+one. The chunking sites use it. ggml_is_numa() keeps its meaning for the
+thread affinity and the model loader's mmap flags.
+
+On koishi (2x Xeon Gold 6150, one CPU-only server bound to node 0, 18
+threads, --numa numactl, Qwen3.8-Flash-Next Q8_0), two alternating rounds:
+
+  idle box     verify step of 4 tokens  322.1, 316.5 -> 304.0, 304.5 ms
+               prompt, warm read         19.56, 19.18 -> 19.21, 19.39 ms/token
+  busy box     verify step of 4 tokens  740 -> 677 ms (with and without
+               --numa on the old build)
+
+Each output element is computed as before, only by another thread.
+---
+ ggml/src/ggml-cpu/ggml-cpu-impl.h |  4 ++++
+ ggml/src/ggml-cpu/ggml-cpu.c      | 30 +++++++++++++++++++++++++++---
+ ggml/src/ggml-cpu/ops.cpp         |  5 +++--
+ ggml/src/ggml-cpu/repack.cpp      |  2 +-
+ 4 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-impl.h b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+index 5dd9ec8e6..e8be39021 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-impl.h
++++ b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+@@ -534,6 +534,10 @@ void ggml_barrier(struct ggml_threadpool * tp);
+ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value);
+ int  ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value);
+ 
++// ggml_is_numa is about the machine. This is about the CPUs this process may
++// use: true only when they are on more than one node.
++bool ggml_numa_spans_nodes(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 9d747f242..5278614a6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -554,6 +554,7 @@ struct ggml_numa_nodes {
+     enum ggml_numa_strategy numa_strategy;
+     struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
+     uint32_t n_nodes;
++    uint32_t n_nodes_used; // nodes with a CPU in cpuset, the CPUs this process may use
+     uint32_t total_cpus; // hardware threads on system
+     uint32_t current_node; // node on which main process is execting
+ #if defined(__gnu_linux__)
+@@ -706,6 +707,17 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
+         GGML_PRINT_DEBUG("\n");
+     }
+ 
++    g_state.numa.n_nodes_used = 0;
++    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
++        const struct ggml_numa_node * node = &g_state.numa.nodes[n];
++        for (uint32_t i = 0; i < node->n_cpus; ++i) {
++            if (CPU_ISSET(node->cpus[i], &g_state.numa.cpuset)) {
++                g_state.numa.n_nodes_used++;
++                break;
++            }
++        }
++    }
++
+     if (ggml_is_numa()) {
+         FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
+         if (fptr != NULL) {
+@@ -726,6 +738,18 @@ bool ggml_is_numa(void) {
+     return g_state.numa.n_nodes > 1;
+ }
+ 
++// Whether this process's threads can run on more than one node. Work is split
++// in fixed slices across threads only then: a shared counter that moves between
++// nodes costs more than the imbalance it fixes. A process bound to one node
++// (numactl --cpunodebind) is not, even on a machine with several.
++bool ggml_numa_spans_nodes(void) {
++#if defined(__gnu_linux__)
++    return g_state.numa.n_nodes_used > 1;
++#else
++    return ggml_is_numa();
++#endif
++}
++
+ #if defined(__ARM_ARCH)
+ #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+ #include <arm_sve.h>
+@@ -1430,7 +1454,7 @@ UseGgmlGemm2:;
+     // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
+     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
+     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
+-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
++    if (nchunk0 * nchunk1 < nth * 4 || ggml_numa_spans_nodes()) {
+         // distribute the thread work across the inner or outer loop based on which one is larger
+         nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
+         nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+@@ -1706,7 +1730,7 @@ static bool ggml_compute_forward_mul_mat_id_sgemm(
+ 
+     // On NUMA, threads take fixed items as the vec_dot path does, so no shared counter
+     // moves between nodes.
+-    const bool disable_chunking = ggml_is_numa();
++    const bool disable_chunking = ggml_numa_spans_nodes();
+ 
+     // a thread claims items in increasing order, so its expert cursor only moves forward
+     int64_t cur_a    = -1;
+@@ -1939,7 +1963,7 @@ static void ggml_compute_forward_mul_mat_id(
+     }
+ 
+     // NUMA keeps the per thread slices, as mul_mat does (see ggml_compute_forward_mul_mat)
+-    const bool disable_chunking = ggml_is_numa();
++    const bool disable_chunking = ggml_numa_spans_nodes();
+     const bool use_flat = !disable_chunking;
+ 
+     // the flat work list counter; every thread starts at its own chunk ith
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index de19fd19f..e74355404 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ggml-cpu.h"
+ #include "ggml-impl.h"
++#include "ggml-cpu-impl.h"
+ #include "binary-ops.h"
+ #include "simd-gemm.h"
+ #include "ggml.h"
+@@ -10077,7 +10078,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         const int64_t nr = neq1*neq2*neq3;
+ 
+         // disable for NUMA
+-        const bool disable_chunking = ggml_is_numa();
++        const bool disable_chunking = ggml_numa_spans_nodes();
+ 
+         // 4x chunks per thread
+         int nth_scaled = nth * 4;
+@@ -11870,7 +11871,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+     int64_t nr = V->ne[1] * V->ne[3];
+ 
+     // disable for NUMA
+-    const bool disable_chunking = ggml_is_numa();
++    const bool disable_chunking = ggml_numa_spans_nodes();
+ 
+     int nth = params->nth;
+     int ith = params->ith;
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 2632ae3a0..5cd82dd34 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4706,7 +4706,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+         }
+ 
+         // disable for NUMA
+-        const bool disable_chunking = ggml_is_numa();
++        const bool disable_chunking = ggml_numa_spans_nodes();
+ 
+         // 4x chunks per thread
+         const int64_t nr0 = ggml_nrows(op->src[0]);

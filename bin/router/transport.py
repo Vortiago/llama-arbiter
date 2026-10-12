@@ -12,7 +12,7 @@ def http_post(url, path, payload, timeout=300.0):
             return json.load(reply)
     except urllib.error.HTTPError as err:
         # A backend puts the reason in the body.
-        raise OSError(f"{err.code} on {path}: {said(err)}") from None
+        raise Rejected(f"{err.code} on {path}: {said(err)}") from None
 
 
 def said(err):
@@ -30,6 +30,11 @@ def said(err):
 
 class Gone(Exception):
     """The client stopped waiting, so there is nobody to answer."""
+
+
+class Rejected(OSError):
+    """The backend answered, and the answer was an error. A backend that
+    did not answer raises a plain OSError: it may be back soon."""
 
 
 def http_post_watched(url, path, payload, timeout, alive, every=2.0):
@@ -54,8 +59,8 @@ def http_post_watched(url, path, payload, timeout, alive, every=2.0):
             reply = conn.getresponse()
             body = reply.read()
             if reply.status >= 400:
-                got["error"] = OSError(f"{reply.status} on {path}: "
-                                       f"{said_in(body) or reply.reason}")
+                got["error"] = Rejected(f"{reply.status} on {path}: "
+                                         f"{said_in(body) or reply.reason}")
             else:
                 got["answer"] = json.loads(body) if body else {}
         except Exception as err:

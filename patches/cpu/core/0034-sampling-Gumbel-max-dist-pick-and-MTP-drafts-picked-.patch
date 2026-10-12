@@ -1,0 +1,742 @@
+From 0bb6fd04640a3007aea3a286526d1f732b17f558 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 19:38:57 +0200
+Subject: [PATCH] sampling: Gumbel-max dist pick, and MTP drafts picked with a
+ copy of the target's chain
+
+The dist sampler picks argmax_i p_i / E_i, with E_i = -log(u_i) and u_i a hash of
+(seed, accepted count, token id). This is an exact sample of p, as the inverse-CDF
+pick was. The noise of a token does not depend on which other tokens are candidates.
+
+The MTP drafter now picks each draft token with a clone of the target's sampler chain
+(dparams.chain_tgt). The clone has the target's seed and accepted count, so draft token
+j draws the same noise as row j of the verify. For a sampled request, draft and target
+then pick the same token more often. Verify is still an exact match, so the output is
+the target's sample whatever was drafted.
+
+dist has no backend implementation now: ggml has no op to hash the candidates' ids.
+With --backend-sampling the chain before dist still runs on the device; the pick runs
+on the CPU over the top-k candidates. The draft's backend top-k goes from 10 to 40 so
+that the copy of the target's chain (top-k 20) has its candidates.
+
+Port of Strata PR #1281 (6381df3, STRATA_SPEC_GUMBEL).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ common/sampling.cpp             |  77 +++++----
+ common/sampling.h               |   4 +
+ common/speculative.cpp          |  16 +-
+ common/speculative.h            |   4 +
+ src/llama-context.cpp           |   5 -
+ src/llama-sampler.cpp           | 277 +++++---------------------------
+ src/llama-sampler.h             |   1 -
+ tests/test-sampling.cpp         |  89 ++++++++++
+ tools/server/server-context.cpp |   1 +
+ 9 files changed, 204 insertions(+), 270 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index bf0f34235..346e5550f 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -109,6 +109,39 @@ struct ring_buffer {
+     std::vector<T> data;
+ };
+ 
++// the candidates of output row idx: what the backend part of the sampler chain left, or the full logits
++static void fill_candidates(struct llama_context * ctx, int idx, std::vector<llama_token_data> & cur) {
++    const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
++    const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
++    const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
++
++    const llama_model * model = llama_get_model(ctx);
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++
++    if (sampled_probs) {
++        const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
++        cur.resize(sampled_probs_count);
++        for (uint32_t i = 0; i < sampled_probs_count; ++i) {
++            cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
++        }
++    } else if (sampled_logits) {
++        const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
++        cur.resize(sampled_logits_count);
++        for (uint32_t i = 0; i < sampled_logits_count; i++) {
++            cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
++        }
++    } else {
++        const auto * logits = llama_get_logits_ith(ctx, idx);
++        GGML_ASSERT(logits != nullptr);
++        cur.resize(n_vocab);
++        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
++            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++        }
++    }
++}
++
+ struct common_sampler {
+     common_params_sampling params;
+ 
+@@ -132,35 +165,7 @@ struct common_sampler {
+     }
+ 
+     void set_logits(struct llama_context * ctx, int idx) {
+-        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+-        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+-        const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+-
+-        const llama_model * model = llama_get_model(ctx);
+-        const llama_vocab * vocab = llama_model_get_vocab(model);
+-
+-        const int n_vocab = llama_vocab_n_tokens(vocab);
+-
+-        if (sampled_probs) {
+-            const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
+-            cur.resize(sampled_probs_count);
+-            for (uint32_t i = 0; i < sampled_probs_count; ++i) {
+-                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
+-            }
+-        } else if (sampled_logits) {
+-            const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
+-            cur.resize(sampled_logits_count);
+-            for (uint32_t i = 0; i < sampled_logits_count; i++) {
+-                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
+-            }
+-        } else {
+-            const auto * logits = llama_get_logits_ith(ctx, idx);
+-            GGML_ASSERT(logits != nullptr);
+-            cur.resize(n_vocab);
+-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+-            }
+-        }
++        fill_candidates(ctx, idx, cur);
+ 
+         cur_p = { cur.data(), cur.size(), -1, false };
+     }
+@@ -858,6 +863,20 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
+ 
+ // helpers
+ 
++llama_token common_sampler_sample_chain(struct llama_sampler * chain, struct llama_context * ctx, int idx) {
++    llama_synchronize(ctx);
++
++    std::vector<llama_token_data> cur;
++    fill_candidates(ctx, idx, cur);
++
++    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++    llama_sampler_apply(chain, &cur_p);
++
++    GGML_ASSERT(cur_p.selected >= 0 && cur_p.selected < (int64_t) cur_p.size);
++
++    return cur_p.data[cur_p.selected].id;
++}
++
+ void common_sampler_apply_grammar(struct common_sampler * gsmpl, llama_token_data_array * cur_p) {
+     GGML_ASSERT(gsmpl);
+     llama_sampler_apply(gsmpl->grmr, cur_p);
+diff --git a/common/sampling.h b/common/sampling.h
+index b3cde4ca8..7e3fa3196 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -103,6 +103,10 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
+ // the .sorted flag of the result indicates whether the returned candidates are sorted
+ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort);
+ 
++// Pick from output row idx of ctx with a sampler chain that may belong to another context. The MTP draft runs a
++// copy of the target's chain this way, so that it draws with the target's seed and noise.
++llama_token common_sampler_sample_chain(struct llama_sampler * chain, struct llama_context * ctx, int idx);
++
+ // Apply only the grammar to a candidate array, giving every token the grammar
+ // forbids a logit of -INFINITY. The rest of the sampling chain is left out on
+ // purpose: this reads which tokens may be written, without temperature, top-k
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 5ccef258b..689f81db4 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1423,6 +1423,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int32_t> verify_h_rows;
+ 
+     std::vector<int>                i_last;
++
++    // per seq, a copy of the target's sampler chain for this round (see chain_tgt)
++    std::vector<llama_sampler_ptr>  chain_cpl;
+     std::vector<std::vector<float>> chain_h;
+ 
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+@@ -1464,7 +1467,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (this->params.backend_sampling) {
+             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++                // more than the 10 the greedy draft reads: the copy of the target's chain picks from these
++                llama_sampler_chain_add(chain, llama_sampler_init_top_k(40));
+ 
+                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+@@ -1494,6 +1498,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+ 
+         i_last.assign(n_seq, -1);
++        chain_cpl.resize(n_seq);
+         i_batch_beg.assign(n_seq, -1);
+         i_batch_end.assign(n_seq, -1);
+ 
+@@ -1697,6 +1702,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 common_sampler_reset(smpls[seq_id].get());
+             }
+ 
++            // the copy holds the target's seed and accepted count: draft token j draws the noise of row j of the verify
++            chain_cpl[seq_id].reset(dp.chain_tgt && !dp.result_q ? llama_sampler_clone(dp.chain_tgt) : nullptr);
++
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+             batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+ 
+@@ -1756,7 +1764,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 }
+ 
+                 // add drafted token for each sequence
+-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
++                llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
++                if (chain_cpl[seq_id]) {
++                    id = common_sampler_sample_chain(chain_cpl[seq_id].get(), ctx_dft, i_last[seq_id]);
++                    llama_sampler_accept(chain_cpl[seq_id].get(), id);
++                }
+ 
+                 // only collect very high-confidence draft tokens
+                 if (cur_p->data[0].p < params.p_min) {
+diff --git a/common/speculative.h b/common/speculative.h
+index a59846829..a2ae2a47b 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -79,6 +79,10 @@ struct common_speculative_draft_params {
+     // the target's temp and seed, read only when the drafter samples probabilistically
+     float    temp = 1.0f;
+     uint32_t seed = LLAMA_DEFAULT_SEED;
++
++    // the target's sampler chain. draft-mtp picks each draft token with a copy of it, which draws with the
++    // target's seed and noise, so draft and target pick the same token more often. Not with result_q.
++    const struct llama_sampler * chain_tgt = nullptr;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d36d6146d..1a444c9e5 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1866,11 +1866,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         return -2;
+     };
+ 
+-    // start a new sampling transaction for this logical batch
+-    for (const auto & entry : sampling.samplers) {
+-        llama_sampler_backend_begin(entry.second);
+-    }
+-
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
+diff --git a/src/llama-sampler.cpp b/src/llama-sampler.cpp
+index 6c958a287..4c3eaafbf 100644
+--- a/src/llama-sampler.cpp
++++ b/src/llama-sampler.cpp
+@@ -1115,33 +1115,33 @@ struct llama_sampler * llama_sampler_init_greedy() {
+ 
+ // dist
+ 
++// The pick is argmax_i p_i / E_i, with E_i = -log(u_i) ~ Exp(1). This is the Gumbel-max trick: the pick is an exact
++// sample of p. u_i is a hash of (seed, n_accept, token id). The noise of a token therefore does not depend on which
++// other tokens are candidates, or on their order. A draft that runs a copy of this sampler on its own logits gives
++// each token the same noise as the target does at that position, so draft and target agree more often.
++// The counter moves on accept, not on apply: a position sampled twice (a verify row, then a replay) gets the same noise.
+ struct llama_sampler_dist : public llama_sampler_backend {
+     const uint32_t seed;
+           uint32_t seed_cur;
+ 
+-    std::mt19937 rng;
+-
+-    // TODO: refactor + fix naming
+-    //       https://github.com/ggml-org/llama.cpp/pull/25532/changes#r3749906719
+-    // use a temporary RNG for multi-output sampling so rejected tokens do not advance rng
+-    bool backend_transactional;
+-    std::mt19937 rng_backend;
+-    size_t n_backend_draws_generated;
+-    size_t n_backend_draws_committed;
+-
+-    // inputs for the current sampling graph
+-    std::vector<ggml_tensor *> inp_uniforms;
++    uint64_t n_accept;
+ 
+     void copy_state(const llama_sampler_dist & src) {
+-        // note: inp_uniforms and backend_transactional belong to the current sampling graph
+-        seed_cur                  = src.seed_cur;
+-        rng                       = src.rng;
+-        rng_backend               = src.rng_backend;
+-        n_backend_draws_generated = src.n_backend_draws_generated;
+-        n_backend_draws_committed = src.n_backend_draws_committed;
++        seed_cur = src.seed_cur;
++        n_accept = src.n_accept;
+     }
+ };
+ 
++static double llama_sampler_dist_exp_noise(uint32_t seed, uint64_t counter, llama_token id) {
++    uint64_t z = (uint64_t) seed ^ (counter * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) (uint32_t) id * 0xD1B54A32D192ED03ull);
++    z += 0x9E3779B97F4A7C15ull;
++    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
++    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
++    z ^= z >> 31;
++    const double u = ((double) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0); // in (0, 1)
++    return -std::log(u);
++}
++
+ static const char * llama_sampler_dist_name(const struct llama_sampler * smpl) {
+     auto * sctx = (llama_sampler_dist *) smpl->ctx;
+     return sctx->get_name();
+@@ -1150,7 +1150,6 @@ static const char * llama_sampler_dist_name(const struct llama_sampler * smpl) {
+ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+     auto * ctx = (llama_sampler_dist *) smpl->ctx;
+ 
+-    // edge cases
+     if (cur_p->size == 0) {
+         cur_p->selected = -1;
+         return;
+@@ -1158,16 +1157,11 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
+ 
+     cur_p->selected = 0;
+ 
+-    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+-
+     if (cur_p->size == 1) {
+-        // keep the RNG state aligned with backend sampling, which draws once per output
+-        (void) dist(ctx->rng);
+         cur_p->data[0].p = 1.0f;
+         return;
+     }
+ 
+-    // max logit for numerical stability
+     float max_l = cur_p->data[0].logit;
+     if (!cur_p->sorted) {
+         for (size_t i = 1; i < cur_p->size; ++i) {
+@@ -1175,77 +1169,45 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
+         }
+     }
+ 
+-    // apply softmax to obtain the probabilities
+-    double sum_cum = 0.0f;
++    double sum = 0.0;
+     for (size_t i = 0; i < cur_p->size; ++i) {
+-        float p = expf(cur_p->data[i].logit - max_l);
++        const float p = expf(cur_p->data[i].logit - max_l);
+         cur_p->data[i].p = p;
+-        sum_cum += p;
++        sum += p;
+     }
+ 
+-#if 1
+-    // sample from the obtained probabilities and normalize the probs in a single pass
+-    // this is ~3x faster on Mac with full gpt-oss vocab than the version below
+-    //
+-    const double rnd = dist(ctx->rng);
+-
+-          double sum_run = 0.0f;
+-    const double sum_tgt = sum_cum*rnd;
+-
+-    bool found = false;
++    double best = -1.0;
+     for (size_t i = 0; i < cur_p->size; ++i) {
+-        if (!found) {
+-            // accumulate probs until we reach the target sum
+-            sum_run += cur_p->data[i].p;
+-            if (sum_run >= sum_tgt) {
++        cur_p->data[i].p /= sum;
++
++        if (cur_p->data[i].p > 0.0f) {
++            const double r = cur_p->data[i].p / llama_sampler_dist_exp_noise(ctx->seed_cur, ctx->n_accept, cur_p->data[i].id);
++            if (r > best) {
++                best = r;
+                 cur_p->selected = i;
+-                found = true;
+             }
+         }
+-
+-        // normalize probs
+-        cur_p->data[i].p /= sum_cum;
+     }
++}
+ 
+-    // fallback to the last token (don't think this can happen)
+-    assert(found);
+-    if (!found) {
+-        cur_p->selected = cur_p->size - 1;
+-    }
+-#else
+-    // for clarity, this is the same as above but does one pass for normalization and one extra pass for sampling
+-    for (size_t i = 0; i < cur_p->size; ++i) {
+-        cur_p->data[i].p /= sum_cum;
+-    }
++static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token token) {
++    GGML_UNUSED(token);
+ 
+-    cur_p->selected = llama_sample_dist(cur_p, ctx->rng);
+-#endif
++    auto * ctx = (llama_sampler_dist *) smpl->ctx;
++    ctx->n_accept++;
+ }
+ 
+ static void llama_sampler_dist_reset(struct llama_sampler * smpl) {
+     auto * ctx = (llama_sampler_dist *) smpl->ctx;
+     ctx->seed_cur = get_rng_seed(ctx->seed);
+-    ctx->rng.seed(ctx->seed_cur);
+-    ctx->rng_backend = ctx->rng;
+-    ctx->n_backend_draws_generated = 0;
+-    ctx->n_backend_draws_committed = 0;
++    ctx->n_accept = 0;
+ }
+ 
+ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sampler * smpl) {
+     const auto * ctx = (const llama_sampler_dist *) smpl->ctx;
+     auto * result = llama_sampler_init_dist(ctx->seed);
+ 
+-    // copy the state
+-    {
+-        auto * result_ctx = (llama_sampler_dist *) result->ctx;
+-
+-        result_ctx->seed_cur                  = ctx->seed_cur;
+-        result_ctx->rng                       = ctx->rng;
+-        result_ctx->backend_transactional     = ctx->backend_transactional;
+-        result_ctx->rng_backend               = ctx->rng_backend;
+-        result_ctx->n_backend_draws_generated = ctx->n_backend_draws_generated;
+-        result_ctx->n_backend_draws_committed = ctx->n_backend_draws_committed;
+-    }
++    ((llama_sampler_dist *) result->ctx)->copy_state(*ctx);
+ 
+     return result;
+ }
+@@ -1254,133 +1216,8 @@ static void llama_sampler_dist_free(struct llama_sampler * smpl) {
+     delete (llama_sampler_dist *) smpl->ctx;
+ }
+ 
+-static bool llama_sampler_dist_backend_init(
+-        struct llama_sampler       * smpl,
+-        ggml_backend_buffer_type_t   buft,
+-        uint32_t                     n_outputs_max_per_seq) {
+-    auto * sctx = (llama_sampler_dist *) smpl->ctx;
+-
+-    const bool res = llama_sampler_backend_support(smpl, buft);
+-
+-    sctx->init(res);
+-    sctx->backend_transactional = n_outputs_max_per_seq > 1;
+-    sctx->rng_backend = sctx->rng;
+-    sctx->n_backend_draws_generated = 0;
+-    sctx->n_backend_draws_committed = 0;
+-
+-    return res;
+-}
+-
+-static void llama_sampler_dist_backend_apply(
+-        struct llama_sampler      * smpl,
+-        struct ggml_context       * ctx,
+-        struct ggml_cgraph        * gf,
+-        struct llama_sampler_data * data) {
+-    GGML_UNUSED(gf);
+-
+-    auto * sctx = (llama_sampler_dist *) smpl->ctx;
+-
+-    ggml_tensor * inp_uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+-    ggml_format_name(inp_uniform, "uniform_%zu", sctx->inp_uniforms.size());
+-    ggml_set_input(inp_uniform);
+-    sctx->inp_uniforms.push_back(inp_uniform);
+-
+-    // flatten
+-    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+-
+-    struct ggml_tensor * probs = ggml_soft_max(ctx, logits);
+-    ggml_set_name(probs, "dist_probs");
+-
+-    struct ggml_tensor * cumsum = ggml_cumsum(ctx, probs);
+-    ggml_set_name(cumsum, "dist_cumsum");
+-
+-    // The uniform tensor has a random value and we subtract this tensor with
+-    // the cumsum tensor (the uniform tensor will be broadcasted by ggml_sub).
+-    // Recall that each entry in cumsum is the cumulative probability up to that
+-    // index so values stay negative while the cumulative total is below the
+-    // random value, and become zero/positive once the threshold is crossed.
+-    struct ggml_tensor * diff = ggml_sub(ctx, cumsum, inp_uniform);
+-    ggml_set_name(diff, "dist_cumsum");
+-
+-    // The ggml_step function produces a tensor where entries are 1 if the
+-    // corresponding entry in diff is > 0, and 0 otherwise. So all values up to
+-    // the index where the cumulative probability exceeds the random value are 0,
+-    // and all entries after that are 1.
+-    struct ggml_tensor * mask = ggml_step(ctx, diff);
+-    ggml_set_name(mask, "dist_mask");
+-
+-    // Taking the sum of the mask gives us the sum of elements after the threshold
+-    // we are interested in.
+-    struct ggml_tensor * idxf = ggml_sum(ctx, mask);
+-    ggml_set_name(idxf, "dist_index_f32");
+-
+-    // Clamp to prevent out-of-bounds access when computing the index.
+-    idxf = ggml_clamp(ctx, idxf, 1.0f, mask->ne[0]);
+-
+-    // Use ggml_scale_bias to scale the index value by -1 and then add the size
+-    // of the mask to that value so we get the correct index ((-1 * idxf) + n).
+-    struct ggml_tensor * idx = ggml_cast(ctx, ggml_scale_bias(ctx, idxf, -1.0f, mask->ne[0]), GGML_TYPE_I32);
+-    ggml_set_name(idx, "dist_index_i32");
+-
+-    // Map back to original vocab ids if a candidates tensor is available.
+-    struct ggml_tensor * sampled_token = idx;
+-    if (data->candidates != nullptr) {
+-        struct ggml_tensor * candidates = ggml_reshape_2d(ctx, data->candidates, 1, ggml_nelements(data->candidates));
+-
+-        sampled_token = ggml_get_rows(ctx, candidates, idx);
+-        ggml_set_name(sampled_token, "dist_sampled_token");
+-    }
+-
+-    data->sampled = sampled_token;
+-    data->probs = probs;
+-}
+-
+-static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
+-    auto * sctx = (llama_sampler_dist *) smpl->ctx;
+-
+-    GGML_ASSERT(!sctx->inp_uniforms.empty());
+-
+-    // We sample in double precision and cast to float to match rnd numbers of
+-    // llama_sampler_dist which uses double precision (sampling from
+-    // std::uniform_real_distribution<double> and
+-    // std::uniform_real_distribution<float> with same rng will produce
+-    // different sequences).
+-    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+-
+-    auto & rng = sctx->backend_transactional ? sctx->rng_backend : sctx->rng;
+-
+-    for (auto * inp_uniform : sctx->inp_uniforms) {
+-        GGML_ASSERT(inp_uniform != nullptr);
+-
+-        const float rnd = dist(rng);
+-        ggml_backend_tensor_set(inp_uniform, &rnd, 0, sizeof(float));
+-
+-        if (sctx->backend_transactional) {
+-            ++sctx->n_backend_draws_generated;
+-        }
+-    }
+-}
+-
+-static void llama_sampler_dist_backend_reset(struct llama_sampler * smpl) {
+-    auto * sctx = (llama_sampler_dist *) smpl->ctx;
+-    sctx->inp_uniforms.clear();
+-}
+-
+-static void llama_sampler_dist_accept(struct llama_sampler * smpl, llama_token token) {
+-    GGML_UNUSED(token);
+-
+-    auto * sctx = (llama_sampler_dist *) smpl->ctx;
+-
+-    if (!sctx->backend_transactional ||
+-            sctx->n_backend_draws_committed >= sctx->n_backend_draws_generated) {
+-        return;
+-    }
+-
+-    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+-    (void) dist(sctx->rng);
+-    ++sctx->n_backend_draws_committed;
+-}
+-
++// no backend implementation: ggml has no op to hash the token ids of the candidates, so the pick runs on the CPU
++// over the candidates the backend part of the chain leaves (top-k keeps that list short)
+ static struct llama_sampler_i llama_sampler_dist_i = {
+     /* .name              = */ llama_sampler_dist_name,
+     /* .accept            = */ llama_sampler_dist_accept,
+@@ -1388,11 +1225,11 @@ static struct llama_sampler_i llama_sampler_dist_i = {
+     /* .reset             = */ llama_sampler_dist_reset,
+     /* .clone             = */ llama_sampler_dist_clone,
+     /* .free              = */ llama_sampler_dist_free,
+-    /* .backend_init      = */ llama_sampler_dist_backend_init,
++    /* .backend_init      = */ nullptr,
+     /* .backend_accept    = */ nullptr,
+-    /* .backend_apply     = */ llama_sampler_dist_backend_apply,
+-    /* .backend_set_input = */ llama_sampler_dist_backend_set_input,
+-    /* .backend_reset     = */ llama_sampler_dist_backend_reset,
++    /* .backend_apply     = */ nullptr,
++    /* .backend_set_input = */ nullptr,
++    /* .backend_reset     = */ nullptr,
+     /* .copy_state        = */ llama_sampler_backend_copy_state<llama_sampler_dist>,
+ };
+ 
+@@ -1402,39 +1239,13 @@ struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
+         /* .iface = */ &llama_sampler_dist_i,
+         /* .ctx   = */ new llama_sampler_dist {
+             ("dist"),
+-            /* .seed                      = */ seed,
+-            /* .seed_cur                  = */ seed_cur,
+-            /* .rng                       = */ std::mt19937(seed_cur),
+-            /* .backend_transactional     = */ false,
+-            /* .rng_backend               = */ std::mt19937(seed_cur),
+-            /* .n_backend_draws_generated = */ 0,
+-            /* .n_backend_draws_committed = */ 0,
+-            /* .inp_uniforms              = */ {},
++            /* .seed     = */ seed,
++            /* .seed_cur = */ seed_cur,
++            /* .n_accept = */ 0,
+         }
+     );
+ }
+ 
+-void llama_sampler_backend_begin(llama_sampler * sampler) {
+-    GGML_ASSERT(sampler != nullptr);
+-
+-    if (sampler->iface == &llama_sampler_chain_i) {
+-        auto * chain = (llama_sampler_chain *) sampler->ctx;
+-        for (auto & entry : chain->samplers) {
+-            if (!entry.is_backend) {
+-                break;
+-            }
+-            llama_sampler_backend_begin(entry.ptr);
+-        }
+-    } else if (sampler->iface == &llama_sampler_dist_i) {
+-        auto * ctx = (llama_sampler_dist *) sampler->ctx;
+-        if (ctx->backend_transactional) {
+-            ctx->rng_backend = ctx->rng;
+-            ctx->n_backend_draws_generated = 0;
+-            ctx->n_backend_draws_committed = 0;
+-        }
+-    }
+-}
+-
+ // top-k
+ 
+ struct llama_sampler_top_k : public llama_sampler_backend {
+diff --git a/src/llama-sampler.h b/src/llama-sampler.h
+index e5db2982b..9cd84dccb 100644
+--- a/src/llama-sampler.h
++++ b/src/llama-sampler.h
+@@ -36,7 +36,6 @@ struct llama_sampler_chain {
+ };
+ 
+ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+-void llama_sampler_backend_begin(llama_sampler * sampler);
+ 
+ struct llama_sampler * llama_sampler_init_dry_testing(
+         float   dry_multiplier,
+diff --git a/tests/test-sampling.cpp b/tests/test-sampling.cpp
+index 353a5a1a1..be1392734 100644
+--- a/tests/test-sampling.cpp
++++ b/tests/test-sampling.cpp
+@@ -91,6 +91,94 @@ static void test_dist_singleton_rng() {
+     llama_sampler_free(control);
+ }
+ 
++// The dist pick is a Gumbel-max pick keyed by (seed, accepted count, token id), so that a draft that runs
++// the same chain on its own logits gives each shared token the same noise as the target does.
++static llama_token sample_ids(llama_sampler * sampler, const std::vector<llama_token> & ids, const std::vector<float> & logits) {
++    std::vector<llama_token_data> cur;
++    for (size_t i = 0; i < ids.size(); ++i) {
++        cur.push_back({ ids[i], logits[i], 0.0f });
++    }
++
++    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
++    llama_sampler_apply(sampler, &cur_p);
++    GGML_ASSERT(cur_p.selected >= 0 && (size_t) cur_p.selected < cur_p.size);
++    return cur_p.data[cur_p.selected].id;
++}
++
++static void test_dist_gumbel() {
++    // the pick does not depend on the order of the candidates, or on candidates that were not picked
++    for (uint32_t seed = 1; seed <= 200; ++seed) {
++        const std::vector<llama_token> ids    = { 0, 1, 2, 3, 4, 5, 6, 7 };
++        const std::vector<float>       logits = { 0.1f, 0.5f, 0.9f, 0.2f, 0.7f, 0.3f, 0.8f, 0.4f };
++
++        llama_sampler * a = llama_sampler_init_dist(seed);
++        const llama_token x = sample_ids(a, ids, logits);
++        llama_sampler_free(a);
++
++        std::vector<llama_token> ids_b;
++        std::vector<float>       logits_b;
++        for (int i = (int) ids.size() - 1; i >= 0; --i) {
++            if (ids[i] == x || i % 3 != 0) {
++                ids_b.push_back(ids[i]);
++                logits_b.push_back(logits[i]);
++            }
++        }
++
++        llama_sampler * b = llama_sampler_init_dist(seed);
++        GGML_ASSERT(sample_ids(b, ids_b, logits_b) == x);
++        llama_sampler_free(b);
++    }
++
++    // the noise moves on with each accepted token, not with each pick, and a clone keeps the count
++    {
++        const std::vector<float> logits(256, 0.0f);
++
++        llama_sampler * s = llama_sampler_init_dist(77);
++        const llama_token x0 = sample_dist(s, logits);
++        GGML_ASSERT(sample_dist(s, logits) == x0);
++
++        llama_sampler_accept(s, 5);
++        const llama_token x1 = sample_dist(s, logits);
++
++        llama_sampler * t = llama_sampler_init_dist(77);
++        llama_sampler_accept(t, 9);
++        GGML_ASSERT(sample_dist(t, logits) == x1);
++
++        llama_sampler * c = llama_sampler_clone(s);
++        GGML_ASSERT(sample_dist(c, logits) == x1);
++
++        llama_sampler_free(s);
++        llama_sampler_free(t);
++        llama_sampler_free(c);
++    }
++
++    // the pick is a sample of the softmax
++    {
++        const std::vector<float> probs = { 0.1f, 0.2f, 0.3f, 0.4f };
++        std::vector<float> logits;
++        for (float p : probs) {
++            logits.push_back(logf(p));
++        }
++
++        const int n = 40000;
++        std::vector<int> count(probs.size(), 0);
++
++        llama_sampler * s = llama_sampler_init_dist(1234);
++        for (int i = 0; i < n; ++i) {
++            const llama_token x = sample_dist(s, logits);
++            count[x]++;
++            llama_sampler_accept(s, x);
++        }
++        llama_sampler_free(s);
++
++        for (size_t i = 0; i < probs.size(); ++i) {
++            const double f = (double) count[i] / n;
++            printf("dist gumbel: token %zu p %.3f freq %.4f\n", i, probs[i], f);
++            GGML_ASSERT(fabs(f - probs[i]) < 0.01);
++        }
++    }
++}
++
+ static void test_temp(const std::vector<float> & probs, const std::vector<float> & probs_expected, float temp) {
+     sampler_tester tester(probs, probs_expected);
+ 
+@@ -339,6 +427,7 @@ int main(void) {
+     ggml_time_init();
+ 
+     test_dist_singleton_rng();
++    test_dist_gumbel();
+ 
+     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.1f, 0.2f, 0.3f, 0.4f}, 1.0f);
+     test_temp({0.1f, 0.2f, 0.3f, 0.4f}, {0.0f, 0.0f, 0.0f, 1.0f}, 0.0f);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index cf739cb23..625d3cd0f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3402,6 +3402,7 @@ private:
+                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                             /* .temp     = */ slot.task->params.sampling.temp,
+                             /* .seed     = */ slot.task->params.sampling.seed,
++                            /* .chain_tgt = */ common_sampler_get(slot.smpl.get()),
+                         };
+ 
+                         drafting.push_back(&slot);

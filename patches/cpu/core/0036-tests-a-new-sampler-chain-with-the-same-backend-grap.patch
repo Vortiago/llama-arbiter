@@ -1,0 +1,117 @@
+From 2d1d298786ba50999a0b870553dfb910ec053e9c Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Thu, 8 Oct 2026 09:44:24 +0200
+Subject: [PATCH] tests: a new sampler chain with the same backend graph does
+ not re-reserve
+
+llama-server detaches the sampler at the end of each request and attaches a
+new chain for the next one. The test attaches a chain with the same graph
+(top_k 20 + dist, other seed) and expects no sched_reserve, the same token as
+a fresh context, and a reserve for a chain with another graph (top_k 40).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ tests/test-backend-sampler.cpp | 82 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
+
+diff --git a/tests/test-backend-sampler.cpp b/tests/test-backend-sampler.cpp
+index 6ec70baa6..529ca8bdf 100644
+--- a/tests/test-backend-sampler.cpp
++++ b/tests/test-backend-sampler.cpp
+@@ -1533,6 +1533,87 @@ static void test_backend_set_sampler(const test_params & params) {
+     printf("backend set sampler test PASSED\n");
+ }
+ 
++static int g_n_reserve = 0;
++
++static void count_reserve_log(ggml_log_level /*level*/, const char * text, void * /*user_data*/) {
++    if (std::strstr(text, "sched_reserve: reserving") != nullptr) {
++        g_n_reserve++;
++    }
++    fputs(text, stderr);
++}
++
++static llama_sampler_ptr make_top_k_dist_chain(int32_t k, uint32_t seed) {
++    llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
++    llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(k));
++    llama_sampler_chain_add(chain.get(), llama_sampler_init_dist(seed));
++    return chain;
++}
++
++// llama-server detaches the sampler when a request ends and attaches a new chain for the next request.
++// A new chain that builds the same backend sampling graph must not re-reserve the scheduler.
++static void test_backend_set_sampler_same_graph(const test_params & params) {
++    const int seq_id = 0;
++
++    // the chains must outlive the contexts
++    llama_sampler_ptr chain_a   = make_top_k_dist_chain(20, 1);
++    llama_sampler_ptr chain_b   = make_top_k_dist_chain(20, 2);
++    llama_sampler_ptr chain_ref = make_top_k_dist_chain(20, 2);
++    llama_sampler_ptr chain_c   = make_top_k_dist_chain(40, 3);
++
++    llama_log_set(count_reserve_log, nullptr);
++
++    std::vector<llama_sampler_seq_config> configs = {{ seq_id, chain_a.get() }};
++    test_context test_ctx(params, configs);
++
++    GGML_ASSERT(test_ctx.decode({{seq_id, "Hello"}}));
++    const llama_token tok0 = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    GGML_ASSERT(tok0 >= 0 && tok0 < test_ctx.n_vocab);
++
++    GGML_ASSERT(test_ctx.decode_tokens({{seq_id, tok0}}));
++    const llama_token tok1 = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    GGML_ASSERT(tok1 >= 0 && tok1 < test_ctx.n_vocab);
++
++    // the next request: same graph, other seed
++    llama_set_sampler(test_ctx.ctx.get(), seq_id, nullptr);
++    llama_set_sampler(test_ctx.ctx.get(), seq_id, chain_b.get());
++
++    g_n_reserve = 0;
++    GGML_ASSERT(test_ctx.decode_tokens({{seq_id, tok1}}));
++    const int n_reserve_same = g_n_reserve;
++    const llama_token tok_b = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    printf("same graph: reserves = %d, token = %d\n", n_reserve_same, tok_b);
++    GGML_ASSERT(tok_b >= 0 && tok_b < test_ctx.n_vocab);
++
++    // a different graph (top_k 40) must reserve
++    llama_set_sampler(test_ctx.ctx.get(), seq_id, nullptr);
++    llama_set_sampler(test_ctx.ctx.get(), seq_id, chain_c.get());
++
++    g_n_reserve = 0;
++    GGML_ASSERT(test_ctx.decode_tokens({{seq_id, tok_b}}));
++    const int n_reserve_other = g_n_reserve;
++    const llama_token tok_c = llama_get_sampled_token_ith(test_ctx.ctx.get(), test_ctx.idx_for_seq(seq_id));
++    printf("other graph: reserves = %d, token = %d\n", n_reserve_other, tok_c);
++    GGML_ASSERT(tok_c >= 0 && tok_c < test_ctx.n_vocab);
++
++    // reference: a fresh context reads the same tokens and attaches the same chain before the last one
++    std::vector<llama_sampler_seq_config> no_configs;
++    test_context ref_ctx(params, no_configs, 1);
++    GGML_ASSERT(ref_ctx.decode({{seq_id, "Hello"}}));
++    GGML_ASSERT(ref_ctx.decode_tokens({{seq_id, tok0}}));
++    llama_set_sampler(ref_ctx.ctx.get(), seq_id, chain_ref.get());
++    GGML_ASSERT(ref_ctx.decode_tokens({{seq_id, tok1}}));
++    const llama_token tok_ref = llama_get_sampled_token_ith(ref_ctx.ctx.get(), ref_ctx.idx_for_seq(seq_id));
++    printf("reference token = %d\n", tok_ref);
++
++    llama_log_set(nullptr, nullptr);
++
++    GGML_ASSERT(tok_b == tok_ref);
++    GGML_ASSERT(n_reserve_other >= 1);
++    GGML_ASSERT(n_reserve_same == 0);
++
++    printf("backend set sampler same graph test PASSED\n");
++}
++
+ static void test_backend_cpu_mixed_batch(const test_params & params) {
+     // Sequence 0 uses backend sampling
+     struct llama_sampler_chain_params chain_params_0 = llama_sampler_chain_default_params();
+@@ -1998,6 +2079,7 @@ static const backend_test_case BACKEND_TESTS[] = {
+     { "dist",            test_backend_dist_sampling,           true  },
+     { "dist_and_cpu",    test_backend_dist_sampling_and_cpu,   true  },
+     { "set_sampler",     test_backend_set_sampler,             true  },
++    { "set_sampler_same_graph", test_backend_set_sampler_same_graph, true },
+     { "multi_output_limit",    test_backend_multi_output_limit,      true },
+     { "multi_sequence_multi_output_dist", test_backend_multi_sequence_multi_output_dist, true },
+     { "multi_output_dist_transaction", test_backend_multi_output_dist_transaction, true },

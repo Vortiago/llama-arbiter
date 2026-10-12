@@ -24,7 +24,7 @@ env=($rest)
 
 # A setting in the environment wins over the table: `env` takes the last
 # assignment of a name. A sweep restarts one backend with one knob moved.
-for name_of in BATCH UBATCH TB SLOTS PRIME CACHE_RAM CPUSET CKPT_STEP CKPT_N PRIO; do
+for name_of in BATCH UBATCH TB SLOTS PRIME CACHE_RAM CPUSET CKPT_STEP CKPT_N PRIO N_CPU_MOE CPU_MOE_DRAFT; do
   [[ -n ${!name_of:-} ]] && env+=("$name_of=${!name_of}")
 done
 # THREADS_ENV, not THREADS: common.sh fills THREADS with the core count, which
@@ -36,11 +36,14 @@ echo "draining $name (this waits for work already running)..."
 # name, and the reply then lands wherever that link points.
 answer=$(mktemp) || die "no temporary file"
 trap 'rm -f "$answer"' EXIT
-code=$(curl -s -o "$answer" -w '%{http_code}' -X POST "$ROUTER/router/drain/$name")
+code=$(curl -s -o "$answer" -w '%{http_code}' \
+  -H "X-Router-Key: ${ROUTER_CONTROL_KEY:-}" \
+  -X POST "$ROUTER/router/drain/$name")
 cat "$answer"; echo
 if [[ $code != 200 ]]; then
   echo "not drained, leaving $name alone" >&2
-  curl -s -X POST "$ROUTER/router/resume/$name" >/dev/null
+  curl -s -H "X-Router-Key: ${ROUTER_CONTROL_KEY:-}" \
+    -X POST "$ROUTER/router/resume/$name" >/dev/null
   exit 1
 fi
 
@@ -50,7 +53,8 @@ pid=$(pid_on_port "$port")
 [[ -z ${pid:-} ]] && pid=$(cat "$RUN/$name.pid" 2>/dev/null || true)
 if [[ -n ${pid:-} ]] && kill -0 "$pid" 2>/dev/null && ! ours "$pid"; then
   echo "$name: pid $pid is something else now, leaving it alone" >&2
-  curl -s -X POST "$ROUTER/router/resume/$name" >/dev/null
+  curl -s -H "X-Router-Key: ${ROUTER_CONTROL_KEY:-}" \
+    -X POST "$ROUTER/router/resume/$name" >/dev/null
   exit 1
 fi
 if [[ -n ${pid:-} ]] && kill -0 "$pid" 2>/dev/null; then
@@ -60,6 +64,18 @@ if [[ -n ${pid:-} ]] && kill -0 "$pid" 2>/dev/null; then
   # Check `ours` again before SIGKILL. Linux reuses pids while llama-server is
   # still releasing 124 GiB.
   kill -0 "$pid" 2>/dev/null && ours "$pid" && kill -9 "$pid" 2>/dev/null
+fi
+
+# Put the model pages on the node that will read them. The gpu backend's
+# --preferred=0 puts a page it faults in the mirrored copy on node 0, so a full
+# start-all places each copy first (place_copies). Do the same for the copy this
+# backend reads. Set PLACE_COPIES=0 to skip.
+if [[ ${PLACE_COPIES:-1} == 1 ]]; then
+  read -ra place_nodes <<<"$(printf '%s\n' $rest | sed -n 's/^NODE=//p' | tail -1 | tr ',' ' ')"
+  # A row with no NODE is no instruction to place anything. place_copies with
+  # no node argument reads every node with a copy, which for one backend's
+  # restart is both copies. A row that wants both says NODE=0,1.
+  (( ${#place_nodes[@]} )) && place_copies "${place_nodes[@]}"
 fi
 
 echo "starting $name..."
@@ -72,7 +88,9 @@ sleep 2
 # be waited on for forty minutes and then resumed.
 up=0
 for _ in $(seq 480); do
-  curl -s -m 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { up=1; break; }
+  # -f: a loading llama-server answers /health with 503, and plain -s
+  # took that for up. A backend that then died at load was put in service.
+  curl -sf -m 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1 && { up=1; break; }
   kill -0 "$started" 2>/dev/null || break
   sleep 5
 done
@@ -87,5 +105,6 @@ if [[ ${KEEP_DRAINED:-0} == 1 ]]; then
   exit 0
 fi
 
-curl -s -X POST "$ROUTER/router/resume/$name" >/dev/null
+curl -s -H "X-Router-Key: ${ROUTER_CONTROL_KEY:-}" \
+  -X POST "$ROUTER/router/resume/$name" >/dev/null
 echo "$name is back in service"

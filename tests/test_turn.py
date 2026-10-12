@@ -170,6 +170,34 @@ class ATurnRefusesAPromptNoBackendCanHold(unittest.TestCase):
         self.assertEqual([code for code, _ in client.failed], [413])
 
 
+class ATypedPlanIsSizedByItsLargestQuestion(unittest.TestCase):
+    """A typed plan asks every question against the slot the read pass filled.
+
+    The handler rebuilds the turn body from the first question, and the size
+    check read only that. A later, longer question could then exceed n_ctx
+    mid-plan: the backend drops the whole slot and every answer is lost. The
+    plan has to be refused up front instead."""
+
+    def test_a_later_long_question_refuses_the_plan_up_front(self):
+        pool = one_backend(n_ctx=2000)
+        raw = json.dumps({
+            "state": "x" * 40,
+            "questions": {
+                "small": {"type": "noul", "instructions": "one word"},
+                "big": {"type": "noul", "instructions": "y" * 20000},
+            },
+        }).encode()
+        plan = router.systemone_plan(raw)
+        body = router.systemone_body(plan, plan["questions"][0])
+        client = FakeClient()
+
+        pool.turn(router.Ask(router.SYSTEMONE, body, None, plan, body), client)
+
+        self.assertEqual([code for code, _ in client.failed], [413])
+        self.assertEqual(pool.link.ops(), [],
+                         "the link saw work despite the refusal")
+
+
 class ATurnNeedsABackendThatReads(unittest.TestCase):
     """The largest prompt any prefiller will read is 0 while none is up. A
     turn that went on from there would wait in acquire for a backend that
@@ -524,6 +552,37 @@ class ACacheIsWrittenToDiskOnce(unittest.TestCase):
         self.assertFalse(pool.park_later(pool.backends[0], "c1", "t1"))
         self.assertTrue(pool.park_jobs.empty())
         self.assertIsNone(pool.parker)         # no worker was even started
+
+
+class ASlotHoldsOneConversation(unittest.TestCase):
+    """A turn that takes a slot overwrites what was in it. A pin that still
+    claimed the slot was saved again before every later turn on that
+    backend, with another conversation's cache in it: on koishi, 3861
+    copies of 229 conversations in one day, 3.3 TB written."""
+
+    def resident(self, pool):
+        pool.pins["old"] = parked_copy("old.park")
+        pool.pins["old"].update(slot=0, tokens=50_000)   # worth a copy
+
+    def test_the_turn_that_takes_a_slot_ends_the_old_claim(self):
+        pool = one_backend()
+        self.resident(pool)
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient())
+
+        self.assertIsNone(pool.pins["old"]["slot"])
+
+    def test_a_claim_that_ended_is_not_saved_again(self):
+        pool = one_backend()
+        self.resident(pool)
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  FakeClient())
+        pool.pins["old"]["parked"] = None      # the budget took its copy
+        pool.link.calls.clear()
+        pool.turn(router.Ask("/v1/chat/completions", prompt(20), "c2"),
+                  FakeClient())
+
+        self.assertNotIn(("save", "cpu", "old.park"), pool.link.calls)
 
 
 class AStreamSaysNothingAfterItsLastWord(unittest.TestCase):

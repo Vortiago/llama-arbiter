@@ -154,6 +154,17 @@ def systemone_body(plan, question):
     return body
 
 
+def systemone_largest(plan):
+    """The body for the question that reads the most of the slot.
+
+    `answers` asks each question against the same slot, so the turn's size
+    check has to size the whole plan by its worst question: the first
+    question is what the read pass carries, and sizing by it lets a later,
+    longer question overflow n_ctx mid-plan and lose every answer."""
+    question = max(plan["questions"], key=lambda q: len(systemone_says(q)))
+    return json.dumps(systemone_body(plan, question)).encode()
+
+
 def systemone_read(reply, question):
     """One typed answer, from the one token the backend wrote.
 

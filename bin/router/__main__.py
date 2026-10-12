@@ -74,4 +74,9 @@ if __name__ == "__main__":
     server = Server((args.host, args.port), Handler)
     server.pool = POOL
     server.passed = passed_paths()
+    server.control_key = os.environ.get("ROUTER_CONTROL_KEY")
+    if not server.control_key:
+        print("[router] ROUTER_CONTROL_KEY is unset: drain, resume and "
+              "reset-rates are open (set it to require X-Router-Key)",
+              flush=True)
     server.serve_forever()

@@ -41,6 +41,15 @@ class Tuning:
     post_timeout: float = 300.0       # a save waits for the slot to finish
     max_body: int = 256 * 1024 * 1024  # largest request body read into memory.
                                       # A turn at ctx 150000 is a few megabytes.
+    body_timeout: float = 600.0       # seconds one request body may take to
+                                      # arrive. A body is read a chunk at a
+                                      # time; a client that trickles forever
+                                      # is answered 408 rather than held.
+    body_total: int = 1024 ** 3       # bytes of request bodies being read at
+                                      # once, over every connection. max_body
+                                      # bounds one body; this bounds their sum,
+                                      # so a hundred slow clients cannot each
+                                      # pin max_body.
     chars_per_tok: float = 4.0
     reply_tokens: int = 1024          # room to reserve for the reply
 

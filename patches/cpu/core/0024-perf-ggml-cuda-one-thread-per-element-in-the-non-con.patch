@@ -1,0 +1,99 @@
+From 6ba1156cd496198f11724e15154ce7f51b4163d0 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Wed, 7 Oct 2026 17:51:13 +0200
+Subject: [PATCH] perf(ggml-cuda): one thread per element in the non-contiguous
+ concat
+
+The kernel ran one block of 256 threads per dst row. The conv-state concat
+of a DeltaNet layer has rows of 3 + n_tokens elements, so a 4-token verify
+left 249 of 256 threads idle in 10240 blocks: 25 us a call. Threads now
+walk the (i0, i1) plane of dst. A copy: exact.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-cuda/concat.cu | 31 ++++++++++++++++---------------
+ 1 file changed, 16 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
+index 6df89013c..01f5678ca 100644
+--- a/ggml/src/ggml-cuda/concat.cu
++++ b/ggml/src/ggml-cuda/concat.cu
+@@ -1,6 +1,7 @@
+ #include "concat.cuh"
+ 
+ #include <stdint.h>
++#include <algorithm>
+ 
+ // contiguous kernels
+ template <typename T, int dim>
+@@ -79,7 +80,8 @@ static void concat_cont_cuda(const T * x,
+     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+ }
+ 
+-// non-contiguous kernel (slow)
++// non-contiguous kernel: one thread per dst element of an (i0, i1) plane, so a short row
++// does not leave most of a block idle
+ template <typename T, int dim>
+ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+     concat_non_cont(
+@@ -94,18 +96,12 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+           uint64_t   nb01,
+           uint64_t   nb02,
+           uint64_t   nb03,
+-           int64_t /*ne10*/,
+-           int64_t /*ne11*/,
+-           int64_t /*ne12*/,
+-           int64_t /*ne13*/,
+           uint64_t   nb10,
+           uint64_t   nb11,
+           uint64_t   nb12,
+           uint64_t   nb13,
+-           int64_t   ne0,
+-           int64_t /*ne1*/,
+-           int64_t /*ne2*/,
+-           int64_t /*ne3*/,
++          const uint3 ne0_fd,
++          const uint32_t n01,
+           uint64_t   nb0,
+           uint64_t   nb1,
+           uint64_t   nb2,
+@@ -114,11 +110,13 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+ 
+     const int64_t i3 = blockIdx.z;
+     const int64_t i2 = blockIdx.y;
+-    const int64_t i1 = blockIdx.x;
++    const int64_t ne0 = ne0_fd.z;
+ 
+-    const T * x;
++    for (uint32_t i = blockIdx.x*blockDim.x + threadIdx.x; i < n01; i += blockDim.x*gridDim.x) {
++        const int64_t i1 = fastdiv(i, ne0_fd);
++        const int64_t i0 = i - i1*ne0;
+ 
+-    for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
++        const T * x;
+         if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+             x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+         } else {
+@@ -163,15 +161,18 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
+     } else {
+         GGML_ASSERT(!ggml_is_quantized(src0->type));
+ 
+-        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
++        const int64_t n01 = dst->ne[0]*dst->ne[1];
++        GGML_ASSERT(n01 <= UINT32_MAX);
++        const uint3 ne0_fd = init_fastdiv_values((uint64_t) dst->ne[0]);
++        const int64_t nblocks = std::min<int64_t>((n01 + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, INT32_MAX);
++        dim3 grid_dim(nblocks, dst->ne[2], dst->ne[3]);
+         auto launch_kernel = [&](auto dim) {
+             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                 src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+-                src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                 src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+-                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
++                ne0_fd, (uint32_t) n01,
+                 dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+         };
+         switch (dim) {
