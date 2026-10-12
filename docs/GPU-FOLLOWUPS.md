@@ -65,6 +65,7 @@ the rest on the card). The tool is `tools/op-profile.cpp`: a warm read of a
 | `--spec-draft-p-min 0.5` (H3) | gpu backend, temperature 1.0, 2 rounds | see `--backend-sampling` baseline | 12.9-13.4 / 17.3-17.6 / 15.3-16.3 tok/s | rejected: -2 to -5% |
 | threads 14 / 16 / 17 / 18 (`-t` = `-tb`) | CPU run and GPU run, node 0 quiet, two passes in reversed order | 18: GPU prompt 8.41, 8.37 ms/token; CPU prompt 20.27, 19.61 | GPU prompt 17: 8.69, 8.72; 16: 9.16, 9.02. CPU prompt 17: 20.25, 20.40; 14: 24.09, 23.51 | keep 18. Verify: no count beats the spread (up to 21 ms CPU, 4 ms GPU). A 4-token verify runs on the `-tb` pool, so `-t` alone changes nothing there |
 | 36 threads (hyperthreads) for the experts | test-backend-ops, model shapes, box busy | 4-token matmul 0.83-0.86 ms | 10.9-12.1 ms | rejected |
+| 72 threads (hyperthreads, both sockets) on the gpu backend, moved with `THREADS=` through bin/restart-backend.sh | direct /completion on gpu0_0, 2000-token prompt, cache off, 256 greedy tokens, 3 reps, split warmed first | prefill 223.5 tok/s, generate 38.8 | prefill 190.4, generate 15.8 | rejected: generate -59%, prefill -15%; keep 36 (18 a socket). A first A/B passed `THREADS_ENV=`, which common.sh clobbers (`THREADS_ENV=${THREADS:-}`), so it was a false null; `TB` is also dead on gpu0_0 (its script passes no `--threads-batch`) |
 
 ### Where the time goes (op-profile, GPU run, ctx 150000, idle)
 
