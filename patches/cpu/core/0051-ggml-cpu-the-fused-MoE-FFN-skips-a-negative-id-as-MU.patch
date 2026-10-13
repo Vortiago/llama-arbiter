@@ -1,0 +1,143 @@
+From fe8a6e8fc88ba8eb7818312f7e4068c141cc4899 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Tue, 13 Oct 2026 23:52:47 +0200
+Subject: [PATCH] ggml-cpu: the fused MoE FFN skips a negative id, as
+ MUL_MAT_ID does
+
+With LLAMA_MOE_SPLIT at most 6, build_moe_ffn splits a batch of 6 or
+fewer tokens too (a verify step has 4). The split gives the CPU id -1 for
+each slot the card computes. Below 64 routed rows the CPU fuses gate, up,
+SWIGLU and down (ggml_compute_forward_moe_ffn), and that op asserted
+i02 >= 0: the process aborted.
+
+The fused op now skips a negative id when it groups the rows, and zeroes
+the down row of that slot, the same as the unfused MUL_MAT_ID. The fix is
+in the op, so any caller of negative ids gets the same rule.
+
+test-moe-split: the fused op with negative ids gives the same bits as the
+unfused ops, and zero rows where the id is negative (aborted before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-cpu/ggml-cpu.c | 16 ++++++++-
+ tests/test-moe-split.cpp     | 68 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 83 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index cc6f6286a..46229eda5 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2344,7 +2344,11 @@ static void ggml_compute_forward_moe_ffn(
+         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+             for (int id = 0; id < n_ids; ++id) {
+                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+-                GGML_ASSERT(i02 >= 0 && i02 < n_as);
++                // a negative id: another backend computes this row (see the zeroing below)
++                if (i02 < 0) {
++                    continue;
++                }
++                GGML_ASSERT(i02 < n_as);
+                 MMID_MATRIX_ROW(i02, counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+                 counts[i02] += 1;
+             }
+@@ -2366,6 +2370,16 @@ static void ggml_compute_forward_moe_ffn(
+         }
+     }
+ 
++    // the down row of a negative id is zero, as in mul_mat_id
++    for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
++        for (int id = 0; id < n_ids; ++id) {
++            const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
++            if (i02 < 0) {
++                memset((char *) down->data + id*down->nb[1] + iid1*down->nb[2], 0, down->ne[0]*sizeof(float));
++            }
++        }
++    }
++
+     ggml_barrier(params->threadpool);
+ 
+     const int64_t n_active = active[n_as];
+diff --git a/tests/test-moe-split.cpp b/tests/test-moe-split.cpp
+index 098d592ec..67b6d1439 100644
+--- a/tests/test-moe-split.cpp
++++ b/tests/test-moe-split.cpp
+@@ -103,10 +103,78 @@ static void test_cpu_negative_ids(int n_tokens) {
+     ggml_free(ctx);
+ }
+ 
++// The CPU fuses gate, up, SWIGLU and down of a small batch (ggml_compute_forward_moe_ffn). With
++// LLAMA_MOE_SPLIT at most the batch size, the split also runs on such a batch: the fused op gets
++// negative ids. Its result must be the unfused ops' result: a zero row for a negative id.
++static void test_cpu_fused_negative_ids() {
++    const int n_embd = 256, n_ff = 128, n_expert = 8, n_used = 3, n_tokens = 4;
++
++    ggml_init_params ip = { 64*1024*1024, nullptr, false };
++    ggml_context * ctx = ggml_init(ip);
++
++    ggml_tensor * wf = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_ff, n_expert);
++    ggml_tensor * wd = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_embd, n_expert);
++    ggml_tensor * w[3];
++    for (int i = 0; i < 3; i++) {
++        w[i] = i < 2 ? ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n_embd, n_ff, n_expert)
++                     : ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n_ff, n_embd, n_expert);
++    }
++    ggml_tensor * x  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
++    ggml_tensor * sk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
++
++    std::mt19937 rng(7);
++    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
++    for (int i = 0; i < 3; i++) {
++        ggml_tensor * src = i < 2 ? wf : wd;
++        for (int64_t j = 0; j < ggml_nelements(src); j++) ((float *) src->data)[j] = u(rng);
++        ggml_quantize_chunk(GGML_TYPE_Q8_0, (const float *) src->data, w[i]->data, 0, src->ne[1]*n_expert, src->ne[0], nullptr);
++    }
++    for (int64_t i = 0; i < ggml_nelements(x); i++) ((float *) x->data)[i] = u(rng);
++    for (int t = 0; t < n_tokens; t++) {
++        for (int k = 0; k < n_used; k++) {
++            const int32_t e = (t*5 + k*3) % n_expert;
++            ((int32_t *) sk->data)[t*n_used + k] = (e % 3 == 0) ? -1 : e;
++        }
++    }
++
++    auto ffn = [&](ggml_tensor ** gate_out) {
++        ggml_tensor * up   = ggml_mul_mat_id(ctx, w[0], x, sk);
++        ggml_tensor * gate = ggml_mul_mat_id(ctx, w[1], x, sk);
++        ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
++        *gate_out = gate;
++        return ggml_mul_mat_id(ctx, w[2], act, sk);
++    };
++    ggml_tensor * gate_f, * gate_r;
++    ggml_tensor * fused = ffn(&gate_f);
++    ggml_tensor * ref   = ffn(&gate_r);
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, fused);
++    ggml_build_forward_expand(gf, ref);
++    // a second use of gate keeps the reference unfused
++    ggml_build_forward_expand(gf, ggml_scale(ctx, gate_r, 1.0f));
++    // the zero rows must be written: start from NaN
++    for (int64_t i = 0; i < ggml_nelements(fused); i++) ((float *) fused->data)[i] = NAN;
++    CHECK(ggml_graph_compute_with_ctx(ctx, gf, 4) == GGML_STATUS_SUCCESS);
++
++    for (int t = 0; t < n_tokens; t++) {
++        for (int k = 0; k < n_used; k++) {
++            const float * a = (const float *) ((const char *) ref->data   + k*ref->nb[1]   + t*ref->nb[2]);
++            const float * b = (const float *) ((const char *) fused->data + k*fused->nb[1] + t*fused->nb[2]);
++            const bool skipped = ((int32_t *) sk->data)[t*n_used + k] < 0;
++            for (int i = 0; i < n_embd; i++) {
++                CHECK(skipped ? b[i] == 0.0f && a[i] == 0.0f : b[i] == a[i]);
++            }
++        }
++    }
++    ggml_free(ctx);
++}
++
+ int main() {
+     test_plan();
+     test_cpu_negative_ids(5);
+     test_cpu_negative_ids(300);  // enough rows per expert for the sgemm path
++    test_cpu_fused_negative_ids();
+     printf("ok\n");
+     return 0;
+ }

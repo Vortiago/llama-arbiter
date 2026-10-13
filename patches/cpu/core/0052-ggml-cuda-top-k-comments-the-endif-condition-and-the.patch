@@ -1,0 +1,43 @@
+From 94cf83d5c0cb56bc048335ad2657ef60947ab664 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Tue, 13 Oct 2026 23:52:47 +0200
+Subject: [PATCH] ggml-cuda: top-k comments: the #endif condition, and the
+ sampler's wide rows
+
+The #endif after the radix-select still named the old condition
+(!GGML_CUDA_USE_CUB && GGML_USE_HIP); it closes #if !CUB_TOP_K_AVAILABLE.
+
+The radix path (ncols >= 8192) also serves the backend top-k sampler,
+whose rows have ncols = n_vocab, not only the QSA indexer. Comments only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-cuda/top-k.cu | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 1bcffa4d7..c582765cc 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -214,7 +214,7 @@ static void top_k_radix_cuda(
+             src, dst, states, ncols, k, blocks_per_row);
+ }
+ 
+-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
++#endif // !defined(CUB_TOP_K_AVAILABLE)
+ 
+ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0   = dst->src[0];
+@@ -239,8 +239,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+     }
+ #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+-    // A wide row is the QSA indexer scoring one pooled key per block: a select
+-    // of the top k, not a sort of every column. Radix-select it. Below the
++    // A wide row needs a select of the top k, not a sort of every column:
++    // radix-select it. Wide rows come from the QSA indexer (one pooled key per
++    // block) and from the backend top-k sampler (ncols = n_vocab). Below the
+     // threshold the row is short and the argsort is fine.
+     if (ncols >= 8192) {
+         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);

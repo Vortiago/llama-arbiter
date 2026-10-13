@@ -1,0 +1,1165 @@
+From f49996897079ed3a74fb30dd01d3feb801a9910c Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Mon, 12 Oct 2026 16:05:07 +0200
+Subject: [PATCH] ggml: count scheduler and CUDA work behind GGML_OP_STATS
+
+One env gate reads once at init. Counters for the scheduler splits, input and
+expert copies, syncs and host gate waits; and for CUDA, copy bytes, op
+dispatches, stream syncs, CUDA graph captures/instantiates/updates/replays/
+evictions and gate waits. A greppable report at request end and from the CLI,
+and additive /metrics. Off by default; no cost when unset.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/CMakeLists.txt             |   1 +
+ ggml/include/ggml-stats.h       |  78 ++++++
+ ggml/src/CMakeLists.txt         |   2 +
+ ggml/src/ggml-backend.cpp       |  87 +++++--
+ ggml/src/ggml-cuda/common.cuh   |   4 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |  17 ++
+ ggml/src/ggml-stats.cpp         | 100 ++++++++
+ src/llama-context.cpp           |   4 +
+ tests/CMakeLists.txt            |   1 +
+ tests/test-backend-stats.cpp    | 422 ++++++++++++++++++++++++++++++++
+ tools/server/server-context.cpp |   4 +
+ tools/server/server-task.cpp    |  37 +++
+ 12 files changed, 740 insertions(+), 17 deletions(-)
+ create mode 100644 ggml/include/ggml-stats.h
+ create mode 100644 ggml/src/ggml-stats.cpp
+ create mode 100644 tests/test-backend-stats.cpp
+
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 4af7fc881..58252f43c 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -336,6 +336,7 @@ set(GGML_PUBLIC_HEADERS
+     include/ggml-opt.h
+     include/ggml-metal.h
+     include/ggml-rpc.h
++    include/ggml-stats.h
+     include/ggml-virtgpu.h
+     include/ggml-sycl.h
+     include/ggml-vulkan.h
+diff --git a/ggml/include/ggml-stats.h b/ggml/include/ggml-stats.h
+new file mode 100644
+index 000000000..68de56a80
+--- /dev/null
++++ b/ggml/include/ggml-stats.h
+@@ -0,0 +1,78 @@
++#pragma once
++
++// ggml operation statistics
++//
++// Pure process-lifetime counters for the scheduler and the CUDA backend. They are
++// disabled by default and enabled once by the env gate GGML_OP_STATS (>= 1). The
++// gate is read lazily on first use and cached, so no getenv runs on the hot path.
++//
++// Counters are process-global and unsynchronized. This is a debug/observability
++// tool, not a synchronization primitive: a multi-context embedder can drive more
++// than one scheduler or CUDA context at a time, and concurrent increments may
++// race and lose counts. Increments allocate nothing and take no locks. Add with
++// GGML_OP_STATS_ADD(), which is a no-op while the gate is off.
++//
++// ggml_op_stats_print() reports the delta since the previous call as one stable,
++// greppable block (prefix "ggml_op_stats:"). ggml_op_stats_graph_tick() drives the
++// optional "interval mode" (GGML_OP_STATS_INTERVAL=N graphs).
++
++#include <stdint.h>
++
++#include "ggml.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct ggml_op_stats {
++    // scheduler: ggml_backend_sched_compute_splits()
++    uint64_t sched_graphs;
++    uint64_t sched_splits;
++    uint64_t sched_input_copies;
++    uint64_t sched_copy_bytes;         // bytes copied into split backends (incl. expert bytes)
++    uint64_t sched_expert_copy_bytes;  // MoE: bytes copied by copy_experts()
++    uint64_t sched_syncs;              // backend / event synchronize calls
++    uint64_t sched_sync_us;            // wall time waited in those synchronize calls
++    uint64_t sched_late_eligible;      // can_compute_late() returned true
++    uint64_t sched_late_splits;        // eligible host split deferred behind the gate
++    uint64_t sched_gate_waits;         // host_gate_wait() queued a wait
++    uint64_t sched_gate_opens;         // host_gate_open() released the gate
++    uint64_t sched_gate_wait_us;       // wall time in host_gate_wait() calls that waited
++
++    // CUDA backend: ggml-cuda.cu / common.cuh
++    uint64_t cuda_h2d_bytes;           // set_tensor_async (and 2d)
++    uint64_t cuda_d2h_bytes;           // get_tensor_async (and 2d)
++    uint64_t cuda_d2d_bytes;           // cpy_tensor_async (and peer copy)
++    uint64_t cuda_ops;                 // ggml_cuda_compute_forward() calls
++    uint64_t cuda_sync_waited;         // context synchronize() that actually synchronized
++    uint64_t cuda_sync_fast;           // context synchronize() that returned early
++    uint64_t cuda_graph_captures;      // cudaStreamBeginCapture
++    uint64_t cuda_graph_capture_nodes; // nodes recorded during capture
++    uint64_t cuda_graph_instantiates;  // cudaGraphInstantiate
++    uint64_t cuda_graph_updates;       // ggml_cuda_graph_update_executable
++    uint64_t cuda_graph_replays;       // cudaGraphLaunch
++    uint64_t cuda_graph_evictions;     // LRU eviction in the graph cache
++    uint64_t cuda_gate_waits;          // host_gate_wait queued a stream wait
++    uint64_t cuda_gate_opens;          // host_gate_open published gate_waits
++};
++
++GGML_API struct ggml_op_stats g_ggml_op_stats;
++
++// the GGML_OP_STATS gate, read once
++GGML_API int  ggml_op_stats_enabled(void);
++
++// zero the counters and the delta baseline
++GGML_API void ggml_op_stats_reset(void);
++
++// print the delta since the previous print as one greppable block (no-op when disabled)
++GGML_API void ggml_op_stats_print(const char * tag);
++
++// register a computed graph; in interval mode (GGML_OP_STATS_INTERVAL=N) print every N graphs
++GGML_API void ggml_op_stats_graph_tick(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#define GGML_OP_STATS_ADD(field, val) \
++    do { if (ggml_op_stats_enabled()) { g_ggml_op_stats.field += (uint64_t) (val); } } while (0)
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 947732000..e0cb25238 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -195,11 +195,13 @@ add_library(ggml-base
+             ../include/ggml-backend.h
+             ../include/ggml-cpp.h
+             ../include/ggml-opt.h
++            ../include/ggml-stats.h
+             ../include/gguf.h
+             ggml.c
+             ggml.cpp
+             ggml-alloc.c
+             ggml-backend.cpp
++            ggml-stats.cpp
+             ggml-backend-meta.cpp
+             ggml-opt.cpp
+             ggml-threading.cpp
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index ef3b055b8..47d6530ff 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -12,6 +12,7 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
++#include "ggml-stats.h"
+ 
+ #include <assert.h>
+ #include <limits.h>
+@@ -1813,10 +1814,35 @@ static bool ggml_backend_sched_queued_host_copy(ggml_backend_t split_backend, co
+         input_cpy->buffer->buft == ggml_backend_get_default_buffer_type(split_backend);
+ }
+ 
++// scheduler synchronize calls, counting and timing them when the gate is on
++static void ggml_op_stats_sync(ggml_backend_t backend) {
++    if (!ggml_op_stats_enabled()) {
++        ggml_backend_synchronize(backend);
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    ggml_backend_synchronize(backend);
++    GGML_OP_STATS_ADD(sched_syncs, 1);
++    GGML_OP_STATS_ADD(sched_sync_us, ggml_time_us() - t0);
++}
++
++static void ggml_op_stats_event_sync(ggml_backend_event_t event) {
++    if (!ggml_op_stats_enabled()) {
++        ggml_backend_event_synchronize(event);
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    ggml_backend_event_synchronize(event);
++    GGML_OP_STATS_ADD(sched_syncs, 1);
++    GGML_OP_STATS_ADD(sched_sync_us, ggml_time_us() - t0);
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
++    GGML_OP_STATS_ADD(sched_graphs, 1);
++
+     ggml_tensor * prev_ids_tensor = nullptr;
+     std::vector<int32_t> ids;
+     std::vector<ggml_bitset_t> used_ids;
+@@ -1877,9 +1903,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         struct ggml_backend_sched_split * split = &splits[late_split];
+         ggml_backend_t qb = sched->backends[splits[late_split - 1].backend_id];
+         late_split = -1;
+-        ggml_backend_event_synchronize(sched->host_ready_events[ggml_backend_sched_backend_id(sched, qb)]);
++        ggml_op_stats_event_sync(sched->host_ready_events[ggml_backend_sched_backend_id(sched, qb)]);
+         enum ggml_status ec = ggml_backend_graph_compute_async(sched->backends[split->backend_id], &split->graph);
+         qb->iface.host_gate_open(qb);
++        GGML_OP_STATS_ADD(sched_gate_opens, 1);
+         return ec;
+     };
+ 
+@@ -1888,6 +1915,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        GGML_OP_STATS_ADD(sched_splits, 1);
++
+         if (late_split >= 0 && split_id != late_split + 1) {
+             enum ggml_status ec = compute_late();
+             if (ec != GGML_STATUS_SUCCESS) {
+@@ -1895,14 +1924,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+         const bool late = can_compute_late(split_id);
++        if (late) {
++            GGML_OP_STATS_ADD(sched_late_eligible, 1);
++        }
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
++                ggml_op_stats_event_sync(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
++                ggml_op_stats_sync(sched->backends[prev_backend_id]);
+             }
+         }
+ 
+@@ -1918,10 +1950,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++                    ggml_op_stats_event_sync(sched->events[split_backend_id][sched->cur_copy]);
+                 } else {
+-                    ggml_backend_synchronize(split_backend);
++                    ggml_op_stats_sync(split_backend);
+                 }
++                GGML_OP_STATS_ADD(sched_input_copies, 1);
++                GGML_OP_STATS_ADD(sched_copy_bytes, ggml_nbytes(input));
+                 ggml_backend_tensor_copy(input, input_cpy);
+             } else {
+                 // wait for the split backend to finish using the input before overwriting it;
+@@ -1929,7 +1963,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                 } else if (!ggml_backend_sched_queued_host_copy(split_backend, input, input_cpy)) {
+-                    ggml_backend_synchronize(split_backend);
++                    ggml_op_stats_sync(split_backend);
+                 }
+ 
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+@@ -1944,7 +1978,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+ 
+-                    ggml_backend_synchronize(input_backend);
++                    ggml_op_stats_sync(input_backend);
+ 
+                     // get the ids
+                     ggml_tensor * ids_tensor = node->src[2];
+@@ -1967,7 +2001,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     if (ids_tensor != prev_ids_tensor) {
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+-                        ggml_backend_synchronize(ids_backend);
++                        ggml_op_stats_sync(ids_backend);
+ 
+                         // find the used experts
+                         used_ids.clear();
+@@ -1990,6 +2024,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+ 
++                        GGML_OP_STATS_ADD(sched_input_copies, 1);
++                        GGML_OP_STATS_ADD(sched_copy_bytes, expert_size_copy);
++                        GGML_OP_STATS_ADD(sched_expert_copy_bytes, expert_size_copy);
+                         ggml_backend_tensor_set_async(split_backend,
+                             input_cpy,
+                             (const uint8_t *)input->data + expert_offset, expert_offset,
+@@ -2024,7 +2061,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 } else if (ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_async &&
+                            input_cpy->buffer->buft == ggml_backend_get_default_buffer_type(split_backend)) {
+                     // host memory to the split backend's own buffer: queue the copy on the split backend
+-                    ggml_backend_synchronize(input_backend);
++                    ggml_op_stats_sync(input_backend);
++                    GGML_OP_STATS_ADD(sched_input_copies, 1);
++                    GGML_OP_STATS_ADD(sched_copy_bytes, ggml_nbytes(input));
+                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                     reads_host[split_backend_id] = true;
+                     if (sched->host_read_events[split_backend_id] == NULL) {
+@@ -2036,20 +2075,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 } else if (ggml_backend_buffer_is_host(input_cpy->buffer) && input_backend->iface.get_tensor_async &&
+                            input->buffer->buft == ggml_backend_get_default_buffer_type(input_backend)) {
+                     // the input backend's own buffer to host memory: queue the copy, wait once before the compute
++                    GGML_OP_STATS_ADD(sched_input_copies, 1);
++                    GGML_OP_STATS_ADD(sched_copy_bytes, ggml_nbytes(input));
+                     ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                     writes_host[ggml_backend_sched_backend_id(sched, input_backend)] = true;
+                 } else {
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+-                        ggml_backend_synchronize(input_backend);
++                        ggml_op_stats_sync(input_backend);
+                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++                            ggml_op_stats_event_sync(sched->events[split_backend_id][sched->cur_copy]);
+                         } else {
+-                            ggml_backend_synchronize(split_backend);
++                            ggml_op_stats_sync(split_backend);
+                         }
+                         ggml_backend_tensor_copy(input, input_cpy);
+                     }
++                    GGML_OP_STATS_ADD(sched_input_copies, 1);
++                    GGML_OP_STATS_ADD(sched_copy_bytes, ggml_nbytes(input));
+                 }
+             }
+         }
+@@ -2058,8 +2101,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             // the input copies above are queued on the previous split's backend
+             const int q = splits[split_id - 1].backend_id;
+             ggml_backend_t qb = sched->backends[q];
++            const bool stats = ggml_op_stats_enabled();
+             ggml_backend_event_record(sched->host_ready_events[q], qb);
+-            if (qb->iface.host_gate_wait(qb, &splits[split_id + 1].graph)) {
++            const int64_t t0 = stats ? ggml_time_us() : 0;
++            const bool waited = qb->iface.host_gate_wait(qb, &splits[split_id + 1].graph);
++            if (stats && waited) {
++                GGML_OP_STATS_ADD(sched_gate_waits, 1);
++                GGML_OP_STATS_ADD(sched_gate_wait_us, ggml_time_us() - t0);
++            }
++            if (waited) {
++                GGML_OP_STATS_ADD(sched_late_splits, 1);
+                 late_split = split_id;
+             }
+         }
+@@ -2067,7 +2118,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         if (late_split != split_id) {
+             for (int b = 0; b < sched->n_backends; b++) {
+                 if (writes_host[b]) {
+-                    ggml_backend_synchronize(sched->backends[b]);
++                    ggml_op_stats_sync(sched->backends[b]);
+                 }
+             }
+         }
+@@ -2104,7 +2155,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 }
+ 
+                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+-                ggml_backend_synchronize(split_backend);
++                ggml_op_stats_sync(split_backend);
+ 
+                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                     break;
+@@ -2135,12 +2186,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             continue;
+         }
+         if (sched->host_read_events[b] != NULL) {
+-            ggml_backend_event_synchronize(sched->host_read_events[b]);
++            ggml_op_stats_event_sync(sched->host_read_events[b]);
+         } else {
+-            ggml_backend_synchronize(sched->backends[b]);
++            ggml_op_stats_sync(sched->backends[b]);
+         }
+     }
+ 
++    ggml_op_stats_graph_tick();
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 64a45ea86..76238b316 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -3,6 +3,7 @@
+ #include "ggml.h"
+ #include "ggml-impl.h"
+ #include "ggml-cuda.h"
++#include "ggml-stats.h"
+ 
+ #include <cstdint>
+ #include <cstdlib>
+@@ -1502,6 +1503,7 @@ public:
+             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+                 if (time_now - it->second->last_used_time >= 10'000'000) {
+                     it = cuda_graphs.erase(it);
++                    GGML_OP_STATS_ADD(cuda_graph_evictions, 1);
+                 } else {
+                     ++it;
+                 }
+@@ -1563,9 +1565,11 @@ public:
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+         // Multi-device execution retains its existing synchronization behavior.
+         if (ggml_cuda_info().device_count == 1 && !stream_used[device][curr_stream_no]) {
++            GGML_OP_STATS_ADD(cuda_sync_fast, 1);
+             return;
+         }
+ #endif
++        GGML_OP_STATS_ADD(cuda_sync_waited, 1);
+         CUDA_CHECK(cudaStreamSynchronize(stream()));
+         stream_used[device][curr_stream_no] = false;
+     }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 554d93bdf..a71903e02 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2549,6 +2549,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    GGML_OP_STATS_ADD(cuda_h2d_bytes, size);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+ 
+@@ -2558,6 +2559,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    GGML_OP_STATS_ADD(cuda_d2h_bytes, size);
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
+@@ -2568,6 +2570,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    GGML_OP_STATS_ADD(cuda_h2d_bytes, size*n_copies);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+ }
+@@ -2579,6 +2582,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+ 
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
++    GGML_OP_STATS_ADD(cuda_d2h_bytes, size*n_copies);
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+@@ -2639,6 +2643,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+         // src and dst are on the same backend
+         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+     }
++    GGML_OP_STATS_ADD(cuda_d2d_bytes, ggml_nbytes(dst));
+     return true;
+ }
+ 
+@@ -2761,6 +2766,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
+         (void)cudaGetLastError();
+         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+         graph->instance = nullptr;
++        GGML_OP_STATS_ADD(cuda_graph_instantiates, 1);
+         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+     } else {
+         GGML_ASSERT(stat == cudaSuccess);
+@@ -4526,6 +4532,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 }
+                 GGML_ASSERT(ok);
+ 
++                GGML_OP_STATS_ADD(cuda_ops, 1);
++                if (use_cuda_graph) { // capture is in progress
++                    GGML_OP_STATS_ADD(cuda_graph_capture_nodes, 1);
++                }
++
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+                }
+@@ -4555,12 +4566,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     if (use_cuda_graph) {
+         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+         if (graph->instance == nullptr) { // Create executable graph from captured graph.
++            GGML_OP_STATS_ADD(cuda_graph_instantiates, 1);
+             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+         }
+         if (cuda_graph_update_required) { // Update graph executable
++            GGML_OP_STATS_ADD(cuda_graph_updates, 1);
+             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+         }
+         // Launch graph
++        GGML_OP_STATS_ADD(cuda_graph_replays, 1);
+         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+ #else
+         GGML_UNUSED(graph_key);
+@@ -4638,6 +4652,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+         }
+ 
+         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
++        GGML_OP_STATS_ADD(cuda_graph_captures, 1);
+     }
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+@@ -5130,6 +5145,7 @@ static bool ggml_backend_cuda_host_gate_wait(ggml_backend_t backend, const ggml_
+     }
+     // the n-th wait holds the stream until the n-th open writes n
+     cuda_ctx->gate_waits++;
++    GGML_OP_STATS_ADD(cuda_gate_waits, 1);
+     CU_CHECK(cuStreamWaitValue32(cuda_ctx->stream(), (CUdeviceptr) cuda_ctx->gate_dev, cuda_ctx->gate_waits, CU_STREAM_WAIT_VALUE_GEQ));
+     return true;
+ #endif
+@@ -5138,6 +5154,7 @@ static bool ggml_backend_cuda_host_gate_wait(ggml_backend_t backend, const ggml_
+ static void ggml_backend_cuda_host_gate_open(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
++    GGML_OP_STATS_ADD(cuda_gate_opens, 1);
+     __atomic_store_n(cuda_ctx->gate_host, cuda_ctx->gate_waits, __ATOMIC_RELEASE);
+ }
+ 
+diff --git a/ggml/src/ggml-stats.cpp b/ggml/src/ggml-stats.cpp
+new file mode 100644
+index 000000000..f0aad8cf9
+--- /dev/null
++++ b/ggml/src/ggml-stats.cpp
+@@ -0,0 +1,100 @@
++#include "ggml-stats.h"
++#include "ggml-impl.h"
++
++#include <inttypes.h>
++#include <stdlib.h>
++#include <string.h>
++
++struct ggml_op_stats g_ggml_op_stats = {};
++
++// baseline for the delta printed by ggml_op_stats_print()
++static struct ggml_op_stats g_ggml_op_stats_last = {};
++
++// interval mode: every N computed graphs print the delta (0 = off)
++static int64_t g_ggml_op_stats_graphs = 0;
++
++int ggml_op_stats_enabled(void) {
++    static const int enabled = []() -> int {
++        const char * v = getenv("GGML_OP_STATS");
++        return v != nullptr && atoi(v) >= 1;
++    }();
++    return enabled;
++}
++
++static int64_t ggml_op_stats_interval(void) {
++    static const int64_t interval = []() -> int64_t {
++        const char * v = getenv("GGML_OP_STATS_INTERVAL");
++        return v != nullptr ? (int64_t) atoll(v) : 0;
++    }();
++    return interval;
++}
++
++void ggml_op_stats_reset(void) {
++    memset(&g_ggml_op_stats, 0, sizeof(g_ggml_op_stats));
++    memset(&g_ggml_op_stats_last, 0, sizeof(g_ggml_op_stats_last));
++    g_ggml_op_stats_graphs = 0;
++}
++
++void ggml_op_stats_print(const char * tag) {
++    if (!ggml_op_stats_enabled()) {
++        return;
++    }
++
++    const struct ggml_op_stats * s = &g_ggml_op_stats;
++    const struct ggml_op_stats * p = &g_ggml_op_stats_last;
++
++    GGML_LOG_INFO("ggml_op_stats: tag=%s graphs=%" PRIu64 " splits=%" PRIu64
++            " input_copies=%" PRIu64 " copy_bytes=%" PRIu64 " expert_copy_bytes=%" PRIu64
++            " sched_syncs=%" PRIu64 " sched_sync_us=%" PRIu64 " late_eligible=%" PRIu64
++            " late_splits=%" PRIu64 " sched_gate_waits=%" PRIu64 " sched_gate_opens=%" PRIu64
++            " sched_gate_wait_us=%" PRIu64 "\n",
++            tag,
++            s->sched_graphs        - p->sched_graphs,
++            s->sched_splits        - p->sched_splits,
++            s->sched_input_copies  - p->sched_input_copies,
++            s->sched_copy_bytes    - p->sched_copy_bytes,
++            s->sched_expert_copy_bytes - p->sched_expert_copy_bytes,
++            s->sched_syncs         - p->sched_syncs,
++            s->sched_sync_us       - p->sched_sync_us,
++            s->sched_late_eligible - p->sched_late_eligible,
++            s->sched_late_splits   - p->sched_late_splits,
++            s->sched_gate_waits    - p->sched_gate_waits,
++            s->sched_gate_opens    - p->sched_gate_opens,
++            s->sched_gate_wait_us  - p->sched_gate_wait_us);
++
++    GGML_LOG_INFO("ggml_op_stats: tag=%s cuda_h2d_bytes=%" PRIu64 " cuda_d2h_bytes=%" PRIu64
++            " cuda_d2d_bytes=%" PRIu64 " cuda_ops=%" PRIu64 " cuda_sync_waited=%" PRIu64
++            " cuda_sync_fast=%" PRIu64 " cuda_graph_captures=%" PRIu64
++            " cuda_graph_capture_nodes=%" PRIu64 " cuda_graph_instantiates=%" PRIu64
++            " cuda_graph_updates=%" PRIu64 " cuda_graph_replays=%" PRIu64
++            " cuda_graph_evictions=%" PRIu64 " cuda_gate_waits=%" PRIu64
++            " cuda_gate_opens=%" PRIu64 "\n",
++            tag,
++            s->cuda_h2d_bytes        - p->cuda_h2d_bytes,
++            s->cuda_d2h_bytes        - p->cuda_d2h_bytes,
++            s->cuda_d2d_bytes        - p->cuda_d2d_bytes,
++            s->cuda_ops              - p->cuda_ops,
++            s->cuda_sync_waited      - p->cuda_sync_waited,
++            s->cuda_sync_fast        - p->cuda_sync_fast,
++            s->cuda_graph_captures   - p->cuda_graph_captures,
++            s->cuda_graph_capture_nodes - p->cuda_graph_capture_nodes,
++            s->cuda_graph_instantiates - p->cuda_graph_instantiates,
++            s->cuda_graph_updates    - p->cuda_graph_updates,
++            s->cuda_graph_replays    - p->cuda_graph_replays,
++            s->cuda_graph_evictions  - p->cuda_graph_evictions,
++            s->cuda_gate_waits       - p->cuda_gate_waits,
++            s->cuda_gate_opens       - p->cuda_gate_opens);
++
++    g_ggml_op_stats_last = g_ggml_op_stats;
++}
++
++void ggml_op_stats_graph_tick(void) {
++    if (!ggml_op_stats_enabled()) {
++        return;
++    }
++    const int64_t interval = ggml_op_stats_interval();
++    g_ggml_op_stats_graphs++;
++    if (interval > 0 && g_ggml_op_stats_graphs % interval == 0) {
++        ggml_op_stats_print("interval");
++    }
++}
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 722ccc3c3..39240c87f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-context.h"
+ 
+ #include "ggml.h"
++#include "ggml-stats.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+ #include "llama-impl.h"
+@@ -4444,6 +4445,9 @@ void llama_perf_context_print(const llama_context * ctx) {
+             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
+     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
+     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
++
++    // scheduler/CUDA counters since the previous print
++    ggml_op_stats_print("cli");
+ }
+ 
+ void llama_perf_context_reset(llama_context * ctx) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 95c613e57..778bb290e 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -359,6 +359,7 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
+ endif()
+ 
+ llama_build_and_test(test-backend-sched-host.cpp)
++llama_build_and_test(test-backend-stats.cpp)
+ 
+ llama_build(test-export-graph-ops.cpp)
+ if (TARGET gguf-model-data)
+diff --git a/tests/test-backend-stats.cpp b/tests/test-backend-stats.cpp
+new file mode 100644
+index 000000000..bb086fec2
+--- /dev/null
++++ b/tests/test-backend-stats.cpp
+@@ -0,0 +1,422 @@
++// The scheduler and CUDA counters in ggml/src/ggml-stats.cpp move by known amounts.
++//
++// The scheduler only inserts input copies between backends with different buffer types, so a
++// CPU-only graph cannot be split (every CPU backend shares the CPU buffer type and pass 3 of
++// ggml_backend_sched_split_graph merges same-buft backends). The test therefore has:
++//   - a CPU-only smoke case that runs a graph and checks the scheduler graph/split counters, and
++//   - a GPU+CPU case that forces copies and splits and checks the sched_* and cuda_* counters.
++// The GPU case runs only when the GPU reports enough free VRAM (or GGML_OP_STATS_TEST_GPU=1),
++// so it does not disturb a busy GPU by default.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cuda.h"
++#include "ggml-stats.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++static void set_gate(const char * name, const char * value) {
++#ifdef _WIN32
++    _putenv_s(name, value);
++#else
++    setenv(name, value, 1);
++#endif
++}
++
++// case-insensitive ASCII compare
++static bool ieq(const char * a, const char * b) {
++    while (*a != '\0' && *b != '\0') {
++        char ca = *a, cb = *b;
++        if (ca >= 'A' && ca <= 'Z') ca = (char) (ca - 'A' + 'a');
++        if (cb >= 'A' && cb <= 'Z') cb = (char) (cb - 'A' + 'a');
++        if (ca != cb) {
++            return false;
++        }
++        a++;
++        b++;
++    }
++    return *a == '\0' && *b == '\0';
++}
++
++static int check(const char * what, uint64_t got, uint64_t want) {
++    if (got != want) {
++        printf("FAILED %s: got %llu, want %llu\n", what, (unsigned long long) got, (unsigned long long) want);
++        return 1;
++    }
++    return 0;
++}
++
++#define DELTA(lo, hi, field) ((hi).field - (lo).field)
++
++// run one small graph on two CPU backends: exercises the per-graph scheduler counters
++static bool run_cpu_case(struct ggml_op_stats * before, struct ggml_op_stats * after) {
++    ggml_backend_t b0 = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    ggml_backend_t b1 = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    if (!b0 || !b1) {
++        return false;
++    }
++
++    const int n_embd = 128, n_tok = 4;
++    ggml_init_params wp = { ggml_tensor_overhead() * 8, nullptr, true };
++    ggml_context * ctx_w = ggml_init(wp);
++    ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_embd);
++
++    ggml_init_params gp = { ggml_tensor_overhead() * 64 + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(gp);
++    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
++    ggml_set_input(x);
++    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
++    ggml_set_output(y);
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, y);
++
++    ggml_backend_t backends[2] = { b0, b1 };
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 64, false, true);
++    ggml_backend_sched_reset(sched);
++    ggml_backend_sched_set_tensor_backend(sched, x, b0);
++    ggml_backend_sched_set_tensor_backend(sched, w, b0);
++    ggml_backend_sched_set_tensor_backend(sched, y, b1);
++    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
++        printf("cpu alloc failed\n");
++        return false;
++    }
++
++    std::vector<float> w_in(n_embd * n_embd, 1.0f), x_in(n_embd * n_tok, 1.0f);
++    ggml_backend_tensor_set(w, w_in.data(), 0, ggml_nbytes(w));
++    ggml_backend_tensor_set(x, x_in.data(), 0, ggml_nbytes(x));
++
++    ggml_op_stats_reset();
++    *before = g_ggml_op_stats;
++    const enum ggml_status st = ggml_backend_sched_graph_compute(sched, gf);
++    *after = g_ggml_op_stats;
++
++    const bool ok = st == GGML_STATUS_SUCCESS;
++
++    ggml_backend_sched_free(sched);
++    ggml_free(ctx);
++    ggml_free(ctx_w);
++    ggml_backend_free(b0);
++    ggml_backend_free(b1);
++    return ok;
++}
++
++enum {
++    GPU_CASE_SKIP  = 0, // no GPU backend available
++    GPU_CASE_OK    = 1,
++    GPU_CASE_FAIL  = 2,
++    GPU_CASE_ALLOC = 3, // buffer allocation failed (environment)
++};
++
++// Three computes of the same graph. Pass 1 runs directly and warms up the CUDA graphs, pass 2
++// captures, instantiates and replays them, pass 3 only replays.
++#define N_PASSES 3
++
++// run x -> a=g*tanh(w_gpu*x) on GPU, b=w_cpu*a on CPU, y=g+b on GPU: forces copies on both
++// directions. bufts, when non-null, overrides the backends' buffer types (used to put the CPU
++// splits in the GPU's pinned host memory so the scheduler can defer them behind the host gate).
++static int run_gpu_case(ggml_backend_buffer_type_t * bufts,
++                        struct ggml_op_stats b[N_PASSES], struct ggml_op_stats a[N_PASSES]) {
++    ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
++    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    if (!gpu || !cpu) {
++        if (gpu) {
++            ggml_backend_free(gpu);
++        }
++        if (cpu) {
++            ggml_backend_free(cpu);
++        }
++        return GPU_CASE_SKIP;
++    }
++
++#ifdef GGML_USE_CUDA
++    // the first GPU backend in registry order may not be CUDA, but the cuda_* counters are
++    if (!ggml_backend_is_cuda(gpu)) {
++        printf("gpu case skipped: first GPU backend is not CUDA\n");
++        ggml_backend_free(gpu);
++        ggml_backend_free(cpu);
++        return GPU_CASE_SKIP;
++    }
++#else
++    printf("gpu case skipped: built without CUDA\n");
++    ggml_backend_free(gpu);
++    ggml_backend_free(cpu);
++    return GPU_CASE_SKIP;
++#endif
++
++    const int n_layer = 2, n_embd = 128, n_tok = 4;
++
++    ggml_init_params wp = { ggml_tensor_overhead() * (2 * n_layer + 1), nullptr, true };
++    ggml_context * ctx_g = ggml_init(wp);
++    ggml_context * ctx_c = ggml_init(wp);
++    std::vector<ggml_tensor *> wg(n_layer), wc(n_layer);
++    for (int i = 0; i < n_layer; i++) {
++        wg[i] = ggml_new_tensor_2d(ctx_g, GGML_TYPE_F32, n_embd, n_embd);
++        wc[i] = ggml_new_tensor_2d(ctx_c, GGML_TYPE_F32, n_embd, n_embd);
++    }
++    ggml_backend_buffer_t buf_g = ggml_backend_alloc_ctx_tensors(ctx_g, gpu);
++    ggml_backend_buffer_t buf_c = ggml_backend_alloc_ctx_tensors(ctx_c, cpu);
++    ggml_backend_buffer_set_usage(buf_g, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    ggml_backend_buffer_set_usage(buf_c, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    std::mt19937 rng(42);
++    std::normal_distribution<float> nd(0.0f, 1.0f / std::sqrt((float) n_embd));
++    std::vector<float> w(n_embd * n_embd);
++    for (int i = 0; i < n_layer; i++) {
++        for (auto & v : w) v = nd(rng);
++        ggml_backend_tensor_set(wg[i], w.data(), 0, ggml_nbytes(wg[i]));
++        for (auto & v : w) v = nd(rng);
++        ggml_backend_tensor_set(wc[i], w.data(), 0, ggml_nbytes(wc[i]));
++    }
++
++    ggml_init_params gp = { ggml_tensor_overhead() * 4096 + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(gp);
++    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
++    ggml_set_input(x);
++    ggml_tensor * h = x;
++    std::vector<ggml_tensor *> on_gpu;
++    for (int i = 0; i < n_layer; i++) {
++        ggml_tensor * g = ggml_tanh(ctx, ggml_mul_mat(ctx, wg[i], h));
++        ggml_tensor * c = ggml_mul_mat(ctx, wc[i], g);
++        h = ggml_add(ctx, g, c);
++        on_gpu.push_back(g->src[0]);
++        on_gpu.push_back(g);
++        on_gpu.push_back(h);
++    }
++    ggml_set_output(h);
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, h);
++
++    ggml_backend_t backends[2] = { gpu, cpu };
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 4096, false, true);
++    ggml_backend_sched_reset(sched);
++    for (ggml_tensor * t : on_gpu) {
++        ggml_backend_sched_set_tensor_backend(sched, t, gpu);
++    }
++    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
++        printf("gpu alloc failed\n");
++        ggml_backend_sched_free(sched);
++        ggml_backend_buffer_free(buf_g);
++        ggml_backend_buffer_free(buf_c);
++        ggml_free(ctx);
++        ggml_free(ctx_g);
++        ggml_free(ctx_c);
++        ggml_backend_free(gpu);
++        ggml_backend_free(cpu);
++        return GPU_CASE_ALLOC;
++    }
++    std::vector<float> x_in(n_embd * n_tok, 1.0f);
++    ggml_backend_tensor_set(x, x_in.data(), 0, ggml_nbytes(x));
++
++    ggml_op_stats_reset();
++    bool ok = true;
++    for (int p = 0; p < N_PASSES; p++) {
++        b[p] = g_ggml_op_stats;
++        ok = ok && ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
++        a[p] = g_ggml_op_stats;
++    }
++
++    ggml_backend_sched_free(sched);
++    ggml_backend_buffer_free(buf_g);
++    ggml_backend_buffer_free(buf_c);
++    ggml_free(ctx);
++    ggml_free(ctx_g);
++    ggml_free(ctx_c);
++    ggml_backend_free(gpu);
++    ggml_backend_free(cpu);
++    return ok ? GPU_CASE_OK : GPU_CASE_FAIL;
++}
++
++int main() {
++    // enable the gate before any compute: the stats module reads it once on first use
++    set_gate("GGML_OP_STATS", "1");
++    ggml_backend_load_all();
++
++    struct ggml_op_stats before = {}, after = {};
++
++    int fails = 0;
++
++    // CPU smoke case
++    if (!run_cpu_case(&before, &after)) {
++        printf("FAILED (cpu case did not run)\n");
++        return 1;
++    }
++    const uint64_t cpu_graphs = after.sched_graphs - before.sched_graphs;
++    const uint64_t cpu_splits = after.sched_splits - before.sched_splits;
++    printf("cpu stats: graphs=%llu splits=%llu\n", (unsigned long long) cpu_graphs, (unsigned long long) cpu_splits);
++    fails += check("cpu graphs", cpu_graphs, 1);
++    fails += check("cpu splits", cpu_splits, 1);
++
++    // the report block must not change the counters
++    ggml_op_stats_print("test");
++    fails += check("print is side-effect free", g_ggml_op_stats.sched_splits - after.sched_splits, 0);
++
++    // GPU case: run only when the GPU has room, so a busy GPU is left alone
++    const char * force = getenv("GGML_OP_STATS_TEST_GPU");
++    // "1", "yes" and "true" (any case) enable the GPU case; anything else set disables it
++    const bool forced   = force != nullptr && (ieq(force, "yes") || ieq(force, "true") || atoi(force) >= 1);
++    const bool disabled = force != nullptr && !forced;
++
++    size_t vram_free = 0, vram_total = 0;
++    ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++    if (gpu_dev) {
++        ggml_backend_dev_memory(gpu_dev, &vram_free, &vram_total);
++    }
++
++    const size_t vram_need = 512ull * 1024 * 1024;
++    if (disabled) {
++        printf("gpu case disabled (GGML_OP_STATS_TEST_GPU=%s)\n", force);
++    } else if (!forced && (!gpu_dev || vram_free < vram_need)) {
++        printf("gpu case skipped: no GPU or free VRAM %zu MiB < %zu MiB\n",
++               vram_free / 1024 / 1024, vram_need / 1024 / 1024);
++    } else {
++        struct ggml_op_stats b[N_PASSES] = {}, a[N_PASSES] = {};
++        const int rc = run_gpu_case(nullptr, b, a);
++        if (rc == GPU_CASE_SKIP) {
++            printf("gpu case skipped: no GPU backend\n");
++            return 0;
++        }
++        if (rc == GPU_CASE_FAIL || rc == GPU_CASE_ALLOC) {
++            printf("FAILED (gpu case did not run)\n");
++            return 1;
++        }
++
++        // the CUDA fast synchronize shortcut only exists for a single non-HIP/MUSA device
++        bool sync_fast_cuda = false;
++#ifdef GGML_USE_CUDA
++        sync_fast_cuda = gpu_dev != nullptr && ggml_backend_cuda_get_device_count() == 1 &&
++                         strncmp(ggml_backend_dev_name(gpu_dev), "CUDA", 4) == 0;
++#endif
++
++        // 5 splits, 5 input copies (x, the two GPU->host and two host->GPU handoffs), all F32 128x4
++        for (int p = 0; p < N_PASSES; p++) {
++            char what[64];
++            snprintf(what, sizeof(what), "plain pass%d", p + 1);
++            fails += check(what, DELTA(b[p], a[p], sched_graphs), 1);
++            snprintf(what, sizeof(what), "plain pass%d splits", p + 1);
++            fails += check(what, DELTA(b[p], a[p], sched_splits), 5);
++            snprintf(what, sizeof(what), "plain pass%d input_copies", p + 1);
++            fails += check(what, DELTA(b[p], a[p], sched_input_copies), 5);
++            snprintf(what, sizeof(what), "plain pass%d copy_bytes", p + 1);
++            fails += check(what, DELTA(b[p], a[p], sched_copy_bytes), 10240);
++            snprintf(what, sizeof(what), "plain pass%d sched_syncs", p + 1);
++            fails += check(what, DELTA(b[p], a[p], sched_syncs), 10);
++            snprintf(what, sizeof(what), "plain pass%d cuda_h2d", p + 1);
++            fails += check(what, DELTA(b[p], a[p], cuda_h2d_bytes), 4096);
++            snprintf(what, sizeof(what), "plain pass%d cuda_d2h", p + 1);
++            fails += check(what, DELTA(b[p], a[p], cuda_d2h_bytes), 4096);
++            snprintf(what, sizeof(what), "plain pass%d cuda_d2d", p + 1);
++            fails += check(what, DELTA(b[p], a[p], cuda_d2d_bytes), 0);
++            snprintf(what, sizeof(what), "plain pass%d cuda_sync_total", p + 1);
++            fails += check(what, DELTA(b[p], a[p], cuda_sync_waited) + DELTA(b[p], a[p], cuda_sync_fast), 6);
++            if (sync_fast_cuda) {
++                snprintf(what, sizeof(what), "plain pass%d cuda_sync_waited", p + 1);
++                fails += check(what, DELTA(b[p], a[p], cuda_sync_waited), 3);
++                snprintf(what, sizeof(what), "plain pass%d cuda_sync_fast", p + 1);
++                fails += check(what, DELTA(b[p], a[p], cuda_sync_fast), 3);
++            }
++            // no host split is eligible here: the CPU splits write into the CPU default buffer,
++            // not the GPU's pinned host buffer, so the next GPU split is not a queued host copy
++            snprintf(what, sizeof(what), "plain pass%d late_eligible", p + 1);
++            fails += check(what, DELTA(b[p], a[p], sched_late_eligible), 0);
++            snprintf(what, sizeof(what), "plain pass%d late_splits", p + 1);
++            fails += check(what, DELTA(b[p], a[p], sched_late_splits), 0);
++            snprintf(what, sizeof(what), "plain pass%d gate_waits", p + 1);
++            fails += check(what, DELTA(b[p], a[p], sched_gate_waits), 0);
++        }
++
++        // the 3 GPU splits have 2, 3 and 1 nodes; pass 2 captures all 3, so 6 nodes total
++        fails += check("plain pass1 cuda_ops", DELTA(b[0], a[0], cuda_ops), 6);
++        fails += check("plain pass2 cuda_ops", DELTA(b[1], a[1], cuda_ops), 6);
++        const bool graphs_on = DELTA(b[1], a[1], cuda_graph_captures) > 0;
++        if (graphs_on) {
++            fails += check("plain pass1 cuda_graph_captures", DELTA(b[0], a[0], cuda_graph_captures), 0);
++            fails += check("plain pass2 cuda_graph_captures", DELTA(b[1], a[1], cuda_graph_captures), 3);
++            fails += check("plain pass2 cuda_graph_capture_nodes", DELTA(b[1], a[1], cuda_graph_capture_nodes), 6);
++            fails += check("plain pass2 cuda_graph_instantiates", DELTA(b[1], a[1], cuda_graph_instantiates), 3);
++            fails += check("plain pass2 cuda_graph_updates", DELTA(b[1], a[1], cuda_graph_updates), 3);
++            fails += check("plain pass2 cuda_graph_replays", DELTA(b[1], a[1], cuda_graph_replays), 3);
++            fails += check("plain pass2 cuda_graph_evictions", DELTA(b[1], a[1], cuda_graph_evictions), 0);
++            fails += check("plain pass3 cuda_ops", DELTA(b[2], a[2], cuda_ops), 0);
++            fails += check("plain pass3 cuda_graph_captures", DELTA(b[2], a[2], cuda_graph_captures), 0);
++            fails += check("plain pass3 cuda_graph_replays", DELTA(b[2], a[2], cuda_graph_replays), 3);
++        }
++
++        // same graph, but the CPU split's tensors live in the GPU's pinned host memory: on pass 3
++        // the graphs are warm and instantiated, so the scheduler defers the two host splits
++        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_dev);
++        if (host_buft == nullptr) {
++            printf("late case skipped: GPU has no host buffer type\n");
++        } else {
++            ggml_backend_buffer_type_t bufts[2] = { ggml_backend_dev_buffer_type(gpu_dev), host_buft };
++            struct ggml_op_stats lb[N_PASSES] = {}, la[N_PASSES] = {};
++            const int lrc = run_gpu_case(bufts, lb, la);
++            if (lrc == GPU_CASE_ALLOC) {
++                printf("late case skipped: pinned host alloc failed\n");
++                return 0;
++            }
++            if (lrc != GPU_CASE_OK) {
++                printf("FAILED (late case did not run)\n");
++                return 1;
++            }
++
++            const bool graphs_on = DELTA(lb[1], la[1], cuda_graph_captures) > 0;
++            for (int p = 0; p < N_PASSES; p++) {
++                char what[64];
++                snprintf(what, sizeof(what), "late pass%d splits", p + 1);
++                fails += check(what, DELTA(lb[p], la[p], sched_splits), 5);
++                snprintf(what, sizeof(what), "late pass%d late_eligible", p + 1);
++                fails += check(what, DELTA(lb[p], la[p], sched_late_eligible), 2);
++
++                // passes 1-2 defer nothing; pass 3 defers only once the graphs are warm.
++                // gate_waits, gate_opens and the cuda gate counters == late_splits here
++                const uint64_t defer = (p == N_PASSES - 1 && graphs_on) ? 2 : 0;
++                snprintf(what, sizeof(what), "late pass%d late_splits", p + 1);
++                fails += check(what, DELTA(lb[p], la[p], sched_late_splits), defer);
++                snprintf(what, sizeof(what), "late pass%d gate_waits", p + 1);
++                fails += check(what, DELTA(lb[p], la[p], sched_gate_waits), defer);
++                snprintf(what, sizeof(what), "late pass%d gate_opens", p + 1);
++                fails += check(what, DELTA(lb[p], la[p], sched_gate_opens), defer);
++                snprintf(what, sizeof(what), "late pass%d cuda_gate_waits", p + 1);
++                fails += check(what, DELTA(lb[p], la[p], cuda_gate_waits), defer);
++                snprintf(what, sizeof(what), "late pass%d cuda_gate_opens", p + 1);
++                fails += check(what, DELTA(lb[p], la[p], cuda_gate_opens), defer);
++            }
++
++            if (graphs_on) {
++                fails += check("late pass3 cuda_ops",     DELTA(lb[2], la[2], cuda_ops), 0);
++                fails += check("late pass3 cuda_graph_replays", DELTA(lb[2], la[2], cuda_graph_replays), 3);
++            }
++
++            printf("late stats: pass3 eligible=%llu splits=%llu gate_waits=%llu gate_opens=%llu"
++                   " cuda_gate_waits=%llu cuda_gate_opens=%llu\n",
++                   (unsigned long long) DELTA(lb[2], la[2], sched_late_eligible),
++                   (unsigned long long) DELTA(lb[2], la[2], sched_late_splits),
++                   (unsigned long long) DELTA(lb[2], la[2], sched_gate_waits),
++                   (unsigned long long) DELTA(lb[2], la[2], sched_gate_opens),
++                   (unsigned long long) DELTA(lb[2], la[2], cuda_gate_waits),
++                   (unsigned long long) DELTA(lb[2], la[2], cuda_gate_opens));
++        }
++
++        printf("gpu stats: pass1 splits=%llu copies=%llu bytes=%llu cuda_ops=%llu h2d=%llu"
++               " pass2 captures=%llu instantiates=%llu updates=%llu replays=%llu\n",
++               (unsigned long long) DELTA(b[0], a[0], sched_splits),
++               (unsigned long long) DELTA(b[0], a[0], sched_input_copies),
++               (unsigned long long) DELTA(b[0], a[0], sched_copy_bytes),
++               (unsigned long long) DELTA(b[0], a[0], cuda_ops),
++               (unsigned long long) DELTA(b[0], a[0], cuda_h2d_bytes),
++               (unsigned long long) DELTA(b[1], a[1], cuda_graph_captures),
++               (unsigned long long) DELTA(b[1], a[1], cuda_graph_instantiates),
++               (unsigned long long) DELTA(b[1], a[1], cuda_graph_updates),
++               (unsigned long long) DELTA(b[1], a[1], cuda_graph_replays));
++    }
++
++    printf(fails ? "FAILED (%d)\n" : "OK\n", fails);
++    return fails ? 1 : 0;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 625d3cd0f..dafded83a 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -11,6 +11,7 @@
+ #include "build-info.h"
+ #include "common.h"
+ #include "fit.h"
++#include "ggml-stats.h"
+ #include "llama.h"
+ #include "log.h"
+ #include "sampling.h"
+@@ -701,6 +702,9 @@ struct server_slot {
+         }
+ 
+         common_speculative_print_stats(spec);
++
++        // scheduler/CUDA counters since the previous request
++        ggml_op_stats_print("request");
+     }
+ 
+     json to_json(bool only_metrics = false) const {
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 6fc7ef8c4..bc07143dc 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -4,6 +4,7 @@
+ #include "server-chat.h"
+ #include "chat.h"
+ #include "common.h"
++#include "ggml-stats.h"
+ #include "json-schema-to-grammar.h"
+ #include "llama.h"
+ #include "sampling.h"
+@@ -1577,6 +1578,22 @@ std::string server_task_result_metrics::to_metrics() {
+             "spec_decode_num_drafts_total",
+             "Speculative: Total speculative decoding verification steps",
+             (double) metrics.n_draft_verif_steps
++        }, {
++            "cuda_graph_captures_total",
++            "Total CUDA graph captures",
++            (double) g_ggml_op_stats.cuda_graph_captures
++        }, {
++            "cuda_graph_replays_total",
++            "Total CUDA graph replays",
++            (double) g_ggml_op_stats.cuda_graph_replays
++        }, {
++            "cuda_stream_syncs_total",
++            "Total CUDA stream synchronizations (waited and fast-out)",
++            (double) (g_ggml_op_stats.cuda_sync_waited + g_ggml_op_stats.cuda_sync_fast)
++        }, {
++            "sched_gate_waits_total",
++            "Total scheduler host-gate waits",
++            (double) g_ggml_op_stats.sched_gate_waits
+         },
+     };
+ 
+@@ -1617,6 +1634,26 @@ std::string server_task_result_metrics::to_metrics() {
+     add_items("counter", counters);
+     add_items("gauge",   gauges);
+ 
++    // The cuda_* counters cover the async copy paths only (set/get_tensor_async and
++    // cpy_tensor_async); synchronous buffer set/get and d2d buffer copies are not
++    // counted. MoE expert copies also use set_tensor_async, so they are part of h2d
++    // only when the MoE split backend is CUDA; only then is subtracting them from
++    // the "normal" series exact.
++    {
++        const uint64_t expert     = g_ggml_op_stats.sched_expert_copy_bytes;
++        const uint64_t h2d        = g_ggml_op_stats.cuda_h2d_bytes;
++        const uint64_t h2d_normal = h2d > expert ? h2d - expert : 0;
++
++        prometheus << "# HELP llamacpp:copy_bytes_total CUDA async copy bytes by direction"
++                      " (synchronous copies and non-CUDA expert copies are not counted; "
++                      "h2d normal excludes kind=expert)\n"
++                   << "# TYPE llamacpp:copy_bytes_total counter\n"
++                   << "llamacpp:copy_bytes_total{direction=\"h2d\",kind=\"normal\"} " << h2d_normal << "\n"
++                   << "llamacpp:copy_bytes_total{direction=\"h2d\",kind=\"expert\"} " << expert << "\n"
++                   << "llamacpp:copy_bytes_total{direction=\"d2h\",kind=\"normal\"} " << g_ggml_op_stats.cuda_d2h_bytes << "\n"
++                   << "llamacpp:copy_bytes_total{direction=\"d2d\",kind=\"normal\"} " << g_ggml_op_stats.cuda_d2d_bytes << "\n";
++    }
++
+     // labeled counter: one time series per draft position
+     if (!metrics.n_accepted_per_pos.empty()) {
+         prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"

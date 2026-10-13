@@ -1,0 +1,424 @@
+From 9a56000952471d096dcea564335ad98eee50a951 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Tue, 13 Oct 2026 23:00:55 +0200
+Subject: [PATCH] server: per-request generate step timings in timings (gen_*)
+
+Each generate step sets marks at fixed points of the server loop; a mark
+adds the time since the previous one to one part, so the parts sum to the
+wall time from the first generated token to the last emit. Parts: gap,
+prep, yield, draft, ckpt, decode, sync, spec, sample, emit. With
+GGML_OP_STATS=1, gen_decode_wait_ms adds the scheduler sync and gate
+wait inside the decode (from the core/0048 counters).
+
+About 12 ggml_time_us() reads per step, always on. Clock reads only, so
+the output does not change. Marks for shared parts are applied after
+yield_to_queue() returns, on the main thread.
+
+test-server-gentrace checks the accounting and the JSON fields.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ tests/CMakeLists.txt            |   3 +
+ tests/test-server-gentrace.cpp  | 103 ++++++++++++++++++++++++++++++++
+ tools/server/server-common.cpp  |  19 ++++++
+ tools/server/server-common.h    |  57 ++++++++++++++++++
+ tools/server/server-context.cpp |  62 +++++++++++++++++++
+ 5 files changed, 244 insertions(+)
+ create mode 100644 tests/test-server-gentrace.cpp
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 778bb290e..09df777cb 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -164,6 +164,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+     target_link_libraries(test-chat PRIVATE server-context)
++    llama_build_and_test(test-server-gentrace.cpp)
++    target_include_directories(test-server-gentrace PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
++    target_link_libraries(test-server-gentrace PRIVATE server-context)
+     llama_build_and_test(test-json-schema-to-grammar.cpp)
+ 
+     if (NOT GGML_BACKEND_DL)
+diff --git a/tests/test-server-gentrace.cpp b/tests/test-server-gentrace.cpp
+new file mode 100644
+index 000000000..a4ef942f1
+--- /dev/null
++++ b/tests/test-server-gentrace.cpp
+@@ -0,0 +1,103 @@
++// server_gen_trace: each microsecond between the first generated token and the
++// last mark goes to exactly one part, and the timings JSON reports the parts.
++
++#include "../tools/server/server-common.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++
++static int n_fail = 0;
++
++#define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); n_fail++; } } while (0)
++
++static bool near(double a, double b) { return std::fabs(a - b) < 1e-9; }
++
++int main() {
++    // not started: marks are ignored and no gen_* fields appear
++    {
++        server_slot_stats st;
++        st.gen.mark(SERVER_GEN_DRAFT, 5000);
++        CHECK(st.gen.wall_us() == 0);
++        CHECK(st.gen.t_us[SERVER_GEN_DRAFT] == 0);
++        const json j = st.to_json();
++        CHECK(!j.contains("gen_steps"));
++        CHECK(!j.contains("gen_wall_ms"));
++    }
++
++    // two steps: the parts sum to the wall time
++    {
++        server_slot_stats st;
++        st.gen.start(1000);                   // first token sampled
++        st.gen.mark(SERVER_GEN_EMIT,   1100); // first token sent
++
++        st.gen.begin_step(1300);              // step 1
++        st.gen.mark(SERVER_GEN_PREP,   1350);
++        st.gen.mark(SERVER_GEN_DRAFT,  2350);
++        st.gen.mark(SERVER_GEN_DECODE, 6350);
++        st.gen.mark(SERVER_GEN_SYNC,   6850);
++        st.gen.mark(SERVER_GEN_SAMPLE, 7050);
++        st.gen.end_step(SERVER_GEN_EMIT, 7150);
++        CHECK(!st.gen.active);
++
++        st.gen.begin_step(7250);              // step 2, rejected: restore, no emit
++        CHECK(st.gen.active);
++        st.gen.mark(SERVER_GEN_DECODE, 9250);
++        st.gen.end_step(SERVER_GEN_CKPT, 9450);
++        st.gen.n_restores++;
++
++        st.gen.add_decode_wait(300);
++
++        CHECK(st.gen.n_steps == 2);
++        CHECK(st.gen.t_us[SERVER_GEN_GAP]    == 200 + 100);
++        CHECK(st.gen.t_us[SERVER_GEN_DECODE] == 4000 + 2000);
++        CHECK(st.gen.t_us[SERVER_GEN_EMIT]   == 100 + 100);
++        CHECK(st.gen.t_us[SERVER_GEN_CKPT]   == 200);
++        CHECK(st.gen.wall_us() == 9450 - 1000);
++
++        int64_t sum = 0;
++        for (int p = 0; p < SERVER_GEN_COUNT; ++p) {
++            sum += st.gen.t_us[p];
++        }
++        CHECK(sum == st.gen.wall_us());
++
++        const json j = st.to_json();
++        CHECK(j.at("gen_steps").get<uint64_t>() == 2);
++        CHECK(j.at("gen_restores").get<uint64_t>() == 1);
++        CHECK(near(j.at("gen_wall_ms").get<double>(), 8.45));
++        CHECK(near(j.at("gen_draft_ms").get<double>(), 1.0));
++        CHECK(near(j.at("gen_draft_per_step_ms").get<double>(), 0.5));
++        CHECK(near(j.at("gen_decode_ms").get<double>(), 6.0));
++        CHECK(near(j.at("gen_decode_per_step_ms").get<double>(), 3.0));
++        CHECK(near(j.at("gen_decode_wait_ms").get<double>(), 0.3));
++        CHECK(j.contains("gen_gap_ms") && j.contains("gen_prep_ms") && j.contains("gen_yield_ms") &&
++              j.contains("gen_ckpt_ms") && j.contains("gen_sync_ms") && j.contains("gen_spec_ms") &&
++              j.contains("gen_sample_ms") && j.contains("gen_emit_ms"));
++    }
++
++    // no decode wait without GGML_OP_STATS: the field is absent
++    {
++        server_slot_stats st;
++        st.gen.start(10);
++        st.gen.begin_step(20);
++        st.gen.end_step(SERVER_GEN_EMIT, 30);
++        CHECK(!st.to_json().contains("gen_decode_wait_ms"));
++    }
++
++    // a mark while not in a step still counts (the first token's emit), but
++    // a step needs begin_step to count
++    {
++        server_gen_trace g;
++        g.start(100);
++        g.mark(SERVER_GEN_EMIT, 150);
++        CHECK(g.n_steps == 0);
++        CHECK(g.t_us[SERVER_GEN_EMIT] == 50);
++    }
++
++    if (n_fail) {
++        fprintf(stderr, "%d check(s) failed\n", n_fail);
++        return 1;
++    }
++    printf("test-server-gentrace: OK\n");
++    return 0;
++}
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 076a85741..5c2ad2ac9 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -101,6 +101,25 @@ json server_slot_stats::to_json() const {
+         base["draft_n_accepted"] = n_draft_accepted;
+     }
+ 
++    if (gen.n_steps > 0) {
++        static const char * names[SERVER_GEN_COUNT] = {
++            "gap", "prep", "yield", "draft", "ckpt", "decode", "sync", "spec", "sample", "emit",
++        };
++        const double steps = (double) gen.n_steps;
++
++        base["gen_steps"]    = gen.n_steps;
++        base["gen_restores"] = gen.n_restores;
++        base["gen_wall_ms"]  = gen.wall_us() / 1000.0;
++        for (int p = 0; p < SERVER_GEN_COUNT; ++p) {
++            base[std::string("gen_") + names[p] + "_ms"]          = gen.t_us[p] / 1000.0;
++            base[std::string("gen_") + names[p] + "_per_step_ms"] = gen.t_us[p] / 1000.0 / steps;
++        }
++        if (gen.t_decode_wait_us >= 0) {
++            base["gen_decode_wait_ms"]          = gen.t_decode_wait_us / 1000.0;
++            base["gen_decode_wait_per_step_ms"] = gen.t_decode_wait_us / 1000.0 / steps;
++        }
++    }
++
+     return base;
+ }
+ 
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 20cdeacf2..c5db14a13 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -375,8 +375,65 @@ json format_response_rerank(
+ // stats and metrics
+ //
+ 
++// the parts of a generate step, in loop order
++enum server_gen_part {
++    SERVER_GEN_GAP,    // previous step's end -> this step's start (queue loop, other tasks, context shift)
++    SERVER_GEN_PREP,   // bookkeeping inside the step (draft params, batch build, other slots' prompts)
++    SERVER_GEN_YIELD,  // yield_to_queue() hand-off and wait for the queue worker
++    SERVER_GEN_DRAFT,  // common_speculative_draft()
++    SERVER_GEN_CKPT,   // speculative checkpoint save, and restore on a rejected draft
++    SERVER_GEN_DECODE, // target llama_process() of the step's batch
++    SERVER_GEN_SYNC,   // llama_synchronize() after it
++    SERVER_GEN_SPEC,   // common_speculative_process() of the decoded batch (draft/MTP update)
++    SERVER_GEN_SAMPLE, // sampling and accepting the draft
++    SERVER_GEN_EMIT,   // accept bookkeeping, detokenize, stop checks, sending the tokens
++    SERVER_GEN_COUNT,
++};
++
++// per-request generate timing: from the first generated token on, each mark
++// adds the time since the previous mark to one part, so the parts sum to the wall time
++struct server_gen_trace {
++    int64_t  t_first = 0; // first generated token, 0 = not started
++    int64_t  t_mark  = 0;
++    bool     active  = false; // inside a generate step, i.e. shared marks apply to this slot
++    uint64_t n_steps    = 0;
++    uint64_t n_restores = 0;
++    int64_t  t_us[SERVER_GEN_COUNT] = {};
++    int64_t  t_decode_wait_us = -1; // scheduler sync + gate wait inside decode, -1 = not counted
++
++    void start(int64_t t) {
++        t_first = t_mark = t;
++    }
++    void mark(server_gen_part p, int64_t t) {
++        if (t_first == 0) {
++            return;
++        }
++        t_us[p] += t - t_mark;
++        t_mark = t;
++    }
++    void begin_step(int64_t t) {
++        mark(SERVER_GEN_GAP, t);
++        if (t_first != 0) {
++            active = true;
++            n_steps++;
++        }
++    }
++    void end_step(server_gen_part p, int64_t t) {
++        mark(p, t);
++        active = false;
++    }
++    void add_decode_wait(int64_t us) {
++        t_decode_wait_us = (t_decode_wait_us < 0 ? 0 : t_decode_wait_us) + us;
++    }
++    int64_t wall_us() const {
++        return t_mark - t_first;
++    }
++};
++
+ // shared between server_slot and server_task_result_*
+ struct server_slot_stats {
++    server_gen_trace gen;
++
+     uint64_t n_prompt_cached    = 0;
+     uint64_t n_prompt_processed = 0;
+     uint64_t n_gen              = 0;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index dafded83a..fce1b41e5 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3360,6 +3360,7 @@ private:
+             }
+ 
+             generating.push_back(&slot);
++            slot.stats.gen.begin_step(ggml_time_us());
+ 
+             if (spec) {
+                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+@@ -3417,9 +3418,16 @@ private:
+ 
+         // generate the actual drafts (if any)
+         if (!drafting.empty()) {
++            int64_t t_work = 0;
++            int64_t t_done = 0;
+             queue_tasks.yield_to_queue([&]() {
++                t_work = ggml_time_us();
+                 common_speculative_draft(spec.get());
++                t_done = ggml_time_us();
+             });
++            gen_mark(SERVER_GEN_PREP,  t_work);
++            gen_mark(SERVER_GEN_DRAFT, t_done);
++            gen_mark(SERVER_GEN_YIELD, ggml_time_us());
+         }
+ 
+         // make checkpoints if needed
+@@ -3470,6 +3478,10 @@ private:
+             }
+         });
+ 
++        if (!drafting.empty()) {
++            gen_mark(SERVER_GEN_CKPT, ggml_time_us());
++        }
++
+         // update the batch with the sampled/drafted tokens
+         iterate(generating, [&](server_slot & slot) {
+             slot.handle_last_sampled_token(batch);
+@@ -4105,12 +4117,35 @@ private:
+         // yield to the queue, so we can still handle metrics tasks while decoding
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
++        int64_t t_work = 0;
++        int64_t t_done = 0;
++        int64_t t_sync = 0;
++        int64_t t_wait = -1;
+         queue_tasks.yield_to_queue([&]() {
++            const bool op_stats = ggml_op_stats_enabled();
++            const uint64_t w0 = op_stats ? g_ggml_op_stats.sched_sync_us + g_ggml_op_stats.sched_gate_wait_us : 0;
++            t_work = ggml_time_us();
+             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
++            t_done = ggml_time_us();
++            if (op_stats) {
++                t_wait = (int64_t) (g_ggml_op_stats.sched_sync_us + g_ggml_op_stats.sched_gate_wait_us - w0);
++            }
+             if (ret == 0 && has_output) {
+                 llama_synchronize(ctx_tgt);
+             }
++            t_sync = ggml_time_us();
+         });
++        gen_mark(SERVER_GEN_PREP,   t_work);
++        gen_mark(SERVER_GEN_DECODE, t_done);
++        gen_mark(SERVER_GEN_SYNC,   t_sync);
++        gen_mark(SERVER_GEN_YIELD,  ggml_time_us());
++        if (t_wait >= 0) {
++            for (auto & slot : slots) {
++                if (slot.stats.gen.active) {
++                    slot.stats.gen.add_decode_wait(t_wait);
++                }
++            }
++        }
+ 
+         if (ret != 0) {
+             {
+@@ -4170,9 +4205,16 @@ private:
+         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
+         if (spec) {
+             bool ok = true;
++            int64_t t_spec_work = 0;
++            int64_t t_spec_done = 0;
+             queue_tasks.yield_to_queue([&]() {
++                t_spec_work = ggml_time_us();
+                 ok = common_speculative_process(spec.get(), batch.view);
++                t_spec_done = ggml_time_us();
+             });
++            gen_mark(SERVER_GEN_PREP,  t_spec_work);
++            gen_mark(SERVER_GEN_SPEC,  t_spec_done);
++            gen_mark(SERVER_GEN_YIELD, ggml_time_us());
+ 
+             if (!ok) {
+                 SRV_ERR("%s", "failed to process speculative batch\n");
+@@ -4301,6 +4343,7 @@ private:
+ 
+             if (slot.stats.n_gen == 1) {
+                 slot.stats.update_prompt_last();
++                slot.stats.gen.start(slot.stats.t_prompt_last);
+                 slot.t_print_last = t_now;
+                 slot.n_gen_last = 0;
+             }
+@@ -4322,9 +4365,11 @@ private:
+             // past this token, and grammar_probs asks what the grammar allowed
+             // *here*. Only counters sit between this and the sampling above.
+             common_sampler_accept(slot.smpl.get(), id, true);
++            slot.stats.gen.mark(SERVER_GEN_SAMPLE, ggml_time_us());
+ 
+             if (!process_token(result, slot)) {
+                 // release slot because of stop condition
++                slot.stats.gen.end_step(SERVER_GEN_EMIT, ggml_time_us());
+                 slot.print_timings();
+                 send_final_response(slot);
+                 slot.release();
+@@ -4333,6 +4378,7 @@ private:
+             }
+ 
+             slot.print_timings_tg();
++            slot.stats.gen.end_step(SERVER_GEN_EMIT, ggml_time_us());
+         });
+ 
+         // speculative decoding - main model sample and accept
+@@ -4372,6 +4418,7 @@ private:
+                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                 }
+                 slot.spec_i_batch.clear();
++                slot.stats.gen.mark(SERVER_GEN_SAMPLE, ggml_time_us());
+ 
+                 GGML_ASSERT(accepted.size() >= 1);
+ 
+@@ -4407,6 +4454,9 @@ private:
+                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
+ 
++                        slot.stats.gen.n_restores++;
++                        slot.stats.gen.end_step(SERVER_GEN_CKPT, ggml_time_us());
++
+                         return;
+                     }
+                 }
+@@ -4463,6 +4513,7 @@ private:
+                 slot.stats.n_gen += 1;
+ 
+                 if (!process_token(result, slot)) {
++                    slot.stats.gen.end_step(SERVER_GEN_EMIT, ggml_time_us());
+                     slot.print_timings();
+                     send_final_response(slot);
+                     slot.release();
+@@ -4472,6 +4523,7 @@ private:
+             }
+ 
+             slot.print_timings_tg();
++            slot.stats.gen.end_step(SERVER_GEN_EMIT, ggml_time_us());
+ 
+             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+         });
+@@ -4496,6 +4548,16 @@ private:
+     // metrics helpers
+     //
+ 
++    // generate trace: add the time up to t to part p, for each slot inside a generate step
++    // note: call on the main thread only, after a yield_to_queue() returns
++    void gen_mark(server_gen_part p, int64_t t) {
++        for (auto & slot : slots) {
++            if (slot.stats.gen.active) {
++                slot.stats.gen.mark(p, t);
++            }
++        }
++    }
++
+     // call before submitting a decode, so that the queued prompt stats can be timed
+     void metrics_pre_decode() {
+         t_decode_start = ggml_time_us();

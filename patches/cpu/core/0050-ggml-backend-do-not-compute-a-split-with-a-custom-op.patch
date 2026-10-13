@@ -1,0 +1,330 @@
+From 610676118e041f14fe49debfd8d8fdf68593d990 Mon Sep 17 00:00:00 2001
+From: Vortiago <atle@havso.net>
+Date: Tue, 13 Oct 2026 23:52:47 +0200
+Subject: [PATCH] ggml-backend: do not compute a split with a custom op behind
+ a host gate
+
+A late CPU split runs while the GPU stream waits on the host gate. The
+gate opens only after the split is done, so nothing in the split may wait
+for that stream. ggml_cuda_graph_ready checks this for the scheduler's own
+launch, but not for the work of the CPU split.
+
+A custom op can call into any backend. The MoE split (LLAMA_MOE_SPLIT)
+does: begin_op registers host memory (cudaHostRegister) and creates the
+helper's backend on its first call, and the helper thread can grow its
+graph buffer (cudaFree), launch kernels for the first time (lazy module
+load) and instantiate CUDA graphs. Each of these can wait for the whole
+device, which includes the gated stream, while the scheduler thread spins
+in end_op: a deadlock. The gated GPU split is only needed to be a warm
+CUDA graph, so a prefill ubatch of a size seen twice in 5 s, whose earlier
+runs had no expert above the threshold, reaches this.
+
+The scheduler now does not compute a split late if it has a custom op.
+Only prefill ubatches with the split lose the gate (a few us per layer
+against ms of CPU work); decode and verify graphs keep it. Exact: the
+order of work changes, not the work.
+
+test-backend-sched-gate: a fake GPU backend with a host gate, on the CPU.
+A plain CPU op is gated; a custom op must not run behind a closed gate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C6MCJC4HTKxvuGjKjqDuqQ
+---
+ ggml/src/ggml-backend.cpp         |   8 +
+ tests/CMakeLists.txt              |   3 +
+ tests/test-backend-sched-gate.cpp | 253 ++++++++++++++++++++++++++++++
+ 3 files changed, 264 insertions(+)
+ create mode 100644 tests/test-backend-sched-gate.cpp
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 47d6530ff..54d778438 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1873,6 +1873,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             qb->iface.host_gate_wait == NULL || qb->iface.get_tensor_async == NULL) {
+             return false;
+         }
++        // a custom op can call into any backend, and a call that waits for the device would wait for
++        // the gated stream: the host would never open the gate
++        for (int i = 0; i < split->graph.n_nodes; i++) {
++            const enum ggml_op op = split->graph.nodes[i]->op;
++            if (op == GGML_OP_CUSTOM || op == GGML_OP_MAP_CUSTOM1 || op == GGML_OP_MAP_CUSTOM2 || op == GGML_OP_MAP_CUSTOM3) {
++                return false;
++            }
++        }
+         // every input is a queued copy from the backend's own buffer to host memory
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             struct ggml_tensor * input = split->inputs[input_id];
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 09df777cb..c365b0b01 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -359,6 +359,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
+ 
+     # Needs non-public ggml{,-backend}-impl.h
+     llama_build_and_test(test-alloc.cpp)
++
++    # Needs non-public ggml-backend-impl.h
++    llama_build_and_test(test-backend-sched-gate.cpp)
+ endif()
+ 
+ llama_build_and_test(test-backend-sched-host.cpp)
+diff --git a/tests/test-backend-sched-gate.cpp b/tests/test-backend-sched-gate.cpp
+new file mode 100644
+index 000000000..fc61b0d98
+--- /dev/null
++++ b/tests/test-backend-sched-gate.cpp
+@@ -0,0 +1,253 @@
++// The scheduler's host gate with a fake GPU backend, on the CPU only.
++//
++// The fake backend computes on the CPU. Its host gate holds the work queued after it until the
++// host opens the gate, as the CUDA stream does. While the gate is closed:
++//  - the scheduler must not wait for the fake backend, or for an event recorded behind the gate
++//    (a real stream would never get there);
++//  - the host split must not run a custom op: a custom op can call into any backend, and a call
++//    that waits for the device (a CUDA free, a host registration, a first kernel launch) waits
++//    for the gated stream, so the host never opens the gate. The MoE split's custom ops do this.
++// Each layer: a matmul and tanh on the fake backend, an op on the CPU, an add on the fake backend.
++// With a plain CPU op the gate must be used; with a custom op it must not.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++#include "../ggml/src/ggml-backend-impl.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cstdint>
++#include <functional>
++#include <random>
++#include <vector>
++
++static struct {
++    ggml_backend_t cpu = nullptr; // computes the fake backend's graphs
++    bool closed = false;
++    int  n_gated = 0;
++    int  n_sync_closed = 0;
++    int  n_custom_closed = 0;
++    std::vector<std::function<void()>> queued;
++} fk;
++
++static void fk_run(std::function<void()> f) {
++    if (fk.closed) {
++        fk.queued.push_back(std::move(f));
++    } else {
++        f();
++    }
++}
++
++// buffers: plain host memory; the device buffer type reports it as not host
++static void   buf_free(ggml_backend_buffer_t b) { free(b->context); }
++static void * buf_base(ggml_backend_buffer_t b) { return b->context; }
++static void   buf_memset(ggml_backend_buffer_t, ggml_tensor * t, uint8_t v, size_t o, size_t n) { memset((char *) t->data + o, v, n); }
++static void   buf_set(ggml_backend_buffer_t, ggml_tensor * t, const void * d, size_t o, size_t n) { memcpy((char *) t->data + o, d, n); }
++static void   buf_get(ggml_backend_buffer_t, const ggml_tensor * t, void * d, size_t o, size_t n) { memcpy(d, (const char *) t->data + o, n); }
++static void   buf_clear(ggml_backend_buffer_t b, uint8_t v) { memset(b->context, v, b->size); }
++
++static ggml_backend_buffer_t buft_alloc(ggml_backend_buffer_type_t buft, size_t size) {
++    ggml_backend_buffer_i i = {};
++    i.free_buffer   = buf_free;
++    i.get_base      = buf_base;
++    i.memset_tensor = buf_memset;
++    i.set_tensor    = buf_set;
++    i.get_tensor    = buf_get;
++    i.clear         = buf_clear;
++    void * p = aligned_alloc(64, (size + 63) & ~(size_t) 63);
++    return ggml_backend_buffer_init(buft, i, p, size);
++}
++static size_t buft_align(ggml_backend_buffer_type_t) { return 64; }
++static bool   buft_dev_is_host(ggml_backend_buffer_type_t) { return false; }
++static bool   buft_host_is_host(ggml_backend_buffer_type_t) { return true; }
++static const char * buft_name(ggml_backend_buffer_type_t buft) { return buft->iface.is_host == buft_host_is_host ? "FAKE_HOST" : "FAKE"; }
++
++extern ggml_backend_device fk_dev;
++static ggml_backend_buffer_type fk_buft_dev  = { { buft_name, buft_alloc, nullptr, buft_align, nullptr, nullptr, nullptr, buft_dev_is_host  }, &fk_dev, nullptr };
++static ggml_backend_buffer_type fk_buft_host = { { buft_name, buft_alloc, nullptr, buft_align, nullptr, nullptr, nullptr, buft_host_is_host }, &fk_dev, nullptr };
++
++// the backend
++static const char * be_name(ggml_backend_t) { return "FAKE"; }
++static void be_free(ggml_backend_t b) { delete b; }
++static void be_set_async(ggml_backend_t, ggml_tensor * t, const void * d, size_t o, size_t n) {
++    fk_run([=] { memcpy((char *) t->data + o, d, n); });
++}
++static void be_get_async(ggml_backend_t, const ggml_tensor * t, void * d, size_t o, size_t n) {
++    fk_run([=] { memcpy(d, (const char *) t->data + o, n); });
++}
++static void be_sync(ggml_backend_t) {
++    // a real stream behind a closed gate never finishes
++    fk.n_sync_closed += fk.closed;
++}
++static ggml_status be_compute(ggml_backend_t, ggml_cgraph * g) {
++    fk_run([=] { ggml_backend_graph_compute(fk.cpu, g); });
++    return GGML_STATUS_SUCCESS;
++}
++// an event recorded behind a closed gate completes only when the gate opens
++static void be_event_record(ggml_backend_t, ggml_backend_event_t e) { e->context = (void *) (uintptr_t) fk.closed; }
++static void be_event_wait(ggml_backend_t, ggml_backend_event_t) {}
++static bool be_gate_wait(ggml_backend_t, const ggml_cgraph *) {
++    fk.closed = true;
++    fk.n_gated++;
++    return true;
++}
++static void be_gate_open(ggml_backend_t) {
++    fk.closed = false;
++    for (auto & f : fk.queued) {
++        f();
++    }
++    fk.queued.clear();
++}
++
++static ggml_guid fk_guid = { 0xfa, 0xce };
++
++// the device
++static const char * dev_name(ggml_backend_dev_t) { return "FAKE"; }
++static void dev_memory(ggml_backend_dev_t, size_t * f, size_t * t) { *f = *t = 0; }
++static enum ggml_backend_dev_type dev_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; }
++static void dev_props(ggml_backend_dev_t d, ggml_backend_dev_props * p) {
++    memset(p, 0, sizeof(*p));
++    p->name = dev_name(d);
++    p->description = dev_name(d);
++    p->type = GGML_BACKEND_DEVICE_TYPE_GPU;
++    p->caps.async = true;
++    p->caps.events = true;
++}
++static ggml_backend_t dev_init(ggml_backend_dev_t d, const char *) {
++    ggml_backend_i i = {};
++    i.get_name         = be_name;
++    i.free             = be_free;
++    i.set_tensor_async = be_set_async;
++    i.get_tensor_async = be_get_async;
++    i.synchronize      = be_sync;
++    i.graph_compute    = be_compute;
++    i.event_record     = be_event_record;
++    i.event_wait       = be_event_wait;
++    i.host_gate_wait   = be_gate_wait;
++    i.host_gate_open   = be_gate_open;
++    return new ggml_backend { &fk_guid, i, d, nullptr };
++}
++static ggml_backend_buffer_type_t dev_buft(ggml_backend_dev_t) { return &fk_buft_dev; }
++static ggml_backend_buffer_type_t dev_host_buft(ggml_backend_dev_t) { return &fk_buft_host; }
++static bool dev_supports_op(ggml_backend_dev_t, const ggml_tensor * op) { return op->op != GGML_OP_CUSTOM; }
++static bool dev_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t b) { return b == &fk_buft_dev; }
++static bool dev_offload_op(ggml_backend_dev_t, const ggml_tensor *) { return false; }
++static ggml_backend_event_t dev_event_new(ggml_backend_dev_t d) { return new ggml_backend_event { d, nullptr }; }
++static void dev_event_free(ggml_backend_dev_t, ggml_backend_event_t e) { delete e; }
++static void dev_event_sync(ggml_backend_dev_t, ggml_backend_event_t e) {
++    fk.n_sync_closed += fk.closed && e->context != nullptr;
++}
++
++ggml_backend_device fk_dev = {
++    { dev_name, dev_name, dev_memory, dev_type, dev_props, dev_init, dev_buft, dev_host_buft, nullptr,
++      dev_supports_op, dev_supports_buft, dev_offload_op, dev_event_new, dev_event_free, dev_event_sync },
++    nullptr, nullptr };
++
++// the host op that may call into another backend
++static void custom_copy(ggml_tensor * dst, int ith, int nth, void *) {
++    if (ith == 0) {
++        fk.n_custom_closed += fk.closed;
++    }
++    const ggml_tensor * src = dst->src[0];
++    const int64_t n = ggml_nelements(dst);
++    for (int64_t i = n*ith/nth; i < n*(ith + 1)/nth; i++) {
++        ((float *) dst->data)[i] = ((const float *) src->data)[i];
++    }
++}
++
++// returns the number of gated splits
++static int run(bool custom) {
++    const int n_layer = 4, n_embd = 64, n_tok = 3;
++
++    fk = {};
++    fk.cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    ggml_backend_t gpu = dev_init(&fk_dev, nullptr);
++
++    ggml_init_params wp = { ggml_tensor_overhead() * (n_layer + 1), nullptr, true };
++    ggml_context * ctx_w = ggml_init(wp);
++    std::vector<ggml_tensor *> wg(n_layer);
++    for (int i = 0; i < n_layer; i++) {
++        wg[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd, n_embd);
++    }
++    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, gpu);
++    ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    std::mt19937 rng(1);
++    std::normal_distribution<float> nd(0.0f, 1.0f / std::sqrt((float) n_embd));
++    std::vector<float> w(n_embd * n_embd);
++    for (int i = 0; i < n_layer; i++) {
++        for (auto & v : w) v = nd(rng);
++        ggml_backend_tensor_set(wg[i], w.data(), 0, ggml_nbytes(wg[i]));
++    }
++
++    ggml_backend_t backends[2] = { gpu, fk.cpu };
++    ggml_backend_buffer_type_t bufts[2] = { &fk_buft_dev, &fk_buft_host };
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, 1024, false, false);
++
++    ggml_init_params gp = { ggml_tensor_overhead() * 1024 + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(gp);
++    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
++    ggml_set_input(x);
++    ggml_tensor * h = x;
++    std::vector<ggml_tensor *> on_gpu, on_cpu;
++    for (int i = 0; i < n_layer; i++) {
++        ggml_tensor * g = ggml_tanh(ctx, ggml_mul_mat(ctx, wg[i], h));
++        ggml_tensor * src[1] = { g };
++        ggml_tensor * c = custom ? ggml_custom_4d(ctx, GGML_TYPE_F32, n_embd, n_tok, 1, 1, src, 1, custom_copy, GGML_N_TASKS_MAX, nullptr)
++                                 : ggml_scale(ctx, g, 0.5f);
++        h = ggml_add(ctx, g, c);
++        on_gpu.push_back(g->src[0]);
++        on_gpu.push_back(g);
++        on_gpu.push_back(h);
++        on_cpu.push_back(c);
++    }
++    ggml_set_output(h);
++    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
++    ggml_build_forward_expand(gf, h);
++    for (ggml_tensor * t : on_gpu) {
++        ggml_backend_sched_set_tensor_backend(sched, t, gpu);
++    }
++    for (ggml_tensor * t : on_cpu) {
++        ggml_backend_sched_set_tensor_backend(sched, t, fk.cpu);
++    }
++    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
++        printf("alloc failed\n");
++        exit(1);
++    }
++    std::vector<float> xin(n_embd * n_tok);
++    for (auto & v : xin) v = nd(rng);
++    ggml_backend_tensor_set(x, xin.data(), 0, ggml_nbytes(x));
++    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
++        printf("compute failed\n");
++        exit(1);
++    }
++    const int n_gated = fk.n_gated;
++    printf("%s CPU op: %d splits, %d gated, %d syncs and %d custom ops behind a closed gate\n",
++        custom ? "custom" : "plain", ggml_backend_sched_get_n_splits(sched), n_gated, fk.n_sync_closed, fk.n_custom_closed);
++
++    ggml_free(ctx);
++    ggml_backend_sched_free(sched);
++    ggml_backend_buffer_free(buf_w);
++    ggml_free(ctx_w);
++    ggml_backend_free(gpu);
++    ggml_backend_free(fk.cpu);
++    return n_gated;
++}
++
++int main() {
++    ggml_backend_load_all();
++    int fails = 0;
++
++    // the plain CPU op is computed behind the gate: the test reaches the gate
++    fails += run(false) == 0;
++    fails += fk.n_sync_closed != 0;
++
++    // the custom op is not
++    run(true);
++    fails += fk.n_custom_closed != 0 || fk.n_sync_closed != 0;
++
++    printf(fails ? "FAILED\n" : "OK\n");
++    return fails ? 1 : 0;
++}
