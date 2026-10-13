@@ -1089,22 +1089,20 @@ class ANonTypedTurnNeverGeneratesOnACpu(EndToEnd):
                          "the gpu read the prompt again instead of reusing "
                          "the parked read")
 
-    def test_a_conversation_less_chat_does_not_answer_on_the_cpu(self):
-        """A chat body with no conversation to name never gets a pin, so
-        `_take` records no slot and there is nothing to carry. The healthy
-        gpu is still the only place a chat reply may come from, so the turn
-        fails rather than answering on the cpu."""
+    def test_a_conversation_less_chat_is_not_read_on_the_cpu(self):
+        """No backend here both reads and generates chat, so a turn that
+        cannot be carried has nowhere to go. It is refused before any read,
+        not read on the cpu and then failed."""
         request = urllib.request.Request(
             self.url + "/v1/chat/completions",
             data=json.dumps({"model": "fake-model", "messages": []}).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
         with self.assertRaises(urllib.error.HTTPError) as raised:
             urllib.request.urlopen(request, timeout=30).read()
-        self.assertEqual(raised.exception.code, 502)
+        self.assertEqual(raised.exception.code, 503)
+        self.assertEqual(self.cpu.probes, [], "the cpu read it anyway")
         self.assertEqual([c["key"] for c in self.cpu.answers], [],
                          "the cpu answered a conversation-less chat turn")
-        self.assertEqual(self.gpu.answers, [],
-                         "the gpu answered without a cache")
 
     def test_a_refused_carry_does_not_answer_chat_on_the_cpu(self):
         """The save the carry needs is refused, so none of the read reaches
@@ -1127,6 +1125,27 @@ class ANonTypedTurnNeverGeneratesOnACpu(EndToEnd):
         self.assertEqual(said["router"]["backend"], "cpu")
         self.assertEqual([c["key"] for c in self.cpu.answers], ["asker"])
         self.assertEqual(self.gpu.chats, [], "the gpu served the typed turn")
+
+
+class AConversationLessChatReadsOnTheGpu(EndToEnd):
+    """The cpu may read chat but not answer it. A chat turn with no
+    conversation cannot be carried off the cpu, so it is read and answered on
+    the gpu, though the cpu comes first in the read order."""
+
+    def test_it_is_answered_on_the_gpu(self):
+        pool = self.pool([
+            self.stub("cpu", 0, generate=[router.SYSTEMONE]),
+            self.stub("gpu", 1)])
+        url = self.serve(pool)
+        request = urllib.request.Request(
+            url + "/v1/chat/completions",
+            data=json.dumps({"model": "fake-model", "messages": []}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=30) as reply:
+            self.assertEqual(reply.status, 200)
+        self.assertEqual(self.cpu.probes, [], "it was read on the cpu")
+        self.assertEqual(self.cpu.answers, [], "the cpu answered it")
+        self.assertEqual(len(self.gpu.answers), 1)
 
 
 class TheNextTurnComesBack(EndToEnd):

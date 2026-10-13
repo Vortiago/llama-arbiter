@@ -882,7 +882,8 @@ class Pool:
 
                 if not target:
                     free = [b for b in self.backends
-                            if prefills(b, path) and self._usable(b, tokens)]
+                            if self._reads_for(b, conv, path)
+                            and self._usable(b, tokens)]
                     owed = {b["name"] for b in free
                             if self._owed(b, conv, tokens, path)}
                     kept |= owed
@@ -898,7 +899,8 @@ class Pool:
 
                 # Nothing that could serve this is up. Waiting cannot help.
                 served_by = target is not None or any(
-                    b["up"] and prefills(b, path) for b in self.backends)
+                    b["up"] and self._reads_for(b, conv, path)
+                    for b in self.backends)
                 if not served_by:
                     return None
                 if alive is not None and not alive():
@@ -918,6 +920,12 @@ class Pool:
         for line in lines:
             print(line, flush=True)
         return got
+
+    @staticmethod
+    def _reads_for(be, conv, path=None):
+        """May this turn be read on `be`. A turn with no conversation has no
+        pin, so no slot to carry: it is read only where it may generate."""
+        return prefills(be, path) and (bool(conv) or generates(be, path))
 
     def _owed(self, be, conv, tokens, path=None):
         """True when reading this turn here would keep another turn from

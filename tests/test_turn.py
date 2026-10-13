@@ -1036,5 +1036,49 @@ class ACpuGeneratesOnlyTypedTurns(unittest.TestCase):
                          "the wait outlived the handoff")
 
 
+class ATurnThatCannotBeCarriedReadsWhereItGenerates(unittest.TestCase):
+    """A turn with no conversation has no pin, so no slot to carry. Read on
+    a cpu that may not answer its path, it had nowhere to go and failed. It
+    is read only where it may also be generated."""
+
+    def pair(self):
+        pool = make_pool([
+            {"name": "cpu", "url": "http://cpu", "pref": 0,
+             "generate": [router.SYSTEMONE]},
+            {"name": "gpu", "url": "http://gpu", "pref": 1}])
+        cpu, gpu = pool.backends
+        cpu.update(up=True, n_ctx=150000)
+        gpu.update(up=True, n_ctx=150000)
+        return pool, cpu, gpu
+
+    def test_a_chat_with_no_conversation_reads_on_the_gpu(self):
+        pool, cpu, gpu = self.pair()
+        got = pool.acquire(None, 10, path="/v1/chat/completions")
+        self.assertIs(got[0], gpu, "it was read where it cannot be answered")
+
+    def test_a_chat_with_a_conversation_still_reads_on_the_cpu(self):
+        pool, cpu, gpu = self.pair()
+        got = pool.acquire("c1", 10, path="/v1/chat/completions")
+        self.assertIs(got[0], cpu)
+
+    def test_a_typed_turn_with_no_conversation_reads_on_the_cpu(self):
+        pool, cpu, gpu = self.pair()
+        got = pool.acquire(None, 10, path=router.SYSTEMONE)
+        self.assertIs(got[0], cpu)
+
+    def test_with_the_gpu_draining_it_waits_and_never_takes_the_cpu(self):
+        pool, cpu, gpu = self.pair()
+        gpu["draining"] = True
+        asked = []
+
+        def alive():
+            asked.append(None)
+            return len(asked) < 2
+
+        self.assertIsNone(pool.acquire(None, 10, alive,
+                                       path="/v1/chat/completions"))
+        self.assertEqual(cpu["busy"], 0, "it took the cpu")
+
+
 if __name__ == "__main__":
     unittest.main()
