@@ -1696,13 +1696,15 @@ class Pool:
         Between the save and the restore the conversation is parked, so a
         failure leaves it parked, not lost.
 
-        Three ways out, and they say different things about who holds
+        Four ways out, and they say different things about who holds
         `source`:
           `source`  nothing was carried, and the caller still holds it
           None      the cache is parked and `source` is already released
           Gone      the client left before any of that. Nothing is parked,
                     the caller still holds `source`, and its ending is the
                     one that releases it and parks what the read got through
+          Rejected  no generator could take it, or none did within
+                    generate_patience. The caller holds `source` again
 
         `migrate` false asks for a turn that is not worth carrying: a park and
         a recall of the whole slot, to write one token. A source that may not
@@ -1712,6 +1714,7 @@ class Pool:
         remove = remove or self.store.drop
         if not self.tuning.handoff:
             return self._stay(source, "the handoff is turned off", path)
+        deadline = time.time() + self.tuning.generate_patience
         if not migrate and generates(source, path):
             return self._stay(source, "this turn is not worth carrying", path)
         target = self.generator(tokens, source, path)
@@ -1739,6 +1742,8 @@ class Pool:
                         if released:
                             return None        # parked, and nobody to answer
                         raise Gone("while it waited for a slot to generate in")
+                    if time.time() > deadline:
+                        return self._out_of_patience(source, released, path)
                     if not released:
                         released = self._park_and_release(conv, source, remove)
                     with self.cv:
@@ -1790,7 +1795,8 @@ class Pool:
         try:
             while True:
                 # None once the last generator went away.
-                free = None if target is None else self._wait_to_generate(target, alive)
+                free = (None if target is None
+                        else self._wait_to_generate(target, alive, deadline))
                 if free is not None:
                     waited = time.time() - queued
                     break
@@ -1801,6 +1807,8 @@ class Pool:
                     with self.cv:
                         source["busy"] += 1
                     return source
+                if time.time() > deadline:
+                    return self._out_of_patience(source, True, path)
                 # `generate: false` is an operator's setting. The turn is parked
                 # on disk, the cheapest place to wait. Wait for a generator.
                 target = self.generator(tokens, source, path)
@@ -1865,8 +1873,8 @@ class Pool:
             slot = record["slot"] if record else None
         if slot is None:
             return False
-        # Settled: the wait to generate has no known end, so the copy has to
-        # outlive the pages the read left behind.
+        # Settled: the wait to generate can run to generate_patience, so the
+        # copy has to outlive the pages the read left behind.
         self.park_partial(conv, source, slot, remove)
         with self.cv:
             record = self.pins.get(conv)
@@ -1902,6 +1910,17 @@ class Pool:
             raise Rejected(f"no generator could take its prompt ({why})")
         return self._stay(source, why, path)
 
+    def _out_of_patience(self, source, released, path=None):
+        """No generator took the turn within generate_patience. A read
+        already released takes its reader back, so the caller's ending
+        releases it once, as on every other way out."""
+        if released:
+            with self.cv:
+                source["busy"] += 1
+        return self._carry_failed(
+            source, f"none was free within "
+                    f"{self.tuning.generate_patience:.0f}s", path)
+
     def generator(self, tokens, source, path=None):
         """The backend a turn read on `source` moves to, or None: it stays.
 
@@ -1936,9 +1955,10 @@ class Pool:
                     return be["name"]
             return None
 
-    def _wait_to_generate(self, target, alive):
+    def _wait_to_generate(self, target, alive, deadline=math.inf):
         """Wait until the generator has a slot. Returns the slot id, or None
-        when the generator cannot serve this turn or the client left."""
+        when the generator cannot serve this turn, the client left, or the
+        deadline passed."""
         with self.cv:
             self.generate_waits[target["name"]] += 1
         try:
@@ -1956,6 +1976,8 @@ class Pool:
                             target["handed"].add(free)
                             return free
                     if alive is not None and not alive():
+                        return None
+                    if time.time() > deadline:
                         return None
                     self.cv.wait(1.0)
         finally:

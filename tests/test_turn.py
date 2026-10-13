@@ -1121,5 +1121,63 @@ class ATurnIsSizedByWhereItCanBeGenerated(unittest.TestCase):
         self.assertEqual(pool.largest(router.SYSTEMONE), 150000)
 
 
+class AWaitForAGeneratorHasADeadline(unittest.TestCase):
+    """A chat turn read on a cpu waits for a generator. A streaming client
+    keeps it alive, and the claim on its conversation holds back the next
+    turn, so a gpu out for good held both for as long as the client stayed.
+    The wait ends after generate_patience and the turn fails cleanly. The
+    read stays parked, so the next turn starts from it."""
+
+    def duo(self, draining=False):
+        pool = make_pool([
+            {"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": False},
+            {"name": "cpu", "url": "http://cpu", "pref": 1,
+             "generate": [router.SYSTEMONE]}],
+            tuning=replace(SANDBOX.tuning, generate_patience=0.3))
+        gpu, cpu = pool.backends
+        gpu.update(up=True, n_ctx=150000, draining=draining)
+        cpu.update(up=True, n_ctx=150000)
+        pool.pins["c1"] = parked_copy(name=None)
+        pool.pins["c1"].update(backend="cpu", slot=0, using=0, inflight=True)
+        cpu["busy"] = 1                      # the read holds it
+        return pool, gpu, cpu
+
+    def check_it_gave_up(self, pool, gpu, cpu):
+        with self.assertRaises(router.Rejected):
+            pool.hand_off("c1", cpu, 10, path="/v1/chat/completions",
+                          alive=lambda: True)
+        # The caller holds the reader again, and its ending releases it.
+        self.assertEqual(cpu["busy"], 1)
+        self.assertEqual(pool.generate_waits["gpu"], 0,
+                         "the wait outlived the handoff")
+        self.assertEqual(gpu["handed"], set())
+        self.assertTrue(pool.pins["c1"]["parked"], "the read was not kept")
+
+    def test_a_gpu_that_stays_out_ends_the_wait(self):
+        pool, gpu, cpu = self.duo(draining=True)
+        self.check_it_gave_up(pool, gpu, cpu)
+
+    def test_a_gpu_with_no_free_slot_ends_the_wait(self):
+        pool, gpu, cpu = self.duo()
+        gpu["busy"] = 1                      # its one slot is taken
+        self.check_it_gave_up(pool, gpu, cpu)
+        self.assertEqual(gpu["busy"], 1)
+
+    def test_the_turn_fails_and_puts_everything_back(self):
+        pool, gpu, cpu = self.duo(draining=True)
+        del pool.pins["c1"]
+        cpu["busy"] = 0
+        client = FakeClient()
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  client)
+        self.assertEqual([code for code, _ in client.failed], [502])
+        self.assertEqual(client.relayed, [])
+        self.assertEqual(cpu["busy"], 0)
+        self.assertEqual(gpu["busy"], 0)
+        self.assertNotIn("c1", pool.turns)
+        self.assertFalse(pool.pins["c1"]["inflight"])
+        self.assertTrue(pool.pins["c1"]["parked"], "the read was not kept")
+
+
 if __name__ == "__main__":
     unittest.main()

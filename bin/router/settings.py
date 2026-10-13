@@ -96,6 +96,11 @@ class Tuning:
     # needs patches/slot-state-carries-checkpoints.patch. Without the patch a
     # move is followed by a full re-read: turn this off.
     handoff: bool = True
+    generate_patience: float = 600.0  # longest a read turn waits for a
+                                      # generator: one out, full, or too small.
+                                      # A streaming client never leaves, and
+                                      # the wait holds its conversation's
+                                      # next turn too.
 
     # -- what the dashboard is shown
     history_step: float = 10.0        # seconds per history bucket
