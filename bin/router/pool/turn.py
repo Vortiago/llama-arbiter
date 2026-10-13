@@ -72,7 +72,12 @@ def timing_fields(read, reply):
     predicted, drafted = reply.get("predicted_n"), reply.get("draft_n")
     accepted = reply.get("draft_n_accepted")
     parts = [v for v in (cache_n, prompt_n, predicted) if v is not None]
-    return {
+    # A server with the step timings (exp/gentrace) splits a generate step
+    # into parts. Keep the count and each part's mean; a total is the two
+    # multiplied.
+    steps = {k: v for k, v in reply.items()
+             if k == "gen_steps" or (k.startswith("gen_") and k.endswith("_per_step_ms"))}
+    return steps | {
         "ctx": sum(parts) if parts else None,
         "pre_ms": read.get("prompt_ms"),
         "gen_ms": reply.get("predicted_ms"),

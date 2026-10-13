@@ -853,6 +853,24 @@ class TheWaitReasonIsSnapshotted(unittest.TestCase):
         self.assertEqual(row["waited_on"], "pinned")
 
 
+class AReplyCarriesItsGenerateSteps(unittest.TestCase):
+    """A server that times its generate steps sends gen_steps and one
+    gen_<part>_per_step_ms per part. The request event keeps them, so a
+    slow day can be split into draft, decode and the rest afterwards."""
+
+    def test_the_step_parts_reach_the_record(self):
+        got = router.timing_fields({}, {"gen_steps": 43, "gen_decode_per_step_ms": 720.64,
+                                        "gen_draft_per_step_ms": 8.73, "gen_draft_ms": 375.24})
+        self.assertEqual(got["gen_steps"], 43)
+        self.assertEqual(got["gen_decode_per_step_ms"], 720.64)
+        self.assertEqual(got["gen_draft_per_step_ms"], 8.73)
+        self.assertNotIn("gen_draft_ms", got)  # the total is steps times the mean
+
+    def test_a_server_without_them_adds_nothing(self):
+        got = router.timing_fields({}, {"predicted_n": 5})
+        self.assertFalse([k for k in got if k.startswith("gen_") and k not in ("gen_ms", "gen_n")])
+
+
 class ANonDictTimingsObjectIsTolerated(unittest.TestCase):
     """A malformed upstream can send `timings` as a list. The turn decomposes
     it in its finally, so a non-dict there must not raise and lose the

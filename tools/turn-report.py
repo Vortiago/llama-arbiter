@@ -23,7 +23,9 @@ a = ap.parse_args()
 # it is printed only where a row has it, so a later probe shows up without a
 # change here.
 FIELDS = ("took", "waited", "pre_ms", "tg", "first_token_s", "accept",
-          "recall_s", "handoff_s")
+          "recall_s", "handoff_s", "gen_steps", "gen_draft_per_step_ms",
+          "gen_decode_per_step_ms", "gen_sync_per_step_ms",
+          "gen_spec_per_step_ms", "gen_emit_per_step_ms")
 
 
 def percentile(values, fraction):
