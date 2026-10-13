@@ -134,6 +134,17 @@ def one_backend(n_ctx=150000, **kw):
     return pool
 
 
+def reader_only():
+    """A pool whose one up backend reads but may not generate. Its generator
+    is down, so a turn read here waits for one."""
+    pool = make_pool([
+        {"name": "cpu", "url": "http://cpu", "pref": 0, "generate": False},
+        {"name": "gpu", "url": "http://gpu", "pref": 1, "prefill": False}])
+    pool.backends[0].update(up=True, n_ctx=150000)
+    pool.backends[1].update(n_ctx=150000)
+    return pool
+
+
 def with_system(rules, said="hello"):
     """A chat request that opens with a system prompt, so it has a cut for
     an opening to be parked at."""
@@ -405,8 +416,7 @@ class ATurnWithNowhereToGenerateStopsAfterTheRead(unittest.TestCase):
     prefill slot held: the wait has no deadline."""
 
     def test_nothing_is_held_once_the_client_has_gone(self):
-        pool = one_backend()
-        pool.backends[0]["generate"] = False
+        pool = reader_only()
         client = FakeClient(alive=False)
 
         pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"), client)
@@ -421,8 +431,7 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
     prefiller first and returns None, the earlier one raises Gone."""
 
     def test_giving_up_before_the_handoff_says_the_client_went(self):
-        pool = one_backend()
-        pool.backends[0]["generate"] = False
+        pool = reader_only()
         pool.acquire("c1", 10)             # the prefiller is held from here
         self.assertEqual(pool.backends[0]["busy"], 1)
 
@@ -430,8 +439,7 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
             pool.hand_off("c1", pool.backends[0], 10, alive=lambda: False)
 
     def test_a_turn_that_loses_its_client_before_the_handoff_holds_nothing(self):
-        pool = one_backend()
-        pool.backends[0]["generate"] = False
+        pool = reader_only()
 
         pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
                   FakeClient(alive=False))
@@ -446,8 +454,7 @@ class APrefillSlotIsNeverLeftHeld(unittest.TestCase):
         """The read is the expensive half, and it completed. A turn that ends
         here has to leave it on disk, the same as a client that goes during
         the read itself."""
-        pool = one_backend()
-        pool.backends[0]["generate"] = False
+        pool = reader_only()
 
         pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
                   FakeClient(alive=False))
@@ -1078,6 +1085,40 @@ class ATurnThatCannotBeCarriedReadsWhereItGenerates(unittest.TestCase):
         self.assertIsNone(pool.acquire(None, 10, alive,
                                        path="/v1/chat/completions"))
         self.assertEqual(cpu["busy"], 0, "it took the cpu")
+
+
+class ATurnIsSizedByWhereItCanBeGenerated(unittest.TestCase):
+    """A chat turn read on a cpu waits for a generator that can hold it. One
+    larger than every generator of its path waited for one that never came.
+    It is refused up front instead, before any read."""
+
+    def pair(self):
+        pool = make_pool([
+            {"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": False},
+            {"name": "cpu", "url": "http://cpu", "pref": 1,
+             "generate": [router.SYSTEMONE]}])
+        gpu, cpu = pool.backends
+        gpu.update(up=True, n_ctx=1000)
+        cpu.update(up=True, n_ctx=150000)
+        return pool, gpu, cpu
+
+    def test_a_chat_larger_than_every_generator_is_refused(self):
+        pool, gpu, cpu = self.pair()
+        client = FakeClient(alive=False)
+        pool.turn(router.Ask("/v1/chat/completions", prompt(20000), "c1"),
+                  client)
+        self.assertEqual([code for code, _ in client.failed], [413])
+        self.assertEqual(pool.link.ops(), [], "it was read anyway")
+
+    def test_a_generator_that_is_down_still_counts(self):
+        """The turn waits for a generator that restarts, so its ctx counts."""
+        pool, gpu, cpu = self.pair()
+        gpu.update(up=False, n_ctx=150000)
+        self.assertEqual(pool.largest("/v1/chat/completions"), 150000)
+
+    def test_a_typed_turn_is_sized_by_the_cpu_that_answers_it(self):
+        pool, gpu, cpu = self.pair()
+        self.assertEqual(pool.largest(router.SYSTEMONE), 150000)
 
 
 if __name__ == "__main__":

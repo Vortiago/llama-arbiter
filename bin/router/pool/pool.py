@@ -835,10 +835,14 @@ class Pool:
         return True
 
     def largest(self, path=None):
-        """The largest prompt any prefiller will read. A generator's ctx does
-        not count: a conversation pinned to one spills to a prefiller."""
-        return max([be["n_ctx"] for be in self.backends
+        """The largest prompt of this path that can be served: one an up
+        prefiller reads and a generator of the path holds. A generator that
+        is down counts at its last ctx, because a turn waits for it."""
+        read = max([be["n_ctx"] for be in self.backends
                     if be["up"] and prefills(be, path)], default=0)
+        made = max([be["n_ctx"] for be in self.backends
+                    if generates(be, path)], default=0)
+        return min(read, made)
 
     def acquire(self, conv, tokens, alive=None, path=None, ticket=None):
         """Take a slot on the backend holding this conversation. Answers
