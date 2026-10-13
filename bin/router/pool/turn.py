@@ -301,7 +301,9 @@ class Turn:
                     pool.note_holds(conv, serving, cuts)
                     pool.release(serving, conv)
                 # After the release: these write the copy that is not behind.
-                if left:
+                # None: hand_off parked the read and gave the slot back, so
+                # what is in it now may be another turn's.
+                if left and serving is not None:
                     pool.park_partial(conv, be, slot)
                 if serving is not None:
                     parking = pool.park_later(serving, conv, ticket,

@@ -1179,5 +1179,39 @@ class AWaitForAGeneratorHasADeadline(unittest.TestCase):
         self.assertTrue(pool.pins["c1"]["parked"], "the read was not kept")
 
 
+class ASlotGivenBackIsNotSavedAgain(unittest.TestCase):
+    """A chat turn waiting for a generator has parked its read and given the
+    cpu slot back. Another turn may read in that slot now. If the copy is
+    then dropped for disk room and the client leaves, the turn's ending must
+    not save that slot under this conversation's name: it is not its own."""
+
+    def test_a_client_that_leaves_after_the_slot_went_back_saves_nothing(self):
+        pool = make_pool([
+            {"name": "gpu", "url": "http://gpu", "pref": 0, "prefill": False},
+            {"name": "cpu", "url": "http://cpu", "pref": 1,
+             "generate": [router.SYSTEMONE]}])
+        gpu, cpu = pool.backends
+        gpu.update(up=True, n_ctx=150000, draining=True)
+        cpu.update(up=True, n_ctx=150000)
+        client = FakeClient()
+
+        def alive():
+            record = pool.pins.get("c1") or {}
+            if record.get("parked") and cpu["busy"] == 0:
+                with pool.cv:
+                    record["parked"] = None     # dropped for disk room
+                return False                    # and the client leaves
+            return True
+
+        client.alive = alive
+        pool.turn(router.Ask("/v1/chat/completions", prompt(10), "c1"),
+                  client)
+        saves = [call for call in pool.link.calls if call[0] == "save"]
+        self.assertEqual(len(saves), 1,
+                         "a slot given back was saved under its name")
+        self.assertEqual(cpu["busy"], 0)
+        self.assertNotIn("c1", pool.turns)
+
+
 if __name__ == "__main__":
     unittest.main()
