@@ -118,7 +118,9 @@
 # koishi runs the gpu backend on both sockets (core/0039): each socket's
 # threads read the experts from that socket's own copy of the model files.
 #   gpu0_0 8080 qwen-mtp.sh BATCH=512 UBATCH=512 NODE=0,1 NUMA_MODE=distribute LLAMA_NUMA_MIRROR=1:/mnt/nvme/models/=/mnt/nvme/models-node1/
-# and one CPU reader per node (cpu0_0, cpu1_0). With node 1 to itself it
+# and one CPU reader per node (cpu0_0, cpu1_0), each at THREADS=17: at 18 a
+# reader and the gpu backend fill every logical CPU of the node, and the gpu
+# backend generated at half speed while the reader read. With node 1 to itself it
 # generated 10.9% faster and read prompts 29% faster than on node 0 alone.
 # export ROUTER_BACKENDS=$ROOT/backends.local.json
 
