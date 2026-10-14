@@ -96,7 +96,19 @@ the large weights, near the A4000's 448 GB/s; the small-K hyper-connection
 GET_ROWS 2.0%, the indexer 0.3%. The kernels Strata tuned are a small share
 here at short context.
 
-### The release in service (llama.cpp-rel6, 14 October 04:50)
+### The release in service (llama.cpp-rel7, 14 October)
+
+rel/7 is rel/6 + core/0053: two Q8_0 expert rows per 512-bit register in the
+multi-column dot. On gpu0_0, 4 alternating rounds, greedy 192 tokens: code
+30.93-31.15 to 33.60-34.02 tok/s, prose 27.46-27.69 to 29.88-30.11 (+8.7%);
+prompt reads unchanged. Each socket of the gpu backend sees about half the
+union of a verify step, where the old kernel was compute-bound; the CPU-only
+verify step (union 28 on one socket) did not change. Where a step's expert
+time goes (exp/bwgap, CPU-only): the fused MoE op reads 94.2 GB/s in a real
+step, the same as the kernel bench; the 84 GB/s figure came from
+OP_PROFILE_OPS, which runs the ops unfused with a sync per node.
+
+### A release before (llama.cpp-rel6, 14 October 04:50)
 
 rel/6 is pin 8e1642198 + patches/ + core/0001-0052: rel5 with core/0048
 (GGML_OP_STATS), 0049 (generate step timings in `timings`), 0050 (no custom op
