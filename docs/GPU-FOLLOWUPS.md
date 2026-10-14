@@ -96,7 +96,18 @@ the large weights, near the A4000's 448 GB/s; the small-K hyper-connection
 GET_ROWS 2.0%, the indexer 0.3%. The kernels Strata tuned are a small share
 here at short context.
 
-### The release in service (llama.cpp-rel4, 8 October 15:15)
+### The release in service (llama.cpp-rel6, 14 October 04:50)
+
+rel/6 is pin 8e1642198 + patches/ + core/0001-0052: rel5 with core/0048
+(GGML_OP_STATS), 0049 (generate step timings in `timings`), 0050 (no custom op
+behind a host gate: the MoE split could hang there), 0051 (the fused CPU MoE
+FFN skips a -1 id) and 0052 (comments). All three backends run it; the cpu
+readers at 17 threads. Against rel5 + 0048 + 0049 on gpu0_0, 3 alternating
+rounds: read 3.5k tokens 233.6-234.1 against 228.1-234.3 tok/s, 12k tokens
+227.1-227.8 against 223.3-228.4, generate code 31.06-31.49 against
+31.02-31.22, prose 27.59-27.85 against 27.72-27.81. No cost from 0050.
+
+### A release before (llama.cpp-rel4, 8 October 15:15)
 
 Patches through core/0039: rel3 plus the Gumbel-coupled drafts (0034-0035),
 re-reserve only when the backend sampling graph changes (0036-0038) and each
